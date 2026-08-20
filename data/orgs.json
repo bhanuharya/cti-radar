@@ -1,0 +1,11 @@
+{
+  "sample": {
+    "name": "Sample Org (demo)",
+    "domains": [
+      "acme-corp.example",
+      "acmecloud.example"
+    ],
+    "findings": "data/orgs/sample/findings.json",
+    "baseline": "data/orgs/sample/baseline.txt"
+  }
+}

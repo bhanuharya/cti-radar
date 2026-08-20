@@ -1,0 +1,45 @@
+# ---- secrets & local config ----
+.server.env
+.env
+*.env
+!requirements.txt
+
+# ---- virtualenv / python ----
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- logs, runtime, temp ----
+*.log
+*.tmp
+heroku-*
+/node_modules
+
+# ---- per-org scan data (contains confidential/PII findings - NEVER commit) ----
+# Each org dir holds findings.json (may include masked-but-sensitive samples),
+# baseline.txt, history.json. These are recon output for YOUR orgs only.
+data/orgs/
+# Legacy top-level runtime artifacts are ignored generically.
+data/*findings*.json
+data/*baseline*.txt
+
+# keep the registry index + a public sample org (safe, no PII) tracked:
+!data/orgs.json
+!data/orgs/sample/
+!data/orgs/sample/**
+!data/ai_config.example.json
+data/ai_config.json
+
+# ---- OpenCode/session exports (internal transcripts; NEVER commit) ----
+/session-*.md
+/cti-*.md
+app/HOW_TO_RUN.md
+data/ai_org_profiles.json
+
+# ---- drafts & screenshots (local only; screenshots may show live data) ----
+.plan*.json
+preview-*.png
+dashboard-preview.png
+

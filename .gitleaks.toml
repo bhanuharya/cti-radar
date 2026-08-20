@@ -1,0 +1,5 @@
+[allowlist]
+description = "Vendored vis-network minified library; generic-api-key rule matches JS object properties"
+paths = [
+  '''^app/static/vis-network\.min\.js$'''
+]

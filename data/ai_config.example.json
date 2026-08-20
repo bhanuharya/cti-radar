@@ -1,0 +1,32 @@
+{
+  "_comment": "Copy to data/ai_config.json and edit. Secrets stay in environment, referenced via api_key_env.",
+  "default_profile": "hermes-local",
+  "profiles": {
+    "hermes-local": {
+      "provider": "ollama",
+      "base_url": "http://127.0.0.1:11434",
+      "model": "hermes3",
+      "timeout": 90,
+      "max_hosts": 25,
+      "options": {
+        "temperature": 0
+      }
+    },
+    "opencode": {
+      "provider": "openai-compatible",
+      "base_url": "https://opencode.ai/zen/go/v1",
+      "model": "muse-spark-1.2-contributor",
+      "api_key_env": "OPENCODE_GO_B_API_KEY",
+      "timeout": 90,
+      "max_hosts": 25
+    },
+    "openrouter": {
+      "provider": "openai-compatible",
+      "base_url": "https://openrouter.ai/api/v1",
+      "model": "meta-llama/llama-3.1-8b-instruct",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "timeout": 90,
+      "max_hosts": 25
+    }
+  }
+}
