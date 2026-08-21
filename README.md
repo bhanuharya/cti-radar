@@ -77,7 +77,8 @@ requirements.txt
   If absent, the report falls back to a printable HTML download.
 - **Optional — AI-assisted scanning:** configure one or more AI provider profiles
   (local Ollama, OpenCode, OpenRouter, vLLM, or any OpenAI-compatible endpoint)
-  in `data/ai_config.json` (see `data/ai_config.example.json`). Alternatively set
+  in `~/.config/cti-radar/ai_config.json` and set `CTI_AI_CONFIG_FILE` to that path
+  (see `data/ai_config.example.json`). Alternatively set
   `OPENCODE_GO_B_API_KEY` for legacy single-key quick-start. Without AI config,
   `mode=ai` scans safely fall back to deterministic `fast`.
   See [How AI-assisted scanning works](#how-ai-assisted-scanning-works-modeai).
@@ -89,12 +90,13 @@ cd cti-dashboard
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 
-# Copy and fill in environment variables
-cp .env.example .server.env
-# edit .server.env with your CTI_USER, CTI_PASSWORD, CTI_SCAN_TOKEN
+# Create private runtime locations outside the Git checkout
+install -d -m 700 "$HOME/.config/cti-radar" "$HOME/.local/share/cti-radar"
+install -m 600 .env.example "$HOME/.config/cti-radar/server.env"
+# edit ~/.config/cti-radar/server.env with CTI_USER, CTI_PASSWORD, CTI_SCAN_TOKEN
 
 # serve on the tailnet IP (change HOST/PORT as needed)
-source .server.env
+set -a; source "$HOME/.config/cti-radar/server.env"; set +a
 cti_host="${CTI_HOST:-100.76.85.44}"  # or 127.0.0.1 / LAN IP — never 0.0.0.0
 CTI_DATA_DIR="${CTI_DATA_DIR:-$HOME/.local/share/cti-radar}" \
 .venv/bin/python -m uvicorn app.main:app --host $cti_host --port "${CTI_PORT:-8084}" --no-server-header
@@ -103,7 +105,8 @@ CTI_DATA_DIR="${CTI_DATA_DIR:-$HOME/.local/share/cti-radar}" \
 Or run under systemd (`~/.config/systemd/user/cti-dashboard.service`, `Linger=yes`
 for reboot persistence).
 
-Open the dashboard, sign in with the credentials from `.server.env`, select an org
+Open the dashboard, sign in with the credentials from
+`~/.config/cti-radar/server.env`, select an org
 (default shipped demo **`sample`**), then use the workspace panel to register a new
 org and scan it.
 
@@ -202,7 +205,7 @@ FastAPI (main.py) — all routes auth-gated
                          status lifecycle + per-org history diff
           │
           ▼
-   data/orgs/<slug>/{findings.json, baseline.txt, history.json}
+   <CTI_DATA_DIR>/orgs/<slug>/{findings.json, baseline.txt, history.json}
 ```
 
 ### How correlation works
@@ -251,7 +254,9 @@ fingerprint data; it never replaces the scan and never blocks it:
 
 ### Provider configuration
 
-Create `data/ai_config.json` (copy from `data/ai_config.example.json`):
+Create `~/.config/cti-radar/ai_config.json` (copy from
+`data/ai_config.example.json`) and set
+`CTI_AI_CONFIG_FILE=$HOME/.config/cti-radar/ai_config.json`:
 
 ```json
 {
@@ -293,7 +298,7 @@ cd cti-dashboard
 python -m pytest tests/ -v
 ```
 
-22 tests covering: tenant authentication, unknown org rejection, graph XSS
+25 tests covering: tenant authentication, unknown org rejection, graph XSS
 prevention, PDF PII masking, job state retention, provider URL SSRF validation,
 session cookie security, CSP enforcement, and registration limits.
 

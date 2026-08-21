@@ -679,7 +679,6 @@ function init() {
       method:'POST', headers: authHeaders(), body: JSON.stringify({ai_profile: v})
     }).then(r=>r.json()).then(()=>{}).catch(()=>{});
   });
-  loadAiProfiles();
   loadOrgs();
 }
 
@@ -708,7 +707,9 @@ function doLogin() {
         msg.className = 'stmsg err';
         return;
       }
-      hideLogin(); refreshAll();
+      hideLogin();
+      loadAiProfiles();
+      loadOrgs();
     })
     .catch(() => { msg.textContent = 'Login error'; msg.className = 'stmsg err'; });
 }
@@ -929,7 +930,10 @@ function downloadPdf() {
 /* ---------- org loading / data refresh ---------- */
 
 function loadOrgs(preferSlug, done) {
-  fetch('/api/orgs').then((r) => r.json()).then((d) => {
+  fetch('/api/orgs').then((r) => {
+    if (!r.ok) throw new Error('orgs ' + r.status);
+    return r.json();
+  }).then((d) => {
     const list = (d && d.orgs) || [];
     const sel = $('orgsel');
     orgNames = {};
@@ -955,9 +959,7 @@ function loadOrgs(preferSlug, done) {
     refreshAll();
     if (done) done();
   }).catch(() => {
-    currentOrg = preferSlug || 'sample';
-    updateOrgName();
-    refreshAll();
+    showLogin();
     if (done) done();
   });
 }
