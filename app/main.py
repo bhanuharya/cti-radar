@@ -616,6 +616,24 @@ def _build_dashboard_payload(org: str, sort: str = None, status: str = "all"):
         by_kind[k] = by_kind.get(k, 0) + 1
     history = {"org": org, "events": events[::-1][:100], "summary": {"total": len(events), "by_kind": by_kind}}
 
+    # scan observability: last scan's per-stage wall-clock + scope facts
+    # (scan_stats lands in meta from every deterministic scan since S6)
+    meta = cc.load_meta(org)
+    scan_stats = meta.get("scan_stats") if isinstance(meta, dict) else None
+    scan_info = None
+    if isinstance(scan_stats, dict) and scan_stats:
+        scan_info = {
+            "date": meta.get("date"),
+            "domains": len((cc.REGISTRY.get(org) or {}).get("domains") or []),
+            "subdomains": meta.get("subdomains"),
+            "reachable": meta.get("reachable"),
+            "reconcile": (meta.get("reconcile") or {}).get("observed")
+            if isinstance(meta.get("reconcile"), dict) else None,
+            "stages": {k: scan_stats.get(k) for k in
+                       ("enum", "resolve", "probe", "services", "tls", "nvd", "total")
+                       if scan_stats.get(k) is not None},
+        }
+
     return {
         "org": org,
         "summary": cc.summary_from_data(fs, baseline),
@@ -624,6 +642,7 @@ def _build_dashboard_payload(org: str, sort: str = None, status: str = "all"):
         "ips": cc.ip_sharing_from_data(fs),
         "findings": {"findings_total": len(nf), "findings": nf},
         "history": history,
+        "scan_info": scan_info,
     }
 
 

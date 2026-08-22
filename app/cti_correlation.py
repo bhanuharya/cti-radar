@@ -188,6 +188,11 @@ def load_meta_date(org=DEFAULT_ORG):
     return _cached_org_data(org)[2]
 
 
+def load_meta(org=DEFAULT_ORG):
+    """Return the org's meta dict (cached, shared — treat as read-only)."""
+    return _cached_org_data(org)[3] or {}
+
+
 # --------------------------------------------------------------------------
 # evidence enrichment + PII masking helpers
 # --------------------------------------------------------------------------
@@ -1066,7 +1071,7 @@ _DATA_CACHE_TTL = 15.0  # seconds
 
 
 def _read_org_files(org):
-    fs, baseline, meta_date = [], [], None
+    fs, baseline, meta_date, meta = [], [], None, {}
     findings_path, baseline_path = _org_paths(org)
     if findings_path and os.path.exists(findings_path):
         try:
@@ -1079,6 +1084,8 @@ def _read_org_files(org):
                     m = _DATE_RE.search(str(meta.get("date") or meta.get("scan_date") or ""))
                     if m:
                         meta_date = m.group(0)
+                else:
+                    meta = {}
         except Exception:
             fs = []
     if baseline_path and os.path.exists(baseline_path):
@@ -1087,7 +1094,7 @@ def _read_org_files(org):
                 baseline = [l.strip() for l in f if l.strip() and not l.startswith("#")]
         except Exception:
             baseline = []
-    return fs, baseline, meta_date
+    return fs, baseline, meta_date, meta
 
 
 def _cached_org_data(org):
@@ -1123,7 +1130,7 @@ def load_data(org=DEFAULT_ORG):
     Return independent copies, including nested finding fields. Callers
     mutate findings during enrichment and must never alter shared cached data.
     """
-    fs, baseline, _ = _cached_org_data(org)
+    fs, baseline, _, _ = _cached_org_data(org)
     return copy.deepcopy(fs or []), copy.deepcopy(baseline or [])
 
 
