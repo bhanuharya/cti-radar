@@ -247,6 +247,10 @@ def load_profiles() -> Tuple[Dict[str, dict], Optional[str]]:
             "timeout": timeout,
             "max_hosts": max_hosts,
             "max_tokens": max_tokens,
+            # opt-out for the one-shot cap-exhaustion retry (see
+            # _call_openai_compatible): max_tokens is per-request; the retry
+            # may add ONE extra request at min(2x cap, 8192)
+            "cap_retry": bool(p.get("cap_retry", True)),
             "options": options,
         }
     # validate default
@@ -393,7 +397,8 @@ def _call_ollama(base_url: str, model: str, prompt: str, timeout: int, options: 
 
 
 def _call_openai_compatible(base_url: str, model: str, prompt: str, timeout: int,
-                            api_key_env: Optional[str], max_tokens: int = 1024):
+                            api_key_env: Optional[str], max_tokens: int = 1024,
+                            cap_retry: bool = True):
     """Call an OpenAI-compatible endpoint. Returns (content, reasoning, diagnostics).
 
     Requests structured JSON output (``response_format: json_object``) and caps
@@ -490,19 +495,35 @@ def _call_openai_compatible(base_url: str, model: str, prompt: str, timeout: int
     except Exception:
         d = {}
     content, reasoning_out, diag = _finish(d, cap)
-    if content is None and diag.get("reason") == "token_cap_exhausted":
-        # one retry with a doubled cap (still bounded) — reasoning models can
-        # finish within a larger budget
-        retry_cap = max(64, min(cap * 2, 8192))
-        try:
-            status, resp_bytes = _post(_payload(retry_cap))
+    if content is None and diag.get("reason") == "token_cap_exhausted" and cap_retry:
+        # at most ONE extra request, only when the budget can actually grow
+        # (a capped-at-8192 profile has no headroom — a duplicate request
+        # would just double the spend), and only when the profile allows it.
+        # max_tokens is the PER-REQUEST cap; this retry is the only place
+        # total spend can exceed it, by at most one request.
+        retry_cap = min(cap * 2, 8192)
+        if retry_cap > cap:
             try:
-                d2 = json.loads(resp_bytes.decode(errors="replace") or "{}")
-            except Exception:
-                d2 = {}
-            content, reasoning_out, diag = _finish(d2, retry_cap, retried_cap=retry_cap)
-        except Exception as e:
-            _log("warn", f"AI provider cap-retry failed for {model}: {type(e).__name__}: {e}")
+                # keep structured output if the endpoint accepted it
+                retry_fmt = dict(_payload(retry_cap))
+                retry_fmt["response_format"] = {"type": "json_object"}
+                try:
+                    status, resp_bytes = _post(retry_fmt)
+                except urllib.error.HTTPError as e:
+                    if e.code in (400, 404, 406, 415, 422, 500, 501):
+                        status, resp_bytes = _post(_payload(retry_cap))
+                    else:
+                        raise
+                try:
+                    d2 = json.loads(resp_bytes.decode(errors="replace") or "{}")
+                except Exception:
+                    d2 = {}
+                content, reasoning_out, diag = _finish(d2, retry_cap, retried_cap=retry_cap)
+            except Exception as e:
+                _log("warn", f"AI provider cap-retry failed for {model}: {type(e).__name__}: {e}")
+        else:
+            _log("debug", f"AI provider cap retry skipped for {model}: "
+                          f"cap {cap} already at ceiling, no headroom")
     return content, reasoning_out, diag
 
 
@@ -522,7 +543,8 @@ def call_ai(prompt: str, profile_name: Optional[str] = None) -> Tuple[Optional[s
     elif provider == "openai-compatible":
         content, reasoning, diag = _call_openai_compatible(
             prof["base_url"], prof["model"], prompt, prof["timeout"],
-            prof["api_key_env"], max_tokens=prof.get("max_tokens", 1024))
+            prof["api_key_env"], max_tokens=prof.get("max_tokens", 1024),
+            cap_retry=prof.get("cap_retry", True))
     provenance = {
         "profile": name,
         "provider": provider,

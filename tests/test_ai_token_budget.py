@@ -81,7 +81,7 @@ def test_cap_exhaustion_detected_and_retried_with_doubled_cap(monkeypatch):
 
     def fake_urlopen(req, timeout=30):
         body = json.loads(req.data.decode())
-        posts.append(body["max_tokens"])
+        posts.append(body)
         if len(posts) == 1:
             return _FakeResp(_empty_content_body(1024, finish=None))
         return _FakeResp(_ok_body('{"results":[]}'))
@@ -90,8 +90,55 @@ def test_cap_exhaustion_detected_and_retried_with_doubled_cap(monkeypatch):
     content, reasoning, diag = ai_providers._call_openai_compatible(
         "https://api.example.com/v1", "muse", "prompt", 30, None, max_tokens=1024)
     assert content == '{"results":[]}'
-    assert posts == [1024, 2048]           # retried once with doubled cap
+    assert [p["max_tokens"] for p in posts] == [1024, 2048]
     assert diag["retried_with_cap"] == 2048
+    # the retry keeps structured output when the endpoint accepted it
+    assert all(p.get("response_format") == {"type": "json_object"} for p in posts)
+
+
+def test_cap_at_ceiling_not_retried_no_double_spend(monkeypatch):
+    """A profile already at the 8192 ceiling must not re-send a duplicate."""
+    posts = []
+
+    def fake_urlopen(req, timeout=30):
+        posts.append(json.loads(req.data.decode()))
+        return _FakeResp(_empty_content_body(8192, finish=None))
+
+    monkeypatch.setattr(ai_providers, "_urlopen_no_redirect", fake_urlopen)
+    content, _, diag = ai_providers._call_openai_compatible(
+        "https://api.example.com/v1", "muse", "prompt", 30, None, max_tokens=8192)
+    assert content is None
+    assert len(posts) == 1                        # no duplicate request
+    assert diag["reason"] == "token_cap_exhausted"
+
+
+def test_cap_retry_opt_out(monkeypatch):
+    posts = []
+
+    def fake_urlopen(req, timeout=30):
+        posts.append(json.loads(req.data.decode()))
+        return _FakeResp(_empty_content_body(1024, finish=None))
+
+    monkeypatch.setattr(ai_providers, "_urlopen_no_redirect", fake_urlopen)
+    content, _, diag = ai_providers._call_openai_compatible(
+        "https://api.example.com/v1", "muse", "prompt", 30, None,
+        max_tokens=1024, cap_retry=False)
+    assert content is None
+    assert len(posts) == 1
+    assert diag["reason"] == "token_cap_exhausted"
+
+
+def test_profile_cap_retry_flag_parsed(monkeypatch):
+    raw = {"default_profile": "p1", "profiles": {
+        "p1": {"provider": "openai-compatible", "base_url": "https://api.example.com/v1",
+               "model": "m", "api_key_env": "TEST_API_KEY", "cap_retry": False},
+    }}
+    monkeypatch.setenv("CTI_AI_CONFIG", json.dumps(raw))
+    monkeypatch.setenv("TEST_API_KEY", "x")
+    monkeypatch.setattr(ai_providers, "_validate_base_url",
+                        lambda url, provider, key_env: True)
+    profiles, _ = ai_providers.load_profiles()
+    assert profiles["p1"]["cap_retry"] is False
 
 
 def test_cap_exhaustion_retry_also_failing_reports_reason(monkeypatch):
