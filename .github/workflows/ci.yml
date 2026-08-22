@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      # explicit writable temp dir for pytest tmp_path fixtures
+      TMPDIR: /tmp
+      CTI_SCAN_TOKEN: ci-test-token
+      CTI_USER: ci
+      CTI_PASSWORD: ci-test-password
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+      - name: Byte-compile all application modules
+        run: python -m py_compile app/*.py
+      - name: Run test suite
+        run: python -m pytest tests/ -q
