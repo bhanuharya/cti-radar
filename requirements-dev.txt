@@ -1,0 +1,5 @@
+# Test/dev dependencies only — runtime needs just requirements.txt.
+# httpx is required by starlette.testclient (FastAPI TestClient).
+# Exact pins: dev tooling moves fast and CI should be reproducible.
+pytest==9.1.1
+httpx==0.28.1

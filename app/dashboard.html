@@ -106,6 +106,10 @@
   .wsmsg { margin-top:10px; font-size:12px; min-height:18px; font-family:var(--mono); color:var(--dim); }
   .wsmsg.ok { color:var(--green); }
   .wsmsg.err { color:var(--red); }
+  .scanstatus { margin-bottom:10px; padding:6px 10px; font-size:11px; color:var(--dim);
+               background:var(--panel2); border:1px solid var(--border); border-radius:8px;
+               overflow-wrap:anywhere; }
+  .scanstatus .dim { color:var(--dim); opacity:.7; }
   .job { margin-top:10px; padding:10px 12px; background:var(--bg); border:1px solid var(--border);
          border-radius:8px; font-family:var(--mono); font-size:12px; color:var(--dim); display:none; }
   .job .jhead { color:var(--txt); font-weight:700; }
@@ -591,6 +595,8 @@ button:disabled{opacity:.45;cursor:wait;}
     <button class="btn panel-toggle" id="ws-toggle" type="button" aria-expanded="true" aria-controls="wsbody">collapse</button>
   </div>
   <div class="panelbody" id="wsbody">
+    <div class="scanstatus mono" id="scan-status" aria-live="polite"
+         title="Last scan: date, scope and per-stage wall-clock seconds (enum / resolve / probe / services / tls / nvd)"><span class="dim">no scan yet</span></div>
     <div class="wsgrid" id="neworg-block" hidden>
     <div class="wsfield"><label>new org · slug <span style="color:var(--green)">*</span></label><input id="no-slug" autocomplete="off" spellcheck="false" placeholder="acme-corp">
       <small style="color:var(--dim);font-size:10px;">lowercase, digits, hyphens · ≤32</small></div>
@@ -1901,6 +1907,7 @@ function refreshAll() {
     try { if (d.ips) renderIps(d.ips); } catch (e) {}
     try { if (d.findings) renderFindings(d.findings); } catch (e) {}
     try { if (d.history) renderHistory(d.history); } catch (e) {}
+    try { renderScanInfo(d.scan_info); } catch (e) {}
     stampAsOf();
   }).catch(() => {
     if (seq !== _refreshSeq) return;
@@ -1939,6 +1946,26 @@ function fetchFindings() {
     '&status=' + encodeURIComponent(statusFilter))
     .then((r) => r.json()).then(renderFindings).catch(() => {});
 }
+function renderScanInfo(info) {
+  const el = $('scan-status');
+  if (!info) { el.innerHTML = '<span class="dim">no scan yet</span>'; return; }
+  const st = info.stages || {};
+  const stages = ['enum', 'resolve', 'probe', 'services', 'tls', 'nvd']
+    .filter((k) => st[k] !== undefined && st[k] !== null)
+    .map((k) => k + ' ' + esc(String(st[k])) + 's');
+  const bits = [];
+  if (info.date) bits.push('scan ' + esc(String(info.date)));
+  if (info.subdomains !== undefined && info.subdomains !== null)
+    bits.push('hosts ' + esc(String(info.subdomains)));
+  if (info.reachable !== undefined && info.reachable !== null)
+    bits.push('reachable ' + esc(String(info.reachable)));
+  if (info.domains) bits.push('domains ' + esc(String(info.domains)));
+  if (stages.length) bits.push('· ' + stages.join(' / '));
+  if (st.total !== undefined && st.total !== null)
+    bits.push('· total ' + esc(String(st.total)) + 's');
+  el.innerHTML = bits.join(' ') || '<span class="dim">no scan stats</span>';
+}
+
 function renderKpis(s) { kpiSummary = s; drawKpis(); }
 
 function drawKpis() {

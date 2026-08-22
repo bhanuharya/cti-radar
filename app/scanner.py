@@ -1350,11 +1350,17 @@ def parse_ai_classification(raw, allowed_targets):
         pass
     if arr is None:
         s, e = raw.find("["), raw.rfind("]")
-        if s == -1 or e <= s:
-            return None
-        try:
-            arr = json.loads(raw[s:e + 1])
-        except Exception:
+        if s != -1 and e > s:
+            try:
+                arr = json.loads(raw[s:e + 1])
+            except Exception:
+                arr = None
+    if arr is None:
+        # truncated batch (cap/timeout mid-item): salvage individual verdict
+        # objects instead of losing the whole batch; per-item validation below
+        # still applies, so garbage objects cannot slip through
+        arr = ai_providers.salvage_result_objects(raw)
+        if not arr:
             return None
     if not isinstance(arr, list):
         return None
@@ -1874,11 +1880,16 @@ def parse_ai_grading(raw, allowed_ids):
         key = raw.find('"results"')
         s = raw.find("[", key) if key != -1 else -1
         e = raw.rfind("]")
-        if s == -1 or e <= s:
-            return None
-        try:
-            arr = json.loads(raw[s:e + 1])
-        except Exception:
+        if s != -1 and e > s:
+            try:
+                arr = json.loads(raw[s:e + 1])
+            except Exception:
+                arr = None
+    if arr is None:
+        # truncated batch: salvage individual grading objects; the ID
+        # whitelist + severity normalization below still reject garbage
+        arr = ai_providers.salvage_result_objects(raw)
+        if not arr:
             return None
     if not isinstance(arr, list):
         return None

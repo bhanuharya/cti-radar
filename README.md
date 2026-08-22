@@ -104,6 +104,11 @@ requirements.txt
 
 - **Python 3.11+**
 - **fastapi** + **uvicorn** (see `requirements.txt`)
+- **One process on one host.** State is JSON files guarded by process-local
+  locks with in-memory sessions/jobs — multiple workers or two instances
+  sharing a data directory can lose updates. See
+  [DEPLOYMENT.md](DEPLOYMENT.md) for the supported shape, hardened systemd
+  unit, and reverse-proxy/trusted-proxy notes.
 - **curl** (used by the passive scanner / fingerprinting)
 - **Optional — headless Chromium** for PDF export
   (`~/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome` style path).
@@ -380,7 +385,7 @@ cd cti-dashboard
 python -m pytest tests/ -v
 ```
 
-183 tests covering: tenant authentication, unknown org rejection, graph XSS
+198 tests covering: tenant authentication, unknown org rejection, graph XSS
 prevention, PDF PII masking, job state retention, provider URL SSRF validation,
 session cookie security, CSP enforcement, registration limits, the
 cheap-model AI triage flow (pre-filter, compact prompt, classifier parsing,
