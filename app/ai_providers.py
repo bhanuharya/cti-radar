@@ -223,6 +223,22 @@ def load_profiles() -> Tuple[Dict[str, dict], Optional[str]]:
         except Exception:
             max_hosts = 10
         max_hosts = max(1, min(max_hosts, 50))
+        # generation cap (output tokens). Reasoning-style models burn the cap
+        # on hidden reasoning and return empty content — a profile can raise
+        # its budget explicitly instead of failing every call.
+        try:
+            max_tokens = int(p.get("max_tokens", 1024) or 1024)
+        except Exception:
+            max_tokens = 1024
+        max_tokens = max(64, min(max_tokens, 8192))
+        options = dict(p.get("options")) if isinstance(p.get("options"), dict) else {}
+        # ollama spells the same knob num_predict; accept it at profile level
+        try:
+            np_ = int(p.get("num_predict", 0) or 0)
+            if np_:
+                options["num_predict"] = max(64, min(np_, 8192))
+        except Exception:
+            pass
         norm[name] = {
             "provider": provider,
             "base_url": base_url,
@@ -230,7 +246,8 @@ def load_profiles() -> Tuple[Dict[str, dict], Optional[str]]:
             "api_key_env": api_key_env_raw,
             "timeout": timeout,
             "max_hosts": max_hosts,
-            "options": p.get("options") if isinstance(p.get("options"), dict) else {},
+            "max_tokens": max_tokens,
+            "options": options,
         }
     # validate default
     if default not in norm:
@@ -375,12 +392,17 @@ def _call_ollama(base_url: str, model: str, prompt: str, timeout: int, options: 
         return None, None, {"error": f"{type(e).__name__}: {e}"}
 
 
-def _call_openai_compatible(base_url: str, model: str, prompt: str, timeout: int, api_key_env: Optional[str]):
+def _call_openai_compatible(base_url: str, model: str, prompt: str, timeout: int,
+                            api_key_env: Optional[str], max_tokens: int = 1024):
     """Call an OpenAI-compatible endpoint. Returns (content, reasoning, diagnostics).
 
     Requests structured JSON output (``response_format: json_object``) and caps
     ``max_tokens`` so cheap models stay bounded. Endpoints that reject the
-    ``response_format`` field are retried once without it.
+    ``response_format`` field are retried once without it. A response whose
+    completion budget was consumed entirely by hidden reasoning (empty content,
+    ``finish_reason`` null/length, ``completion_tokens`` at the cap) is retried
+    once with a doubled cap — that is the classic failure signature of
+    reasoning models (muse-spark, GLM) behind a small cap.
     """
     key = os.environ.get(api_key_env or "", "") if api_key_env else ""
     # allow no key for local openai-compatible (e.g., vLLM without auth)
@@ -389,6 +411,7 @@ def _call_openai_compatible(base_url: str, model: str, prompt: str, timeout: int
     if api_key_env and not key:
         _log("warn", f"AI profile {model} requires {api_key_env} but it is not set")
         return None, None, {"error": f"missing API key ({api_key_env})"}
+    cap = max(64, min(int(max_tokens or 1024), 8192))
 
     def _post(payload):
         data = json.dumps(payload).encode()
@@ -402,10 +425,42 @@ def _call_openai_compatible(base_url: str, model: str, prompt: str, timeout: int
             status = getattr(r, "status", None)
             return status, resp_bytes
 
-    base_payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0, "max_tokens": 1024}
+    def _payload(tok_cap):
+        p = {"model": model, "messages": [{"role": "user", "content": prompt}],
+             "temperature": 0, "max_tokens": tok_cap}
+        return p
+
+    base_payload = _payload(cap)
     with_format = dict(base_payload)
     with_format["response_format"] = {"type": "json_object"}
+
+    def _finish(d, tok_cap, retried_cap=None):
+        """Extract + classify. Returns (content, reasoning_out, diag)."""
+        content, reasoning = _extract_openai_content_reasoning(d)
+        reasoning_out = reasoning[:2000] if reasoning else None
+        diag = {"status": status or 200}
+        if retried_cap:
+            diag["retried_with_cap"] = retried_cap
+        if content:
+            _log("info", f"AI provider responded ({model}): {len(content)} chars"
+                 + (f", reasoning {len(reasoning)} chars" if reasoning else ""))
+            return content, reasoning_out, diag
+        # empty content — classify WHY (token cap exhausted by reasoning?)
+        usage = d.get("usage") if isinstance(d, dict) else None
+        comp = int(usage.get("completion_tokens") or 0) if isinstance(usage, dict) else 0
+        finish = None
+        choices = d.get("choices") if isinstance(d, dict) else None
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            finish = choices[0].get("finish_reason")
+        if comp >= tok_cap * 0.98 and finish in (None, "length"):
+            diag["reason"] = "token_cap_exhausted"
+            _log("warn", f"AI provider token cap exhausted by reasoning ({model}): "
+                         f"{comp} completion tokens at cap {tok_cap}, no content")
+        else:
+            _log("warn", f"AI provider returned no content ({model})",
+                 {"body_excerpt": resp_bytes[:1000].decode(errors="replace")})
+            diag["response_excerpt"] = resp_bytes[:1000].decode(errors="replace")
+        return None, reasoning_out, diag
 
     status, resp_bytes = None, b""
     try:
@@ -434,18 +489,21 @@ def _call_openai_compatible(base_url: str, model: str, prompt: str, timeout: int
         d = json.loads(resp_bytes.decode(errors="replace") or "{}")
     except Exception:
         d = {}
-    content, reasoning = _extract_openai_content_reasoning(d)
-    reasoning_out = reasoning[:2000] if reasoning else None
-    if content:
-        _log("info", f"AI provider responded ({model}): {len(content)} chars"
-             + (f", reasoning {len(reasoning)} chars" if reasoning else ""))
-        return content, reasoning_out, {"status": status or 200}
-    _log("warn", f"AI provider returned no content ({model})",
-         {"body_excerpt": resp_bytes[:1000].decode(errors="replace")})
-    return None, reasoning_out, {
-        "status": status or 200,
-        "response_excerpt": resp_bytes[:1000].decode(errors="replace"),
-    }
+    content, reasoning_out, diag = _finish(d, cap)
+    if content is None and diag.get("reason") == "token_cap_exhausted":
+        # one retry with a doubled cap (still bounded) — reasoning models can
+        # finish within a larger budget
+        retry_cap = max(64, min(cap * 2, 8192))
+        try:
+            status, resp_bytes = _post(_payload(retry_cap))
+            try:
+                d2 = json.loads(resp_bytes.decode(errors="replace") or "{}")
+            except Exception:
+                d2 = {}
+            content, reasoning_out, diag = _finish(d2, retry_cap, retried_cap=retry_cap)
+        except Exception as e:
+            _log("warn", f"AI provider cap-retry failed for {model}: {type(e).__name__}: {e}")
+    return content, reasoning_out, diag
 
 
 def call_ai(prompt: str, profile_name: Optional[str] = None) -> Tuple[Optional[str], Optional[dict]]:
@@ -462,7 +520,9 @@ def call_ai(prompt: str, profile_name: Optional[str] = None) -> Tuple[Optional[s
     if provider == "ollama":
         content, reasoning, diag = _call_ollama(prof["base_url"], prof["model"], prompt, prof["timeout"], prof["options"])
     elif provider == "openai-compatible":
-        content, reasoning, diag = _call_openai_compatible(prof["base_url"], prof["model"], prompt, prof["timeout"], prof["api_key_env"])
+        content, reasoning, diag = _call_openai_compatible(
+            prof["base_url"], prof["model"], prompt, prof["timeout"],
+            prof["api_key_env"], max_tokens=prof.get("max_tokens", 1024))
     provenance = {
         "profile": name,
         "provider": provider,
@@ -570,6 +630,35 @@ def strip_json_fences(raw):
     if s.endswith("```"):
         s = s[:-3].rstrip()
     return s.strip()
+
+
+def salvage_result_objects(raw, max_items=64):
+    """Best-effort recovery of individual result objects from truncated JSON.
+
+    A weak model that streams a verdict array can get cut off mid-item (cap,
+    timeout, connection drop). Instead of losing the whole batch, scan for
+    balanced {...} objects with raw_decode and return whatever parses.
+    Per-item semantic validation stays with the caller — this only recovers
+    syntax. Returns [] when nothing parses.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    s = strip_json_fences(raw)
+    dec = json.JSONDecoder()
+    out = []
+    i = 0
+    while i < len(s) and len(out) < max_items:
+        j = s.find("{", i)
+        if j == -1:
+            break
+        try:
+            obj, end = dec.raw_decode(s, j)
+            if isinstance(obj, dict):
+                out.append(obj)
+            i = end
+        except ValueError:
+            i = j + 1  # unbalanced/truncated object — keep scanning
+    return out
 
 
 def parse_ai_response(raw: str, allowed_targets: set) -> Optional[List[dict]]:

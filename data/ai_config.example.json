@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to data/ai_config.json and edit. Secrets stay in environment, referenced via api_key_env.",
+  "_comment": "Copy to data/ai_config.json and edit. Secrets stay in environment, referenced via api_key_env. max_tokens (64-8192, default 1024) caps output tokens; reasoning models (muse-spark, glm) should raise it to 3072+ or their whole budget is spent on hidden reasoning. Ollama profiles may use num_predict instead.",
   "default_profile": "hermes-local",
   "profiles": {
     "hermes-local": {
@@ -18,7 +18,8 @@
       "model": "muse-spark-1.2-contributor",
       "api_key_env": "OPENCODE_GO_B_API_KEY",
       "timeout": 90,
-      "max_hosts": 25
+      "max_hosts": 25,
+      "max_tokens": 3072
     },
     "openrouter": {
       "provider": "openai-compatible",
