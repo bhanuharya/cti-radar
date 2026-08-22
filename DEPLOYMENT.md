@@ -1,7 +1,7 @@
 # CTI Radar — Deployment Guide
 
 This document describes the **supported deployment shape** and its hardening
-notes. For day-to-day operation see `app/HOW_TO_RUN.md`.
+notes. For day-to-day operation see the `README.md` setup section.
 
 ## Supported shape: single process, single host
 
@@ -39,25 +39,27 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/you/code/cti-dashboard
-EnvironmentFile=/home/you/.config/cti-radar/server.env   # mode 600
+# server.env holds CTI_HOST / CTI_PORT (read by the app entry point, which
+# refuses to bind 0.0.0.0) and the credentials. Keep it mode 600.
+# Paths below assume user "you" — adjust to your home.
+EnvironmentFile=/home/you/.config/cti-radar/server.env
 Environment=CTI_DATA_DIR=/home/you/.local/share/cti-radar
 Environment=CTI_STATE_DIR=/home/you/.local/state/cti-radar
 Environment=CTI_AI_CONFIG_FILE=/home/you/.config/cti-radar/ai_config.json
-Environment=CTI_HOST=100.x.y.z        # tailnet IP — NEVER 0.0.0.0
-Environment=CTI_PORT=8084
-ExecStart=/home/you/code/cti-dashboard/.venv/bin/python -m uvicorn app.main:app \
-          --host 100.x.y.z --port 8084 --no-server-header --workers 1
+# NOTE: no host/port here on purpose — the entry point below reads
+# CTI_HOST/CTI_PORT from server.env, so there is exactly one place to
+# change the bind address.
+WorkingDirectory=/home/you/code/cti-dashboard
+ExecStart=/home/you/code/cti-dashboard/.venv/bin/python -m app.main
 Restart=always
 RestartSec=3
 
-# hardening
+# hardening: /home is readable (checkout, venv, config) but only the
+# data/state dirs are writable
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=tmpfs            # code lives in /home; tmpfs hides other homes —
-                             # if the app cannot read its checkout, use
-                             # ReadWritePaths= instead and drop ProtectHome
+ProtectHome=read-only
 ReadWritePaths=/home/you/.local/share/cti-radar /home/you/.local/state/cti-radar
 ProtectKernelTunables=true
 ProtectControlGroups=true
@@ -66,6 +68,10 @@ RestrictSUIDSGID=true
 [Install]
 WantedBy=default.target
 ```
+
+Changing the bind address means editing `CTI_HOST`/`CTI_PORT` in
+`server.env` and restarting — the unit itself never hard-codes them.
+Validate your edited unit with `systemd-analyze verify` before enabling.
 
 Enable persistence across reboots (user services stop at logout otherwise):
 
