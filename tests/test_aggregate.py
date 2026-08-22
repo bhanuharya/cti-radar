@@ -3,7 +3,7 @@
 - Deep-compare aggregate fields with legacy endpoint responses
 - Verify thresholded gzip (JSON only, >1KB gzipped, small not)
 - Verify legacy routes retained and fallback shapes stable
-- Verify single findings load per aggregate request (no global caching)
+- Verify single findings load per aggregate request (read-through cache)
 """
 import json
 import os
@@ -23,9 +23,8 @@ from fastapi.testclient import TestClient
 
 
 def _ensure_sample_data():
-    base = os.path.join(os.path.dirname(__file__), "..")
-    # ensure orgs.json has sample + beta registered
-    orgs_json = os.path.join(base, "data", "orgs.json")
+    # ensure orgs.json has sample + beta registered (under redirected root)
+    orgs_json = os.path.join(cc.DATA_ROOT, "orgs.json")
     reg = {}
     if os.path.exists(orgs_json):
         try:
@@ -33,7 +32,7 @@ def _ensure_sample_data():
                 reg = json.load(f)
         except Exception:
             reg = {}
-    org_root = os.path.join(base, "data", "orgs")
+    org_root = os.path.join(cc.DATA_ROOT, "orgs")
     for slug in ("sample", "beta"):
         od = os.path.join(org_root, slug)
         os.makedirs(od, exist_ok=True)
@@ -47,18 +46,15 @@ def _ensure_sample_data():
         fp = os.path.join(od, "findings.json")
         bp = os.path.join(od, "baseline.txt")
         hp = os.path.join(od, "history.json")
-        if not os.path.exists(fp):
-            with open(fp, "w") as f:
-                json.dump({"meta": {"date": "2026-01-15"}, "findings": [
-                    {"id": "F-001", "title": "T", "severity": "CRITICAL", "target": "a.example.com", "ip": "1.2.3.4", "category": "XSS", "status": "OPEN", "related_cves": ["CVE-2023-1234"]},
-                    {"id": "F-002", "title": "U", "severity": "HIGH", "target": "b.example.com", "ip": "1.2.3.4", "category": "XSS", "status": "OPEN", "related_cves": ["CVE-2023-1234"]},
-                ]}, f, indent=2)
-        if not os.path.exists(bp):
-            with open(bp, "w") as f:
-                f.write("a.example.com\n1.2.3.4\n")
-        if not os.path.exists(hp):
-            with open(hp, "w") as f:
-                json.dump([{"ts": "2026-01-10T00:00:00", "kind": "scan", "mode": "fast", "summary": {"found": 2}}], f)
+        with open(fp, "w") as f:
+            json.dump({"meta": {"date": "2026-01-15"}, "findings": [
+                {"id": "F-001", "title": "T", "severity": "CRITICAL", "target": "a.example.com", "ip": "1.2.3.4", "category": "XSS", "status": "OPEN", "related_cves": ["CVE-2023-1234"]},
+                {"id": "F-002", "title": "U", "severity": "HIGH", "target": "b.example.com", "ip": "1.2.3.4", "category": "XSS", "status": "OPEN", "related_cves": ["CVE-2023-1234"]},
+            ]}, f, indent=2)
+        with open(bp, "w") as f:
+            f.write("a.example.com\n1.2.3.4\n")
+        with open(hp, "w") as f:
+            json.dump([{"ts": "2026-01-10T00:00:00", "kind": "scan", "mode": "fast", "summary": {"found": 2}}], f)
     with open(orgs_json, "w") as f:
         json.dump(reg, f, indent=2)
     cc._reload_registry()
@@ -87,7 +83,16 @@ def test_aggregate_matches_legacy():
         assert agg["graph"] == s_graph
         assert agg["fleet"] == s_fleet
         assert agg["ips"] == s_ips
-        assert agg["findings"] == s_find
+        assert agg["findings"]["findings_total"] == s_find["findings_total"]
+        assert [f["id"] for f in agg["findings"]["findings"]] == [
+            f["id"] for f in s_find["findings"]
+        ]
+        # Aggregate lists stay lightweight; the legacy endpoint remains full.
+        if agg["findings"]["findings"]:
+            light = agg["findings"]["findings"][0]
+            full = s_find["findings"][0]
+            assert "status_history" not in light
+            assert "status_history" in full
         assert agg["history"] == s_hist
         # also /api/orgs/{slug}/dashboard
         agg2 = _get(f"/api/orgs/{org}/dashboard?sort=severity&status=all").json()
@@ -126,16 +131,26 @@ def test_single_findings_load_per_aggregate():
 
     builtins.open = counting_open
     try:
+        # cold read-through cache: aggregate reads findings.json exactly once
+        cc.invalidate_org_cache("sample")
+        cc.invalidate_org_cache("beta")
         cnt["n"] = 0
         _get("/api/dashboard?org=sample&sort=severity&status=all")
         assert cnt["n"] == 1, f"aggregate should open findings.json once, got {cnt['n']}"
+        # warm cache: a second identical request avoids the disk read entirely
+        cnt["n"] = 0
+        _get("/api/dashboard?org=sample&sort=severity&status=all")
+        assert cnt["n"] == 0, f"cached aggregate should not re-open findings.json, got {cnt['n']}"
+        # each legacy endpoint performs its own read when cache is invalidated
         cnt["n"] = 0
         for p in ["/api/summary?org=sample", "/api/graph?org=sample", "/api/fleet?org=sample", "/api/ips?org=sample", "/api/findings?org=sample&sort=severity&status=all"]:
+            cc.invalidate_org_cache("sample")
             _get(p)
-        # legacy path opens at least once per endpoint + extra meta_date read
         assert cnt["n"] >= 5
     finally:
         builtins.open = orig
+        cc.invalidate_org_cache("sample")
+        cc.invalidate_org_cache("beta")
 
 
 def test_pii_masking_preserved():

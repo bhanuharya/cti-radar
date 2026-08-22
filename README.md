@@ -14,8 +14,10 @@ visualize its findings — no hardcoding to one company.
 
 > **Intended use:** authorized security teams assessing **their own** external
 > footprint. Scanning is **passive / non-intrusive by default** (certificate
-> transparency + DNS + HTTP header probe + InternetDB enrichment). Use it only on
-> infrastructure you own or are explicitly authorized to test.
+> transparency — crt.name / crt.sh / certspotter / hackertarget — plus DNS
+> resolution, HTTP header probe, a TCP connect scan of common service ports, and
+> InternetDB enrichment). Use it only on infrastructure you own or are explicitly
+> authorized to test.
 
 ---
 
@@ -24,8 +26,35 @@ visualize its findings — no hardcoding to one company.
 - **Multi-org / workspaces** — register any org (slug-validated), per-org data stays
   in `data/orgs/<slug>/`.
 - **Dual-mode scanning** — `fast` (deterministic, $0) or `ai` (after deterministic
-  capture, an optional LLM interprets fingerprints into findings). AI never fails a
+  capture, an optional LLM triages only the interesting hosts into `AI-ASSESSED`
+  findings, then re-grades existing findings' severity/impact). AI never fails a
   scan; it degrades to the deterministic result.
+- **OpenHack active assessment (separate from passive CTI scans)** — the
+  `/openhack-scan` endpoint is fail-closed behind a server-level operator gate,
+  exact target allowlist, and time-bounded ROE.
+- **Passive service discovery** — for each resolved host/IP the scanner performs a
+  TCP connect scan of common service ports (ssh, rdp, mysql, …), surfacing exposed
+  services without payloads or banner grabbing.
+- **Six passive enumeration sources** — certificate transparency (crt.name /
+  crt.sh / certspotter) plus hackertarget, **Wayback Machine CDX** and
+  **AlienVault OTX passive DNS**, so hosts that never had a TLS certificate are
+  still found. **Wildcard-DNS filtering** drops names that only echo a `*.` record.
+- **Offline version→CVE matching** — software versions parsed from headers,
+  titles and service banners (SSH/FTP/SMTP/MySQL) are matched against a vendored
+  high-impact CVE map (`app/cve_data.json`, 22 products / 36 CVEs). Matches are
+  tiered **CORRELATED** with an explicit verify caveat and confidence
+  (LOW/MED) badges — deterministic, offline, $0. Optional **NVD 2.0
+  enrichment** (`CTI_NVD_ENRICH=1`) adds official CVSS score/vector,
+  disk-cached and fail-open.
+- **Security-header findings** — missing HSTS/CSP/X-Frame-Options/
+  X-Content-Type-Options on reachable hosts (HSTS/CSP only expected on HTTPS;
+  auth surfaces bumped to MEDIUM).
+- **New-exposure diffing** — every scan is diffed against the previous scan's
+  baseline: newly resolved hosts and newly open service ports become
+  CONFIRMED findings, so attack-surface growth is tracked over time. A
+  dashboard quick-filter isolates them.
+- **TLS certificate inspection** — stdlib handshake (no payload) on HTTPS hosts:
+  expired and self-signed certificates become deterministic findings.
 - **Correlation engine** — derives NEW findings from existing ones: CVE fleet-spread,
   IP co-residency, InternetDB source-backed exposure.
 - **Finding detail** — `found_date`, tier (CONFIRMED / CORRELATED / AI / CLEAN),
@@ -50,10 +79,14 @@ app/
   main.py              FastAPI server + all /api endpoints + PDF render
   ai_providers.py      AI provider abstraction (ollama + openai-compatible),
                        per-org profiles, SSRF validation
+  cve_match.py         offline version->CVE matching + optional NVD enrichment
+  cve_data.json        vendored high-impact CVE map (deterministic, offline)
   cti_correlation.py   core engine: registry, normalization, correlation,
                        PII masking, status lifecycle
-  scanner.py           passive scan (CT/DNS/HTTP/fingerprint/InternetDB),
-                       AI-assisted assessment, history ledger, recheck
+  scanner.py           passive scan (6 enum sources, wildcard filter, DNS,
+                       HTTP fingerprint, TCP service-port probe, banner
+                       versions, TLS certs, InternetDB, baseline diff),
+                       AI triage, recheck
   dashboard.html       single-file frontend (graph, cards, modal, workspace, history)
   static/
     vis-network.min.js vendored graph library (no CDN dependency)
@@ -95,9 +128,10 @@ install -d -m 700 "$HOME/.config/cti-radar" "$HOME/.local/share/cti-radar"
 install -m 600 .env.example "$HOME/.config/cti-radar/server.env"
 # edit ~/.config/cti-radar/server.env with CTI_USER, CTI_PASSWORD, CTI_SCAN_TOKEN
 
-# serve on the tailnet IP (change HOST/PORT as needed)
+# Serve on loopback by default; set CTI_HOST in the private env file to a
+# specific private interface address when remote access is required.
 set -a; source "$HOME/.config/cti-radar/server.env"; set +a
-cti_host="${CTI_HOST:-100.76.85.44}"  # or 127.0.0.1 / LAN IP — never 0.0.0.0
+cti_host="${CTI_HOST:-127.0.0.1}"  # never 0.0.0.0
 CTI_DATA_DIR="${CTI_DATA_DIR:-$HOME/.local/share/cti-radar}" \
 .venv/bin/python -m uvicorn app.main:app --host $cti_host --port "${CTI_PORT:-8084}" --no-server-header
 ```
@@ -141,7 +175,8 @@ org and scan it.
 - **Frontend dependencies are vendored:** vis-network is shipped locally in
   `app/static/` — no external CDN requests. The Content-Security-Policy does
   not trust any third-party script origins.
-- **Non-intrusive scanning:** CT + DNS + HTTP reachability/header probe +
+- **Non-intrusive scanning:** certificate transparency (crt.name / crt.sh / certspotter / hackertarget) + DNS + HTTP
+  reachability/header probe + service banner capture + TCP connect scan of common service ports +
   passive InternetDB only. No payloads, no brute-force, no exploitation.
 
 ### Scanner + provider SSRF protections
@@ -211,46 +246,68 @@ FastAPI (main.py) — all routes auth-gated
 ### How correlation works
 
 Starting from seed domains (e.g. `*.example.com`), a scan enumerates subdomains
-(certificate transparency), resolves them, fingerprints reachable hosts, and
-enriches IPs from InternetDB. Then:
+(crt.name, crt.sh, certspotter, hackertarget, Wayback CDX, OTX passive DNS —
+with wildcard-DNS filtering), resolves them (inactive hosts
+are dropped), probes HTTP(S) reachability (capturing status codes via curl) and
+captures service banners (SSH/FTP/SMTP/etc. greetings) for every reachable port,
+fingerprints reachable hosts, TCP-connects common service ports on resolved IPs, and enriches
+IPs from InternetDB. It then derives **deterministic findings directly**:
 
-1. **CVE correlation** — any host sharing a CVE with a known finding → new finding.
-2. **IP co-residency** — other hosts on a confirmed finding's IP → new finding.
-3. **InternetDB** — exposed vulnerable port/CPE → source-backed finding.
+1. **Version→CVE match** (offline) — disclosed versions vs the vendored map →
+   advisory CORRELATED finding per host with NVD links and confidence.
+2. **Security headers** — missing HSTS/CSP/XFO/XCTO → LOW/MEDIUM finding.
+3. **New exposure** — diff vs the previous scan's baseline (new hosts / newly
+   open ports) → CONFIRMED finding.
+
+And the correlation engine adds derived findings from existing ones:
+
+4. **CVE correlation** — any host sharing a CVE with a known finding → new finding.
+5. **IP co-residency** — other hosts on a confirmed finding's IP → new finding.
+6. **InternetDB** — exposed vulnerable port/CPE → source-backed finding.
 
 Generated findings are tagged `CORRELATED` / `AI-ASSESSED` and are distinct from
 `CONFIRMED` originals; the dashboard's **Correlated** tab isolates them.
+Advisory `scan-cve` findings never seed further correlation (no amplification).
 
 ### How AI-assisted scanning works (`mode=ai`)
 
 A fast `mode=fast` scan is **always** the deterministic engine (subdomain
-enumeration → DNS resolution → reachability probe → fingerprint capture) and costs
-**$0** — it runs first, unconditionally, and persists `baseline.txt` + `findings.json`
-either way. `mode=ai` layers an **optional LLM read** on top of that captured
-fingerprint data; it never replaces the scan and never blocks it:
+enumeration → DNS resolution → reachability probe → HTTP fingerprint → TCP
+service-port scan) and costs **$0** — it runs first, unconditionally, and persists
+`baseline.txt` + `findings.json` either way. `mode=ai` layers an **optional,
+cheap-model-friendly classifier** on top of that captured data; it never replaces
+the scan and never blocks it:
 
-1. **Capture** — for each reachable host, the scanner stores a small, PII-safe
-   fingerprint: `{url, http_code, server, x-powered-by, title}`.
+1. **Capture** — for each reachable host the scanner stores a small, PII-safe
+   fingerprint (`url`, HTTP code, `server`, `x-powered-by`, `title`) plus the open
+   service ports found by the TCP connect scan.
 
-2. **Ask** — up to 25 fingerprinted hosts are sent as a bounded JSON payload to a
-   configured AI provider (local Ollama, hosted OpenCode/OpenRouter, or any
-   OpenAI-compatible endpoint; see `data/ai_config.example.json`).
-   The prompt explicitly walls off the fingerprint data as untrusted, instructing
-   the model to treat it strictly as data, never as instructions.
+2. **Triage** — a deterministic pre-scorer keeps only the hosts worth a second
+   look: exposed admin/DB/remote-access ports, interesting titles (`admin`,
+   `jenkins`, `citrix`, …), version disclosures in server headers, or auth-gated
+   consoles. Plain public websites are skipped. The set is capped by the profile's
+   `max_hosts` (default 10).
 
-3. **Parse** — the model's JSON response is strictly validated: targets must match
-   fingerprinted hosts, severities must be canonical, CVEs must match
-   `CVE-YYYY-NNNNN`, and fields are length-capped. Each validated item becomes a
-   finding tagged **`AI-ASSESSED`** (`status_detail: AI-ASSESSED`, `source: ai-assess`),
-   and merges into `findings.json` **deduplicated by (target, title)** — so re-runs
-   upgrade/refresh an existing AI finding instead of duplicating it. Deterministic
-   findings are never overwritten by AI output.
+3. **Classify** — the model sees one compact line per triaged host and returns a
+   tiny verdict object:
+   `{"results":[{"target","verdict":"confirm|dismiss","severity","reason"}]}`.
+   The model provides *judgment only* — it does not write full findings, so it
+   cannot drift the schema, invent CVEs, or emit unchecked prose. Ollama uses
+   `format:"json"`; OpenAI-compatible endpoints use `response_format:
+   json_object` (with a retry without it); both cap `max_tokens`/`num_predict`.
 
-4. **Fail-safe** — the model call runs in a strict try/except with an **absolute
-   fallback**: missing API key, a non-200 response, bad JSON, or a timeout all
-   return `None`/`[]` and the scan records the event
-   (`AI assessment failed/unavailable`) and returns the **already-complete
-   deterministic result**. An AI run can never take down or alter a fast scan.
+4. **Expand, validate, merge** — confirmed verdicts are expanded into findings by
+   templates and tagged **`AI-ASSESSED`** (`source: ai-assess`), then strictly
+   validated (target whitelist, canonical severities) and merged into
+   `findings.json` deduplicated by `(target, title)`. On malformed JSON one
+   self-repair retry is attempted; legacy full-finding responses are still
+   accepted. Deterministic findings are never overwritten by AI output.
+
+5. **Fail-safe** — the model call runs in a strict try/except with an absolute
+   fallback: missing API key, a non-200 response, bad JSON, or a timeout all
+   return `None`/`[]`, the event is recorded (`AI assessment failed/unavailable`),
+   and the scan returns the **already-complete deterministic result**. An AI run
+   can never take down or alter a fast scan.
 
 ### Provider configuration
 
@@ -267,7 +324,7 @@ Create `~/.config/cti-radar/ai_config.json` (copy from
       "base_url": "http://127.0.0.1:11434",
       "model": "hermes3",
       "timeout": 90,
-      "max_hosts": 25
+      "max_hosts": 10
     },
     "opencode": {
       "provider": "openai-compatible",
@@ -275,7 +332,7 @@ Create `~/.config/cti-radar/ai_config.json` (copy from
       "model": "muse-spark-1.2-contributor",
       "api_key_env": "OPENCODE_GO_B_API_KEY",
       "timeout": 90,
-      "max_hosts": 25
+      "max_hosts": 10
     }
   }
 }
@@ -284,11 +341,36 @@ Create `~/.config/cti-radar/ai_config.json` (copy from
 Profiles are validated at load time: non-loopback HTTP is rejected, private IPs
 are rejected, environment proxy settings are bypassed, and redirects are blocked.
 API keys are referenced by environment variable name only — never stored in the
-config file.
+config file. `max_hosts` caps the pre-triaged set the model sees (default 10).
+Structured JSON mode is requested (`format:"json"` for Ollama,
+`response_format: json_object` for OpenAI-compatible, with a retry without it) and
+generation is token-capped.
 
 The split is deliberately clean: **deterministic capture is the source of truth,
 $0, and self-healing; the LLM is an optional interpretive pass that adds
 vulnerability-context findings on top.**
+
+## OpenHack active-assessment authorization
+
+OpenHack is an **active external assessment**, not the passive CTI scanner. Use it
+only with written authorization and a time-bounded rules of engagement (ROE).
+At request time the active gate requires `CTI_OPENHACK_ACTIVE=1`, `CTI_OPENHACK_ISOLATED=1`, and an explicit absolute `CTI_OPENHACK_BIN` (a disposable-container wrapper);
+`CTI_OPENHACK_ALLOWED_DOMAINS` must list every registered target exactly (DNS names
+only; no wildcards, URLs, paths, ports, IPs, or suffix matches), and
+`CTI_OPENHACK_ROE_EXPIRES` must be a future timezone-aware RFC3339/ISO-8601
+timestamp. The org's OpenHack opt-in and normal authentication are also required.
+
+```dotenv
+CTI_OPENHACK_ACTIVE=1
+CTI_OPENHACK_ISOLATED=1
+CTI_OPENHACK_ALLOWED_DOMAINS=example.com,api.example.com
+CTI_OPENHACK_ROE_EXPIRES=2030-01-01T00:00:00Z
+# Prefer a wrapper that launches OpenHack in a disposable container:
+CTI_OPENHACK_BIN=/usr/local/bin/openhack-disposable-container-wrapper
+```
+
+Keep targets exact and scoped to the written ROE. Login throttling uses the directly connected source IP; configure rate limiting at the reverse proxy too for defense in depth. Do not point
+`CTI_OPENHACK_BIN` at a host binary; use a disposable-container wrapper instead.
 
 ## Testing
 
@@ -298,9 +380,20 @@ cd cti-dashboard
 python -m pytest tests/ -v
 ```
 
-25 tests covering: tenant authentication, unknown org rejection, graph XSS
+183 tests covering: tenant authentication, unknown org rejection, graph XSS
 prevention, PDF PII masking, job state retention, provider URL SSRF validation,
-session cookie security, CSP enforcement, and registration limits.
+session cookie security, CSP enforcement, registration limits, the
+cheap-model AI triage flow (pre-filter, compact prompt, classifier parsing,
+template expansion, and self-repair retry), AI grading with exposure
+verification (`still_open` read of the latest probe data), probe-evidence
+refresh on existing findings, deterministic login-portal / version-disclosure
+findings, the Wayback/OTX enum sources + wildcard-DNS filtering, the offline
+version→CVE map (comparator edges, alias normalization, banner-derived
+versions, no-correlation-amplification) + optional NVD enrichment
+(cache, fail-open), security-header findings, baseline-diff new-exposure
+sequencing, resolver-pool + InternetDB-cache behavior, and evidence-based AI
+prompt enrichment (CVE candidates, missing-header signals, sanitizer
+neutralization).
 
 ## Preview
 

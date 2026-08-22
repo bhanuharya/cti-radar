@@ -3,23 +3,33 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=yes">
-<meta name="theme-color" content="#0B0F0D">
+<meta name="theme-color" content="#000000">
+<link rel="manifest" href="/static/manifest.json">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23000000'/%3E%3Crect x='3' y='3' width='4' height='2.5' fill='%2350fa7b'/%3E%3Crect x='3' y='8' width='10' height='2.5' fill='%2350fa7b'/%3E%3Crect x='3' y='13' width='6' height='2.5' fill='%2350fa7b'/%3E%3C/svg%3E">
 <title>CTI Radar — Correlation Dashboard</title>
 <style>
   :root {
-    --bg:#0B0F0D; --bg2:#0F150F; --panel:#111713; --panel2:#17201A;
-    --border:#26352A; --border2:#1a211a;
-    --txt:#F1F5F2; --dim:#9AA99E;
-    --red:#FF4D5E; --orange:#FF9F43; --yellow:#F4C95D; --blue:#4DA3FF;
-    --info:#87948C; --green:#3ddc84; --amber:#ffc24d; --purple:#c084fc;
+    --bg:#000000; --bg2:#0a0a0a; --panel:#0d0d0d; --panel2:#141414;
+    --border:#2a2a2a; --border2:#1c1c1c;
+    --txt:#d0d0d0; --dim:#7a7a7a;
+    --red:#ff5555; --orange:#ffb86c; --yellow:#f1fa8c; --blue:#8be9fd;
+    --info:#9aa5a0; --green:#50fa7b; --amber:#ffb86c; --purple:#bd93f9;
     --radius:10px; --card-pad:18px; --gap:24px;
-    --sans:system-ui,-apple-system,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;
+    --sans:'JetBrains Mono','Fira Code','SF Mono','Cascadia Mono',Consolas,'Courier New',monospace;
     --mono:'JetBrains Mono','Fira Code','SF Mono','Cascadia Mono',Consolas,'Courier New',monospace;
+    --glow:0 0 6px rgba(80,250,123,.28);
   }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html { scroll-behavior:smooth; }
+  /* normalize all form controls to the app's mono type scale (overridable) */
+  button, input, select, textarea { font-family:var(--mono); font-size:12px; }
   html,body { margin:0; padding:0; }
-  body { background:var(--bg); color:var(--txt); font-family:var(--sans); font-size:14px;
+  body { background:var(--bg); color:var(--txt); font-family:var(--mono); font-size:14px;
          line-height:1.5; overflow-x:hidden; }
+  body::before { content:""; position:fixed; inset:0; z-index:2147483000; pointer-events:none;
+    background:repeating-linear-gradient(0deg, rgba(255,255,255,.02) 0 1px, transparent 1px 3px);
+    mix-blend-mode:screen; }
   a { color:var(--green); }
 
   /* ---------- top bar ---------- */
@@ -28,14 +38,16 @@
     padding:18px 16px; padding-top:calc(18px + env(safe-area-inset-top));
     background:var(--bg2); border-bottom:1px solid var(--border);
     position:sticky; top:0; z-index:50;
+    max-width:100%; overflow:hidden;
   }
-  .brand { display:flex; align-items:center; gap:12px; min-width:0; }
-  .brandmark { width:34px; height:34px; border-radius:9px; flex:0 0 auto;
+  .brand { display:flex; align-items:center; gap:12px; min-width:0; max-width:100%; overflow:hidden; }
+  .brand > div { min-width:0; }
+  .brandmark { width:34px; height:34px; border-radius:4px; flex:0 0 auto;
                display:flex; align-items:center; justify-content:center;
-               background:linear-gradient(135deg,#17201A,#111713);
+               background:#000000;
                border:1px solid var(--green); color:var(--green);
                font-family:var(--mono); font-size:13px; font-weight:700; }
-  .topbar h1 { margin:0; font-size:clamp(24px,3vw,30px); font-weight:700; line-height:1.15; color:var(--txt); }
+  .topbar h1 { margin:0; font-size:clamp(22px,3vw,30px); font-weight:700; line-height:1.15; color:var(--green); letter-spacing:.5px; min-width:0; overflow-wrap:anywhere; }
   .accent { color:var(--green); }
   .topbar .sub { color:var(--dim); font-size:12px; margin-top:4px; line-height:1.5; }
   .topbar .asof { color:var(--dim); font-size:11px; font-family:var(--mono);
@@ -50,7 +62,7 @@
   select.orgsel {
     appearance:none; -webkit-appearance:none;
     background:var(--panel2); border:1px solid var(--border); color:var(--txt);
-    font-family:var(--mono); font-size:13px; padding:7px 12px; border-radius:8px;
+    font-family:var(--mono); font-size:12px; padding:7px 12px; border-radius:8px;
     cursor:pointer; max-width:220px;
   }
   select.orgsel:focus { outline:none; border-color:var(--green); }
@@ -61,21 +73,36 @@
   .wsfield { display:flex; flex-direction:column; gap:4px; min-width:0; }
   .wsfield label { font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.4px; }
   .wsfield input { background:var(--panel2); border:1px solid var(--border); color:var(--txt);
-                   font-family:var(--mono); font-size:13px; padding:8px 10px; border-radius:8px; width:100%; }
+                   font-family:var(--mono); font-size:12px; padding:8px 10px; border-radius:8px; width:100%; }
   .wsfield input::placeholder { color:var(--dim); opacity:.6; }
   .wsfield input:focus { outline:none; border-color:var(--green); }
   .wsfield select { background:var(--panel2); border:1px solid var(--border); color:var(--txt);
-                    font-family:var(--mono); font-size:13px; padding:8px 10px; border-radius:8px;
+                    font-family:var(--mono); font-size:12px; padding:8px 10px; border-radius:8px;
                     width:100%; cursor:pointer; }
   .wsfield select:focus { outline:none; border-color:var(--green); }
-  .wsfield.actions { justify-content:flex-end; flex-direction:row; align-items:flex-end; gap:8px; flex-wrap:wrap; }
+  .wsfield.actions { display:flex; flex-direction:column; gap:12px; grid-column:1 / -1; }
+  .bgroup { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; flex:1 1 auto; min-width:0; }
+  .bgroup .bcap { grid-column:1 / -1; font-size:10px; text-transform:uppercase;
+                  letter-spacing:.6px; color:var(--dim); margin-bottom:-2px; }
+  .bgroup .btn.primary { grid-column:1 / -1; }
+  .bgroup select { grid-column:1 / -1; width:100%; max-width:none; }
+  .wsfield.ws-wide { grid-column:1 / -1; }
+  .wsdomrow { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .wsdomrow input { flex:1 1 220px; width:auto; }
+  .domchips { display:flex; flex-wrap:wrap; gap:6px; margin-top:2px; }
+  .domchip { display:inline-flex; align-items:center; gap:6px; background:var(--panel2);
+             border:1px solid var(--border); color:var(--txt); font-family:var(--mono);
+             font-size:12px; border-radius:8px; padding:4px 8px; }
+  .domchip .dx { color:var(--dim); cursor:pointer; font-size:14px; line-height:1;
+                 padding:0 2px; background:none; border:none; font-family:var(--mono); }
+  .domchip .dx:hover { color:var(--red); }
   .btn { background:var(--panel2); border:1px solid var(--border); color:var(--txt);
          font-family:var(--mono); font-size:12px; padding:8px 14px; border-radius:8px;
          cursor:pointer; white-space:nowrap; }
   .btn:hover { border-color:var(--green); color:var(--green); }
   .btn:disabled { opacity:.5; cursor:not-allowed; }
-  .btn.primary { background:var(--green); border-color:var(--green); color:#0B0F0D; font-weight:700; }
-  .btn.primary:hover { filter:brightness(1.12); color:#0B0F0D; }
+  .btn.primary { background:var(--green); border-color:var(--green); color:#000000; font-weight:700; }
+  .btn.primary:hover { filter:brightness(1.12); color:#000000; }
   .wsmsg { margin-top:10px; font-size:12px; min-height:18px; font-family:var(--mono); color:var(--dim); }
   .wsmsg.ok { color:var(--green); }
   .wsmsg.err { color:var(--red); }
@@ -83,6 +110,12 @@
          border-radius:8px; font-family:var(--mono); font-size:12px; color:var(--dim); display:none; }
   .job .jhead { color:var(--txt); font-weight:700; }
   .job table { margin-top:6px; }
+  .job .jstat { display:flex; align-items:center; gap:8px; margin-top:6px; }
+  .job .jerr { color:var(--red); }
+  .job .jok { color:var(--green); }
+  .spinner { width:12px; height:12px; border-radius:50%; border:2px solid var(--border);
+             border-top-color:var(--green); animation:spin .8s linear infinite; display:inline-block; }
+  @keyframes spin { to { transform:rotate(360deg); } }
 
   /* ---------- KPIs ---------- */
   .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
@@ -110,12 +143,12 @@
                border-bottom:1px solid var(--border); position:relative; }
   .graphwrap #graph { position:absolute; top:0; left:0; right:0; bottom:0; }
   .graphstats { position:absolute; top:12px; left:12px; z-index:10; color:var(--dim);
-                font-size:12px; font-family:var(--mono); background:rgba(11,15,13,.85);
-                padding:4px 10px; border:1px solid var(--border); border-radius:8px;
+                font-size:12px; font-family:var(--mono); background:rgba(10,10,10,.85);
+                padding:4px 10px; border:1px solid var(--border); border-radius:4px;
                 pointer-events:none; }
   .legend { position:absolute; bottom:12px; left:12px; z-index:10;
-            background:rgba(11,15,13,.92); border:1px solid var(--border);
-            border-radius:10px; padding:10px 12px; font-size:12px; color:var(--dim);
+            background:rgba(10,10,10,.92); border:1px solid var(--border);
+            border-radius:4px; padding:10px 12px; font-size:12px; color:var(--dim);
             backdrop-filter:blur(4px); }
   .legend .lbl { font-size:11px; letter-spacing:.4px; color:var(--dim); margin-bottom:6px; }
   .legend .row { display:flex; align-items:center; gap:8px; margin:3px 0; }
@@ -125,7 +158,9 @@
   .side { display:flex; flex-direction:column; gap:var(--gap); padding:var(--gap) 16px 0; }
   .panel { background:var(--panel); border:1px solid var(--border);
            border-radius:var(--radius); padding:var(--card-pad); }
-  .panel h3 { margin:0 0 12px; font-size:16px; font-weight:600; color:var(--txt); line-height:1.3; }
+  .panel h3 { margin:0 0 12px; font-size:15px; font-weight:700; color:var(--green); line-height:1.3;
+              letter-spacing:.5px; }
+  .panel h3::before { content:'▸ '; color:var(--green); }
   .count { display:inline-block; background:var(--panel2); border:1px solid var(--border);
            border-radius:999px; padding:1px 10px; font-size:12px; color:var(--dim);
            margin-left:6px; vertical-align:middle; }
@@ -140,6 +175,23 @@
   .mono.cve { color:var(--amber); }
   .mono.ip { color:var(--blue); }
   .empty { color:var(--dim); font-size:12px; padding:10px 0; text-align:center; }
+
+  /* collapsible panel headers + internal scroll areas */
+  .panelhead { display:flex; align-items:center; justify-content:space-between; gap:10px;
+               margin-bottom:12px; flex-wrap:wrap; }
+  .panelhead h3 { margin:0; }
+  .panelbody { min-width:0; }
+  .panel-toggle { padding:4px 10px; font-size:11px; }
+  .table-scroll { overflow-x:auto; overscroll-behavior:contain;
+                  border:1px solid var(--border2); border-radius:8px; }
+  .table-scroll table { border-collapse:separate; border-spacing:0; width:100%; }
+  .table-scroll th { background:var(--panel2); }
+  .side, .findings, .table-scroll, .modal-body {
+    scrollbar-width:thin; scrollbar-color:var(--border) transparent; }
+  .findings::-webkit-scrollbar, .table-scroll::-webkit-scrollbar { width:8px; height:8px; }
+  .findings::-webkit-scrollbar-thumb, .table-scroll::-webkit-scrollbar-thumb {
+    background:var(--border); border-radius:8px; }
+  .findings::-webkit-scrollbar-track, .table-scroll::-webkit-scrollbar-track { background:transparent; }
 
   /* ---------- findings ---------- */
   .panel.findings { margin:var(--gap) 16px 0; }
@@ -159,23 +211,58 @@
                    font-size:12px; padding:5px 10px; border-radius:8px; cursor:pointer; }
   select.sortsel:focus { outline:none; border-color:var(--green); }
 
-  .findings { display:grid; gap:12px; margin-top:14px; grid-template-columns:minmax(0,1fr); }
+  /* multi-select severity chips */
+  .sevchips { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+  .chip { background:var(--panel2); border:1px solid var(--border); color:var(--dim);
+          font-family:var(--mono); font-size:11px; font-weight:700; padding:5px 11px;
+          border-radius:999px; cursor:pointer; letter-spacing:.4px; }
+  .chip:hover { border-color:var(--green); color:var(--txt); }
+  .chip[aria-pressed="true"] { border-color:var(--green); color:var(--green); background:rgba(61,220,132,.12); }
+  .chip[data-sev="CRITICAL"][aria-pressed="true"] { border-color:var(--red); color:var(--red); background:rgba(255,77,94,.12); }
+  .chip[data-sev="HIGH"][aria-pressed="true"] { border-color:var(--orange); color:var(--orange); background:rgba(255,159,67,.12); }
+  .chip[data-sev="MEDIUM"][aria-pressed="true"] { border-color:var(--yellow); color:var(--yellow); background:rgba(244,201,93,.14); }
+  .chip[data-sev="LOW"][aria-pressed="true"] { border-color:var(--blue); color:var(--blue); background:rgba(77,163,255,.12); }
+  .chip[data-sev="INFO"][aria-pressed="true"] { border-color:var(--info); color:var(--info); background:rgba(135,148,140,.12); }
+
+  .findings { display:grid; gap:10px; margin-top:14px; grid-template-columns:minmax(0,1fr); }
+  .pagination.compact { margin-top:10px; padding-top:8px; }
+  .pagination.bottom { margin-top:12px; }
+  .pagination { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+                margin-top:14px; padding-top:10px; border-top:1px solid var(--border2); }
+  .pagination[hidden] { display:none; }
+  .pinfo { color:var(--dim); font-size:12px; font-family:var(--mono); }
+  .pagination .spacer { flex:1 1 auto; }
+  .pagination label { font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.4px; }
+  .pbtn { background:var(--panel2); border:1px solid var(--border); color:var(--txt);
+          font-family:var(--mono); font-size:12px; padding:6px 12px; border-radius:8px;
+          cursor:pointer; }
+  .pbtn:hover:not(:disabled) { border-color:var(--green); color:var(--green); }
+  .pbtn:disabled { opacity:.4; cursor:not-allowed; }
+
   .fcard { background:var(--panel2); border:1px solid var(--border);
            border-radius:var(--radius); padding:var(--card-pad); min-width:0;
            overflow-wrap:anywhere; word-break:break-word;
-           cursor:pointer; transition:border-color .15s, transform .15s; }
+           transition:border-color .15s, box-shadow .15s; }
   .fcard * { max-width:100%; overflow-wrap:anywhere; word-break:break-word; }
   .fcard:hover { border-color:var(--green); }
-  .fcard:active { transform:scale(.995); }
-  .fhead { display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0; }
-  .fid { font-family:var(--mono); font-size:12px; font-weight:700; color:var(--txt);
+  .fhead { display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0;
+           cursor:pointer; user-select:none; }
+  .fchev { flex:0 0 auto; width:18px; height:18px; display:inline-flex; align-items:center;
+           justify-content:center; color:var(--dim); font-family:var(--mono); font-size:12px;
+           transition:transform .15s ease; }
+  .fcard.collapsed .fchev { transform:rotate(-90deg); }
+  .fid { font-family:var(--mono); font-size:12px; font-weight:700; color:var(--green);
          background:var(--bg); border:1px solid var(--green); border-radius:6px;
          padding:2px 8px; letter-spacing:.5px; white-space:nowrap; }
   .ftitle { margin:0; font-size:15px; font-weight:600; line-height:1.4; color:var(--txt);
             flex:1 1 auto; min-width:0; overflow-wrap:anywhere; word-break:break-word; }
-  .viewhint { margin-left:auto; font-size:11px; font-family:var(--mono); color:var(--dim); }
-  .fcard:hover .viewhint { color:var(--green); }
-  .fcat { margin-top:10px; font-size:12px; color:var(--dim); line-height:1.5; overflow-wrap:anywhere; }
+  .fview { margin-left:auto; background:var(--bg); border:1px solid var(--border);
+           color:var(--dim); font-family:var(--mono); font-size:11px; padding:4px 10px;
+           border-radius:7px; cursor:pointer; white-space:nowrap; }
+  .fview:hover { border-color:var(--green); color:var(--green); }
+  .fbody { margin-top:12px; padding-top:2px; }
+  .fcard.collapsed .fbody { display:none; }
+  .fcat { margin-top:0; font-size:12px; color:var(--dim); line-height:1.5; overflow-wrap:anywhere; }
   .fcve { margin-top:10px; display:flex; flex-wrap:wrap; gap:6px 12px; min-width:0; }
   .cve-link { color:var(--amber); font-family:var(--mono); font-size:12px; text-decoration:none;
               overflow-wrap:anywhere; word-break:break-word; }
@@ -206,6 +293,9 @@
   .tag.correlated { background:rgba(77,163,255,.14); color:var(--blue); border-color:rgba(77,163,255,.4); }
   .tag.other { background:rgba(135,148,140,.14); color:var(--info); border-color:rgba(135,148,140,.4); }
   .tag.ai { background:rgba(192,132,252,.14); color:var(--purple); border-color:rgba(192,132,252,.4); }
+  .tag.conf-low { background:rgba(244,201,93,.14); color:var(--yellow); border-color:rgba(244,201,93,.4); }
+  .tag.conf-medium { background:rgba(77,163,255,.10); color:var(--blue); border-color:rgba(77,163,255,.35); }
+  .tag.conf-high { background:rgba(61,220,132,.10); color:var(--green); border-color:rgba(61,220,132,.35); }
   .tag.clean { background:rgba(61,220,132,.14); color:var(--green); border-color:rgba(61,220,132,.4); }
 
   /* ---------- severity badges ---------- */
@@ -252,7 +342,7 @@
   .modal-head { display:flex; align-items:flex-start; gap:12px; padding:18px 20px;
                 border-bottom:1px solid var(--border); background:var(--panel2); }
   .mhead-inner { min-width:0; flex:1 1 auto; }
-  .mtitle { margin:0; font-size:19px; font-weight:700; line-height:1.3; color:var(--txt);
+  .mtitle { margin:0; font-size:19px; font-weight:700; line-height:1.3; color:var(--green);
             word-break:break-word; }
   .mheadrow { display:flex; align-items:center; gap:10px; margin-top:10px; flex-wrap:wrap; }
   .mid { font-family:var(--mono); font-size:12px; color:var(--dim); }
@@ -265,7 +355,7 @@
           border-bottom:1px solid var(--border2); }
   .drow:last-child { border-bottom:none; }
   .dlabel { font-size:11px; font-weight:600; letter-spacing:.5px; text-transform:uppercase;
-            color:var(--dim); }
+            color:var(--green); }
   .dvalue { font-size:13px; color:var(--txt); line-height:1.55; word-break:break-word; }
   .dtitle { font-size:15px; font-weight:600; color:var(--txt); }
   .ullist { margin:2px 0 0; padding-left:20px; color:var(--txt); }
@@ -282,18 +372,19 @@
   .history { margin-top:6px; display:flex; flex-direction:column; gap:6px;
              font-family:var(--mono); }
   .hevent { font-family:var(--mono); font-size:12px; line-height:1.55;
-            background:rgba(10,16,22,.92); border:1px solid var(--border2);
-            border-left:3px solid var(--accent,#F4C95D); border-radius:6px;
+            background:rgba(10,10,10,.92); border:1px solid var(--border2);
+            border-left:3px solid var(--amber); border-radius:4px;
             padding:7px 10px; position:relative; }
-  .htime { color:var(--dim,#87948c); font-size:10px; letter-spacing:.4px;
+  .htime { color:var(--dim); font-size:10px; letter-spacing:.4px;
            opacity:.9; text-transform:none; }
-  .htrans { color:var(--txt,#e8edf0); }
-  .htrans .prompt { color:var(--accent,#F4C95D); }          /* terminal prompt marker */
-  .htrans .arrow { color:var(--amber,#F4C95D); font-weight:700; }   /* -> transition */
-  .hby { color:var(--dim,#87948c); font-size:11px; }
-  .hnote { color:var(--amber,#F4C95D); margin-top:3px; word-break:break-word;
+  .htrans { color:var(--txt); }
+  .htrans .prompt { color:var(--amber); }          /* terminal prompt marker */
+  .htrans .arrow { color:var(--amber); font-weight:700; }   /* -> transition */
+  .hevent.ai { border-left-color:var(--green); } /* agent reply */
+  .hby { color:var(--dim); font-size:11px; }
+  .hnote { color:var(--amber); margin-top:3px; word-break:break-word;
            font-weight:600; }
-  .hnote::before { content:'▸ '; color:var(--dim,#87948c); }
+  .hnote::before { content:'▸ '; color:var(--dim); }
   .stedit { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:4px; }
   select.stsel, input.stinput { background:var(--panel2); border:1px solid var(--border);
         color:var(--txt); font-family:var(--mono); font-size:12px; padding:7px 10px; border-radius:8px; }
@@ -302,58 +393,154 @@
   .stmsg { width:100%; font-size:11px; font-family:var(--mono); color:var(--dim); min-height:14px; }
   .stmsg.err { color:var(--red); }
   .stmsg.ok { color:var(--green); }
+  .commentbox { display:flex; flex-direction:column; gap:8px; margin-top:4px; }
+  .commentbox textarea { background:var(--panel2); border:1px solid var(--border);
+    color:var(--txt); font-family:var(--mono); font-size:12px; padding:8px 10px;
+    border-radius:8px; resize:vertical; min-height:52px; width:100%; box-sizing:border-box; }
+  .commentbox textarea:focus { outline:none; border-color:var(--green); }
+  .commentrow { display:flex; align-items:center; gap:8px; }
 
   @media (max-width:600px) {
-    .modal-overlay { padding:0; align-items:stretch; }
-    .modal-card { max-width:none; max-height:100vh; height:100%; border-radius:0; border:none; }
-    .modal-head { padding:14px 16px; padding-top:calc(14px + env(safe-area-inset-top)); }
+    /* bottom sheet: slides up, rounded top, swipe the handle to dismiss */
+    .modal-overlay { padding:0; align-items:flex-end; background:rgba(0,0,0,.72); }
+    .modal-card { max-width:none; width:100%; max-height:88dvh; height:auto;
+                  border:none; border-top:1px solid var(--border);
+                  border-radius:16px 16px 0 0;
+                  padding-bottom:calc(8px + env(safe-area-inset-bottom));
+                  animation:sheetup .22s ease-out;
+                  transition:transform .18s ease-out; }
+    .modal-card.dragging { transition:none; }
+    .modal-card::before { content:""; display:block; flex:0 0 auto;
+                          width:44px; height:4px; border-radius:2px;
+                          background:var(--border); margin:8px auto 0; }
+    @keyframes sheetup { from { transform:translateY(28px); opacity:.35; } }
+    .modal-head { padding:6px 16px 10px; }
     .modal-body { padding:6px 16px 16px; }
     .mtitle { font-size:17px; }
   }
 
   /* ---------- scan history panel ---------- */
+  .adminpanel td.mono { white-space:nowrap; }
+  .lvlinfo { color:var(--blue); }
+  .lvlwarn { color:var(--amber); }
+  .lvlerror { color:var(--red); }
   .panel.historypanel { margin:var(--gap) 16px 0; }
+  .opsgrid { display:flex; flex-direction:column; gap:var(--gap); margin:var(--gap) 16px 0; }
+  .opsgrid .panel { margin:0; }
   .historypanel table { display:block; overflow-x:auto; white-space:nowrap; }
   .historypanel th, .historypanel td { white-space:normal; }
   .historypanel td.mono { white-space:nowrap; }
 
-  .foot { text-align:center; padding:24px 16px; color:var(--dim); font-size:11px; }
+  .foot { text-align:center; padding:24px 16px; color:var(--dim); font-size:11px;
+          font-family:var(--mono); }
 
   @media (min-width:900px) {
     .layout { display:grid; grid-template-columns:minmax(0,1fr) 360px; gap:var(--gap);
               padding:var(--gap) 20px 0; align-items:start; }
     .graphwrap { height:76vh; border:1px solid var(--border); border-radius:var(--radius); }
-    .side { max-height:76vh; overflow-y:auto; padding:0; }
+    .side { padding:0; }
     .panel.findings { margin:var(--gap) 20px 0; }
-    .panel.historypanel { margin:var(--gap) 20px 0; }
+    .opsgrid { display:grid; grid-template-columns:1fr 1.2fr; gap:var(--gap);
+               margin:var(--gap) 20px 0; align-items:start; }
     .panel.workspace { margin:var(--gap) 20px 0; }
     .topbar { padding:20px 24px; padding-top:calc(20px + env(safe-area-inset-top)); }
     .kpis { padding:var(--gap) 20px 0; }
     body { font-size:14px; }
+    .wsfield.actions { flex-direction:row; flex-wrap:wrap; align-items:flex-start; }
+    .wsfield.actions .bgroup { flex:1 1 280px; max-width:420px; }
+    .wsfield.actions .bgroup-wide { flex:0 1 180px; }
   }
   @media (max-width:600px) {
     .topbar { flex-wrap:wrap; }
     .topright { width:100%; justify-content:flex-start; }
     .orgsel { flex:1 1 auto; max-width:none; }
-    .wsfield.actions { justify-content:flex-start; }
+    /* one calm column for every workspace field */
+    .wsgrid { grid-template-columns:1fr; }
+    .wsfield.actions .btn { width:100%; white-space:normal; line-height:1.3;
+                            padding:10px 6px; text-align:center; }
+    .topbar .sub { max-width:100%; overflow:hidden; text-overflow:ellipsis;
+                   white-space:nowrap; }
+  }
+  @media (max-width:380px) {
+    .topbar .sub { display:none; }
+  }
+
+  /* ---------- findings filter ergonomics (<=600px) ---------- */
+  @media (max-width:600px) {
+    .findhead { flex-direction:column; align-items:stretch; gap:10px; }
+    .findhead h3 { display:flex; align-items:center; justify-content:space-between; }
+    /* tier tabs own a row; horizontal scroll if tight */
+    .ftabs { overflow-x:auto; scrollbar-width:none; }
+    .ftabs::-webkit-scrollbar { display:none; }
+    .ftab { min-height:40px; }
+    /* sort + status as a tidy 2x2 grid */
+    .sortwrap { display:grid; grid-template-columns:auto 1fr auto 1fr;
+                align-items:center; gap:6px 8px; }
+    .sortwrap > label { white-space:nowrap; }
+    .sortwrap > select { width:100%; min-width:0; min-height:40px; }
+    /* severity chips become a snap-scroll strip with real tap targets */
+    .sortwrap > .sevchips { grid-column:1 / -1; flex-wrap:nowrap;
+                            overflow-x:auto; -webkit-overflow-scrolling:touch;
+                            scrollbar-width:none; padding-bottom:2px; }
+    .sortwrap > .sevchips::-webkit-scrollbar { display:none; }
+    .sevchips .chip { flex:0 0 auto; min-height:40px; padding:8px 14px; }
+    .sortwrap > .btn { min-height:40px; padding:8px 12px; }
+    #findings-collapseall, #findings-refresh { justify-self:end; }
+  }
+
+  /* generous touch targets on coarse pointers, everywhere */
+  @media (pointer:coarse) {
+    .btn, .chip, .ftab, .pagination button, .pageprev, .pagenext,
+    .fleetprev, .fleetnext, .ipsprev, .ipsnext { min-height:44px; }
+    .pagination button, .pageprev, .pagenext,
+    .fleetprev, .fleetnext, .ipsprev, .ipsnext { min-width:44px; }
   }
   @media (max-width:500px) {
     .graphwrap { height:50vh; min-height:340px; }
+    /* legend: compact wrapping chip strip instead of a tall fixed column */
+    .legend { right:12px; bottom:8px; left:auto; padding:6px 8px; font-size:11px;
+              max-width:calc(100% - 24px); }
+    .legend .lbl { display:inline-block; margin:0 6px 0 0; }
+    .legend .row { display:inline-flex; margin:2px 8px 2px 0; }
+    .kpi { padding:10px 12px; border-radius:8px; }
+    .kpi .kpi-num { margin-top:2px; }
     .topbar h1 { font-size:24px; }
     .topbar .asof { display:none; }
     .kpis { grid-template-columns:repeat(2,1fr); }
     .kpi .kpi-num { font-size:26px; }
   }
 
-.login-overlay{position:fixed;inset:0;z-index:999;display:flex;align-items:center;justify-content:center;background:rgba(5,10,16,.92);}
-.login-card{background:var(--panel,#0d141a);border:1px solid var(--line,#1e2a33);border-radius:14px;padding:32px 26px;width:min(340px,90vw);display:flex;flex-direction:column;gap:12px;}
+  /* sticky quick navigation for mobile users */
+  .mobilenav { display:none; }
+  [id] { scroll-margin-top: 96px; }
+  @media (max-width:600px) {
+    body { padding-bottom:calc(66px + env(safe-area-inset-bottom)); }
+    .mobilenav { display:flex; position:fixed; left:0; right:0; bottom:0; z-index:60;
+                 background:rgba(10,10,10,.96); border-top:1px solid var(--border);
+                 backdrop-filter:blur(6px); padding:6px 8px;
+                 padding-bottom:calc(6px + env(safe-area-inset-bottom)); }
+    .mobilenav a { flex:1 1 0; text-align:center; color:var(--dim); font-size:11px;
+                   font-family:var(--mono); text-decoration:none; padding:8px 4px;
+                   border-radius:8px; }
+    .mobilenav a:active, .mobilenav a:focus { background:var(--panel2); color:var(--green); }
+  .mobilenav a.active { color:var(--green); }
+  #mobilenav.jobbusy::after { content:""; position:absolute; top:7px; right:12px;
+      width:9px; height:9px; border-radius:50%; background:var(--green);
+      box-shadow:0 0 10px var(--green); animation:pulse 1.3s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity:.3; } }
+  }
+
+.login-overlay{position:fixed;inset:0;z-index:999;display:flex;align-items:center;justify-content:center;background:rgba(1,10,4,.94);}
+.login-card{background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:32px 26px;width:min(340px,90vw);display:flex;flex-direction:column;gap:12px;}
 .login-brand{display:flex;align-items:center;gap:10px;}
-.login-card h2{font-size:20px;margin:0;}
-.login-card input{padding:11px 12px;border-radius:8px;background:#0a0f14;border:1px solid var(--line,#1e2a33);color:var(--text,#e8edf0);}
-.login-sub{color:var(--dim,#87948c);font-size:12px;margin:0;}
-.login-hint{color:var(--dim,#87948c);font-size:10px;text-align:center;}
-.btn.ghost{background:transparent;border:1px solid var(--line,#1e2a33);color:var(--dim,#87948c);}
-.btn.ghost:hover{color:var(--text,#e8edf0);border-color:var(--accent,#F4C95D);}
+.login-card h2{font-size:20px;margin:0;color:var(--green);}
+.login-card input{font-family:var(--mono);font-size:12px;padding:11px 12px;border-radius:4px;background:var(--bg);border:1px solid var(--border);color:var(--txt);}
+.login-card input:focus{outline:none;border-color:var(--green);}
+.login-sub{color:var(--dim);font-size:12px;margin:0;}
+.login-hint{color:var(--dim);font-size:10px;text-align:center;}
+.btn.ghost{background:transparent;border:1px solid var(--border);color:var(--dim);}
+.btn.ghost:hover{color:var(--green);border-color:var(--green);}
+button:disabled{opacity:.45;cursor:wait;}
 </style>
 </head>
 <body>
@@ -382,18 +569,53 @@
       <span class="orglabel">org</span>
       <span class="orgname" id="orgname"></span>
       <select class="orgsel" id="orgsel" aria-label="Select organization"><option>Loading…</option></select>
+      <button class="btn ghost" id="neworg-btn" type="button" title="Register a new organization (workspace)">＋ New org</button>
     </div>
+    <button class="btn ghost" id="refresh-btn" type="button" title="Refresh all data">Refresh</button>
     <button class="btn ghost" id="logout-btn" type="button" title="Sign out">Logout</button>
     <div class="asof" id="asof"></div>
   </div>
 </header>
 
-<div class="panel workspace">
-  <div class="wsgrid">
-    <div class="wsfield"><label>slug</label><input id="ws-slug" autocomplete="off" spellcheck="false" placeholder="acme-corp">
+<nav class="mobilenav" id="mobilenav" aria-label="Section navigation">
+  <a href="#workspace">Scan</a>
+  <a href="#graph-section">Graph</a>
+  <a href="#findings-section">Findings</a>
+  <a href="#history-section">History</a>
+  <a href="#ops-section">Logs</a>
+</nav>
+
+<div class="panel workspace" id="workspace">
+  <div class="panelhead">
+    <h3>Workspace &amp; scans</h3>
+    <button class="btn panel-toggle" id="ws-toggle" type="button" aria-expanded="true" aria-controls="wsbody">collapse</button>
+  </div>
+  <div class="panelbody" id="wsbody">
+    <div class="wsgrid" id="neworg-block" hidden>
+    <div class="wsfield"><label>new org · slug <span style="color:var(--green)">*</span></label><input id="no-slug" autocomplete="off" spellcheck="false" placeholder="acme-corp">
       <small style="color:var(--dim);font-size:10px;">lowercase, digits, hyphens · ≤32</small></div>
-    <div class="wsfield"><label>name</label><input id="ws-name" autocomplete="off" placeholder="Acme Corp"></div>
-    <div class="wsfield"><label>domains</label><input id="ws-domains" autocomplete="off" spellcheck="false" placeholder="acme.com example.com"></div>
+    <div class="wsfield"><label>new org · name</label><input id="no-name" autocomplete="off" placeholder="Acme Corp"></div>
+    <div class="wsfield ws-wide">
+      <label>new org · domains <span style="color:var(--green)">*</span></label>
+      <div class="wsdomrow">
+        <input id="no-domains" autocomplete="off" spellcheck="false" placeholder="acme.com example.com (space, comma, or newline separated)">
+        <button class="btn primary" id="no-create" type="button">Create org</button>
+        <button class="btn" id="no-cancel" type="button">Cancel</button>
+      </div>
+      <small style="color:var(--dim);font-size:10px;">Creates a separate workspace — this never modifies the currently selected org. Domains: max 20, strict DNS names.</small>
+    </div>
+    </div>
+    <div class="wsgrid">
+    <div class="wsfield ws-wide">
+      <label>domains — selected org <span class="count" id="ws-domcount"></span></label>
+      <div class="wsdomrow">
+        <input id="ws-domains" autocomplete="off" spellcheck="false" placeholder="acme.com example.com (space, comma, or newline separated)">
+        <button class="btn" id="ws-add-domain" type="button">Add</button>
+        <button class="btn" id="ws-remove-domain" type="button">Remove</button>
+      </div>
+      <div class="domchips" id="ws-domchips" aria-label="Current scope domains"></div>
+      <small style="color:var(--dim);font-size:10px;">Type one or more domains, then <b>Add</b> or <b>Remove</b> — applies to the org selected above. Click a chip’s <b>×</b> to remove just that domain. New organizations are created via <b>＋ New org</b> in the header.</small>
+    </div>
     <div class="wsfield"><label>scan mode</label>
       <select id="scanmode" aria-label="Scan mode">
         <option value="fast" selected>Fast</option>
@@ -407,45 +629,88 @@
       <small id="aihint" style="color:var(--dim);font-size:10px;">loading…</small>
     </div>
     <div class="wsfield actions">
-      <button class="btn primary" id="ws-register" type="button">New workspace</button>
-      <button class="btn" id="ws-scan" type="button">Scan (full)</button>
-      <button class="btn" id="ws-recheck" type="button">Recheck</button>
-      <button class="btn" id="ws-correlate" type="button">Correlate</button>
-      <button class="btn" id="ws-pdf" type="button">PDF report</button>
+      <div class="bgroup">
+        <span class="bcap">scan &amp; verify</span>
+        <button class="btn primary" id="ws-scan" type="button" title="Full passive scan of the selected org (enum + DNS + fingerprint + ports + TLS)">Scan (full)</button>
+        <button class="btn" id="ws-recheck" type="button">Recheck ports</button>
+        <button class="btn" id="ws-correlate" type="button">Correlate</button>
+      </div>
+      <div class="bgroup">
+        <span class="bcap">ai · openhack</span>
+        <button class="btn" id="ws-grade" type="button" title="Re-grade existing OPEN findings (severity/impact) with the AI profile">AI grade</button>
+        <button class="btn" id="ws-ohack-quick" type="button" title="OpenHack quick-pass (~8 min): verify OPEN findings, grade severity (verified full range / unverified ±1), enrich evidence">OpenHack quick</button>
+        <button class="btn" id="ws-ohack-deep" type="button" title="OpenHack deep run: full agentic assessment of org domains (long-running)">OpenHack deep</button>
+        <select class="orgsel" id="ohmodel" aria-label="OpenHack model" title="Model used by OpenHack runs — ox-alpha is the recommended unreleased GLM channel">
+          <option value="ox-alpha">ox-alpha (recommended)</option>
+        </select>
+      </div>
+      <div class="bgroup bgroup-wide">
+        <span class="bcap">export</span>
+        <button class="btn" id="ws-pdf" type="button">PDF report</button>
+      </div>
     </div>
   </div>
-  <div class="wsmsg" id="wsmsg"></div>
-  <div class="job" id="job"></div>
+    <div class="wsmsg" id="wsmsg"></div>
+    <div class="job" id="job"></div>
+  </div>
 </div>
 
 <div class="kpis" id="kpis"></div>
 
-<div class="layout">
+<div class="layout" id="graph-section">
   <div class="graphwrap">
     <div class="graphstats" id="graphstats"></div>
+    <button class="btn ghost" id="graph-fit" type="button" title="Fit graph to view"
+            style="position:absolute; top:10px; right:10px; z-index:11; padding:6px 10px;">fit</button>
     <div id="graph"></div>
     <div class="legend">
       <div class="lbl">legend</div>
-      <div class="row"><span class="swatch" style="background:#2ecc71"></span> host</div>
-      <div class="row"><span class="swatch" style="background:#3498db"></span> IP</div>
-      <div class="row"><span class="swatch" style="background:#e74c3c"></span> CVE</div>
-      <div class="row"><span class="swatch" style="background:#9b59b6"></span> brand</div>
-      <div class="row"><span class="swatch" style="background:#f39c12"></span> class</div>
+      <div class="row"><span class="swatch" style="background:#50fa7b"></span> host</div>
+      <div class="row"><span class="swatch" style="background:#8be9fd"></span> IP</div>
+      <div class="row"><span class="swatch" style="background:#ff5555"></span> CVE</div>
+      <div class="row"><span class="swatch" style="background:#bd93f9"></span> brand</div>
+      <div class="row"><span class="swatch" style="background:#ffb86c"></span> class</div>
     </div>
   </div>
   <div class="side">
-    <div class="panel">
-      <h3>CVE fleet spread</h3>
-      <table><thead><tr><th>CVE</th><th>hosts</th></tr></thead><tbody id="fleet"></tbody></table>
+    <div class="panel cvepanel">
+      <div class="panelhead">
+        <h3>CVE fleet spread <span class="count" id="fleetcount"></span></h3>
+        <button class="btn panel-toggle" id="fleet-toggle" type="button" aria-expanded="true" aria-controls="fleetbody">collapse</button>
+      </div>
+      <div class="panelbody" id="fleetbody">
+        <div class="table-scroll">
+          <table><thead><tr><th>CVE</th><th>hosts</th></tr></thead><tbody id="fleet"></tbody></table>
+        </div>
+        <div class="pagination compact" id="fleetpagination" hidden>
+          <span class="pinfo" id="fleetpinfo"></span>
+          <span class="spacer"></span>
+          <button class="pbtn" id="fleetprev" type="button" aria-label="Previous page">‹ prev</button>
+          <button class="pbtn" id="fleetnext" type="button" aria-label="Next page">next ›</button>
+        </div>
+      </div>
     </div>
     <div class="panel">
-      <h3>IP co-residency</h3>
-      <table><thead><tr><th>IP</th><th>hosts</th></tr></thead><tbody id="ips"></tbody></table>
+      <div class="panelhead">
+        <h3>IP co-residency <span class="count" id="ipcount"></span></h3>
+        <button class="btn panel-toggle" id="ips-toggle" type="button" aria-expanded="true" aria-controls="ipsbody">collapse</button>
+      </div>
+      <div class="panelbody" id="ipsbody">
+        <div class="table-scroll">
+          <table><thead><tr><th>IP</th><th>hosts</th></tr></thead><tbody id="ips"></tbody></table>
+        </div>
+        <div class="pagination compact" id="ipspagination" hidden>
+          <span class="pinfo" id="ipspinfo"></span>
+          <span class="spacer"></span>
+          <button class="pbtn" id="ipsprev" type="button" aria-label="Previous page">‹ prev</button>
+          <button class="pbtn" id="ipsnext" type="button" aria-label="Next page">next ›</button>
+        </div>
+      </div>
     </div>
   </div>
 </div>
 
-<div class="panel findings">
+<div class="panel findings" id="findings-section">
   <div class="findhead">
     <h3>Findings <span class="count" id="fcount"></span></h3>
     <div class="ftabs" id="ftabs" role="tablist" aria-label="Finding view">
@@ -467,25 +732,50 @@
         <option value="IN_PROGRESS">In progress</option>
         <option value="MITIGATED">Mitigated</option>
         <option value="ACCEPTED_RISK">Accepted risk</option>
+        <option value="RESOLVED">Resolved</option>
       </select>
-      <label>severity</label>
-      <select class="sortsel" id="sevsel" aria-label="Filter by severity">
-        <option value="all" selected>All</option>
-        <option value="CRITICAL">Critical</option>
-        <option value="HIGH">High</option>
-        <option value="MEDIUM">Medium</option>
-        <option value="LOW">Low</option>
-        <option value="INFO">Info</option>
-      </select>
+      <div class="sevchips" id="sevchips" role="group" aria-label="Filter by severity (multi-select)">
+        <button class="chip" data-sev="CRITICAL" type="button" aria-pressed="false">Critical</button>
+        <button class="chip" data-sev="HIGH" type="button" aria-pressed="false">High</button>
+        <button class="chip" data-sev="MEDIUM" type="button" aria-pressed="false">Medium</button>
+        <button class="chip" data-sev="LOW" type="button" aria-pressed="false">Low</button>
+        <button class="chip" data-sev="INFO" type="button" aria-pressed="false">Info</button>
+        <button class="chip" data-qf="newexp" type="button" aria-pressed="false" title="Show only hosts/ports newly observed vs the previous scan's baseline">New exposure</button>
+      </div>
+      <button class="btn" id="findings-collapseall" type="button" title="Expand or collapse all findings on the current page">expand all</button>
+      <button class="btn" id="findings-refresh" type="button" title="Refresh findings and related data">refresh</button>
     </div>
   </div>
+  <div class="pagination" id="pagination" hidden>
+    <span class="pinfo" id="pinfo"></span>
+    <span class="spacer"></span>
+    <label>per page</label>
+    <select class="sortsel" id="pagesize" aria-label="Findings per page">
+      <option value="10" selected>10</option>
+      <option value="25">25</option>
+      <option value="50">50</option>
+      <option value="100">100</option>
+    </select>
+    <button class="pbtn" id="pageprev" type="button" aria-label="Previous page">‹ prev</button>
+    <button class="pbtn" id="pagenext" type="button" aria-label="Next page">next ›</button>
+  </div>
   <div class="findings" id="findings"></div>
+  <div class="pagination bottom" id="pagination-bottom" hidden>
+    <span class="pinfo" id="pinfo2"></span>
+    <span class="spacer"></span>
+    <button class="pbtn" id="pageprev2" type="button" aria-label="Previous page">‹ prev</button>
+    <button class="pbtn" id="pagenext2" type="button" aria-label="Next page">next ›</button>
+  </div>
 </div>
 
-<div class="panel historypanel">
+<div class="opsgrid" id="ops-section">
+<div class="panel historypanel" id="history-section">
   <div class="findhead">
     <h3>Scan history <span class="count" id="hcount"></span></h3>
-    <button class="btn" id="history-toggle" type="button">collapse</button>
+    <div class="sortwrap">
+      <button class="btn" id="history-refresh" type="button">refresh</button>
+      <button class="btn panel-toggle" id="history-toggle" type="button">collapse</button>
+    </div>
   </div>
   <div id="historybody">
     <table>
@@ -493,6 +783,27 @@
       <tbody id="history"></tbody>
     </table>
   </div>
+</div>
+
+<div class="panel adminpanel" id="admin-section">
+  <div class="panelhead">
+    <h3>Runtime logs <span class="count" id="logcount"></span></h3>
+    <div class="sortwrap">
+      <select class="sortsel" id="logorg" aria-label="Filter logs by org"><option value="">All orgs</option></select>
+      <button class="btn" id="logs-refresh" type="button">refresh</button>
+      <button class="btn panel-toggle" id="logs-toggle" type="button" aria-expanded="true" aria-controls="logsbody">collapse</button>
+    </div>
+  </div>
+  <div class="panelbody" id="logsbody">
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>time</th><th>level</th><th>job</th><th>org</th><th>message</th></tr></thead>
+        <tbody id="adminlogs"></tbody>
+      </table>
+    </div>
+    <button class="btn" id="logs-more" type="button" style="margin-top:8px" hidden>show more</button>
+  </div>
+</div>
 </div>
 
 <div class="modal-overlay" id="modal" hidden>
@@ -520,10 +831,28 @@ let kpiSummary = null;
 let graphMeta = null;
 let currentOrg = 'sample';
 let orgNames = {};
+let orgDomains = {};
 let sortBy = 'severity';
 let statusFilter = 'all';
 let tierFilter = 'all';
-let sevFilter = 'all';
+let newExpOnly = false;          // quick-filter: category "new exposure" (S5)
+let lastFindingsRaw = [];        // unfiltered list, for client-side re-filtering
+const sevFilters = new Set(); // empty = all severities
+let findingList = [];
+let findingPage = 1;
+let pageSize = 10;
+let allCollapsed = true;
+let fleetList = [];
+let fleetPage = 1;
+const fleetPageSize = 10;
+let ipList = [];
+let ipPage = 1;
+const ipPageSize = 10;
+let scanPollTimer = null;
+let recheckPollTimer = null;
+let gradePollTimer = null;
+let logLimit = 50;
+let lastLogs = [];
 let modalFinding = null;
 let graphNetwork = null;
 let graphResizeHandler = null;
@@ -557,6 +886,13 @@ const tierTag = (t) => {
   else if (v === 'correlated') cls = 'correlated';
   else if (v === 'ai') cls = 'ai';
   return `<span class="tag ${cls}">${esc((t || 'OTHER').toUpperCase())}</span>`;
+};
+
+const confidenceTag = (f) => {
+  const c = String((f && f.confidence) || '').toLowerCase();
+  if (c !== 'low' && c !== 'medium' && c !== 'high') return '';
+  const cls = c === 'low' ? 'conf-low' : (c === 'medium' ? 'conf-medium' : 'conf-high');
+  return `<span class="tag ${cls}" title="Evidence confidence of this finding (version-match granularity)">${esc(c.toUpperCase())} CONF</span>`;
 };
 
 const statusInfo = (s) => {
@@ -616,14 +952,98 @@ const sourceLinksHtml = (f) => {
 
 const q = () => `?org=${encodeURIComponent(currentOrg)}`;
 
+let _pollInFlight = 0, _badgeOffTimer = null;
+function _updateJobBadge(inflight) {
+  const nav = $('mobilenav');
+  if (!nav) return;
+  if (inflight > 0) {
+    if (_badgeOffTimer) { clearTimeout(_badgeOffTimer); _badgeOffTimer = null; }
+    nav.classList.add('jobbusy');
+  } else if (!_badgeOffTimer) {
+    // hold the dot through inter-poll gaps; clear 6s after the last one
+    _badgeOffTimer = setTimeout(() => {
+      if (_pollInFlight === 0) nav.classList.remove('jobbusy');
+    }, 6000);
+  }
+}
+
 function init() {
-  $('asof').textContent = new Date().toISOString().slice(0, 16).replace('T', ' ');
+  stampAsOf();
+  // running-job indicator: any in-flight job-status poll lights the nav dot
+  const _origFetch = window.fetch.bind(window);
+  const _pollRe = /\/api\/orgs\/[^/]+\/(scan|recheck|correlate|ai-grade|openhack-scan)\/[A-Za-z0-9_.\-]+$/;
+  window.fetch = function(input, init) {
+    try {
+      const url = typeof input === 'string' ? input : (input && input.url) || '';
+      if (_pollRe.test(url)) {
+        _pollInFlight++; _updateJobBadge(_pollInFlight);
+        return _origFetch(input, init).finally(() => {
+          _pollInFlight--; _updateJobBadge(_pollInFlight);
+        });
+      }
+    } catch (e) {}
+    return _origFetch(input, init);
+  };
+  // bottom-sheet swipe-down dismiss (mobile only)
+  const sheet = document.getElementById('modal');
+  let ty0 = null, dy = 0;
+  sheet.addEventListener('touchstart', (e) => {
+    if (window.innerWidth > 600 || $('modal').hidden) return;
+    const card = sheet.querySelector('.modal-card');
+    if (!card) return;
+    const headH = 56;   // handle + header zone
+    const t = e.touches[0];
+    const r = card.getBoundingClientRect();
+    if (t.clientY - r.top > headH && card.scrollTop <= 0 && false) return;
+    // only start a drag from the handle/header strip, so body scrolling stays free
+    if (t.clientY - r.top > headH) { ty0 = null; return; }
+    ty0 = t.clientY; dy = 0;
+    card.classList.add('dragging');
+  }, { passive: true });
+  sheet.addEventListener('touchmove', (e) => {
+    if (ty0 === null) return;
+    dy = Math.max(0, e.touches[0].clientY - ty0);
+    const card = sheet.querySelector('.modal-card');
+    if (card) card.style.transform = 'translateY(' + dy + 'px)';
+  }, { passive: true });
+  sheet.addEventListener('touchend', () => {
+    if (ty0 === null) return;
+    const card = sheet.querySelector('.modal-card');
+    ty0 = null;
+    if (!card) return;
+    card.classList.remove('dragging');
+    card.style.transform = '';
+    if (dy > 90) hideModal();
+  });
+
+  // scrollspy: highlight the section currently in view
+  const spyLinks = {};
+  document.querySelectorAll('#mobilenav a').forEach((a) => {
+    const id = (a.getAttribute('href') || '').slice(1);
+    if (id) spyLinks[id] = a;
+  });
+  const spy = new IntersectionObserver((entries) => {
+    entries.forEach((en) => {
+      if (!en.isIntersecting) return;
+      document.querySelectorAll('#mobilenav a').forEach((x) => x.classList.remove('active'));
+      const l = spyLinks[en.target.id];
+      if (l) l.classList.add('active');
+    });
+  }, { rootMargin: '-40% 0px -55% 0px' });
+  ['workspace','graph-section','findings-section','history-section','ops-section']
+    .forEach((id) => { const el = document.getElementById(id); if (el) spy.observe(el); });
+  // graph fit-to-view (touch users lose keyboard shortcuts)
+  $('graph-fit').addEventListener('click', () => {
+    if (graphNetwork) { try { graphNetwork.fit({ animation: true }); } catch (e) {} }
+  });
   const sel = $('orgsel');
   sel.addEventListener('change', () => {
     currentOrg = sel.value || 'sample';
     try { localStorage.setItem('ctiRadarOrg', currentOrg); } catch (e) {}
     updateOrgName();
+    refreshDomainsField();
     fetchAiProfileForOrg(currentOrg);
+    syncOhModelForOrg(currentOrg);
     refreshAll();
   });
   $('modal').addEventListener('click', (e) => {
@@ -634,11 +1054,30 @@ function init() {
   });
   $('findings').addEventListener('click', (e) => {
     const card = e.target.closest('.fcard');
-    if (card && card.dataset.id) openFinding(card.dataset.id);
+    if (!card || !card.dataset.id) return;
+    if (e.target.closest('.fview')) {
+      e.preventDefault();
+      e.stopPropagation();
+      openFinding(card.dataset.id);
+      return;
+    }
+    if (e.target.closest('.fhead')) {
+      e.stopPropagation();
+      toggleCard(card);
+      return;
+    }
+    if (e.target.closest('a')) return; // let CVE / source links open in a new tab
+    openFinding(card.dataset.id);
   });
   $('findings').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && e.target.classList && e.target.classList.contains('fcard')) {
-      openFinding(e.target.dataset.id);
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const card = e.target.closest('.fcard');
+    if (!card) return;
+    e.preventDefault();
+    if (e.target.classList && e.target.classList.contains('fview')) {
+      openFinding(card.dataset.id);
+    } else if (e.target.closest('.fhead')) {
+      toggleCard(card);
     }
   });
   $('sortsel').addEventListener('change', () => setSort($('sortsel').value));
@@ -646,10 +1085,49 @@ function init() {
     statusFilter = $('statussel').value || 'all';
     fetchFindings();
   });
-  $('sevsel').addEventListener('change', () => {
-    sevFilter = $('sevsel').value || 'all';
+  $('sevchips').addEventListener('click', (e) => {
+    const chip = e.target.closest('.chip');
+    if (!chip) return;
+    if (chip.dataset.qf === 'newexp') {
+      newExpOnly = !newExpOnly;
+      chip.setAttribute('aria-pressed', String(newExpOnly));
+      findingList = applyTierFilter(lastFindingsRaw);
+      findingPage = 1;
+      $('fcount').textContent = findingList.length;
+      renderFindingPage();
+      return;
+    }
+    if (!chip.dataset.sev) return;
+    const sev = chip.dataset.sev;
+    if (sevFilters.has(sev)) sevFilters.delete(sev);
+    else sevFilters.add(sev);
+    chip.setAttribute('aria-pressed', String(sevFilters.has(sev)));
     fetchFindings();
   });
+  $('pagesize').addEventListener('change', () => {
+    pageSize = Math.max(1, parseInt($('pagesize').value, 10) || 10);
+    findingPage = 1;
+    renderFindingPage();
+  });
+  $('pageprev').addEventListener('click', () => changePage(-1));
+  $('pagenext').addEventListener('click', () => changePage(1));
+  $('pageprev2').addEventListener('click', () => changePage(-1));
+  $('pagenext2').addEventListener('click', () => changePage(1));
+  $('findings-collapseall').addEventListener('click', () => setAllCollapsed(!allCollapsed));
+  $('fleet-toggle').addEventListener('click', () => togglePanel('fleetbody', 'fleet-toggle'));
+  $('ips-toggle').addEventListener('click', () => togglePanel('ipsbody', 'ips-toggle'));
+  $('ws-toggle').addEventListener('click', () => togglePanel('wsbody', 'ws-toggle'));
+  $('fleetprev').addEventListener('click', () => changeFleetPage(-1));
+  $('fleetnext').addEventListener('click', () => changeFleetPage(1));
+  $('ipsprev').addEventListener('click', () => changeIpsPage(-1));
+  $('ipsnext').addEventListener('click', () => changeIpsPage(1));
+  $('refresh-btn').addEventListener('click', refreshAllData);
+  $('findings-refresh').addEventListener('click', refreshAllData);
+  $('history-refresh').addEventListener('click', refreshAllData);
+  $('logs-refresh').addEventListener('click', loadLogs);
+  $('logorg').addEventListener('change', loadLogs);
+  $('logs-more').addEventListener('click', () => { logLimit += 50; renderLogs({ logs: lastLogs }); });
+  $('logs-toggle').addEventListener('click', () => togglePanel('logsbody', 'logs-toggle'));
   $('ftabs').addEventListener('click', (e) => {
     const btn = e.target.closest('.ftab');
     if (!btn) return;
@@ -661,15 +1139,44 @@ function init() {
   $('history-toggle').addEventListener('click', toggleHistory);
   $('modalbody').addEventListener('click', (e) => {
     if (e.target && e.target.id === 'stedit-save') submitStatus();
+    if (e.target && e.target.id === 'comment-save') submitComment();
   });
-  $('ws-register').addEventListener('click', registerWorkspace);
+  document.addEventListener('click', (e) => {
+    const b = e.target.closest('#ohack-enable-retry');
+    if (!b) return;
+    b.disabled = true;
+    ohackEnableAndRetry(b.dataset.slug, b.dataset.mode);
+  });
+  $('neworg-btn').addEventListener('click', showNewOrg);
+  $('no-cancel').addEventListener('click', hideNewOrg);
+  $('no-create').addEventListener('click', createNewOrg);
+  ['no-slug', 'no-name', 'no-domains'].forEach((id) => {
+    $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); createNewOrg(); } });
+  });
+  $('no-slug').addEventListener('input', () => { $('no-slug').value = normalizeSlug($('no-slug').value); });
+  $('ws-add-domain').addEventListener('click', () => sendDomainAction('add'));
+  $('ws-remove-domain').addEventListener('click', () => sendDomainAction('remove'));
+  $('ws-domchips').addEventListener('click', (e) => {
+    const x = e.target.closest('.dx');
+    if (!x || !x.dataset.domain) return;
+    removeDomainChip(x.dataset.domain);
+  });
   $('ws-scan').addEventListener('click', scanSelected);
   $('ws-recheck').addEventListener('click', recheckSelected);
   $('ws-correlate').addEventListener('click', correlateSelected);
+  $('ws-grade').addEventListener('click', gradeSelected);
+  $('ws-ohack-quick').addEventListener('click', () => openhackScan('quick'));
+  $('ws-ohack-deep').addEventListener('click', () => openhackScan('deep'));
+  $('ohmodel').addEventListener('change', () => {
+    const v = $('ohmodel').value;
+    fetch('/api/orgs/' + encodeURIComponent(currentOrg) + '/openhack-config', {
+      method: 'POST', headers: authHeaders(),
+      body: JSON.stringify({ model: v })
+    }).then(r => r.json()).catch(() => {});
+  });
   $('ws-pdf').addEventListener('click', downloadPdf);
   $('login-btn').addEventListener('click', doLogin);
   $('logout-btn').addEventListener('click', doLogout);
-  $('ws-slug').addEventListener('input', () => { $('ws-slug').value = normalizeSlug($('ws-slug').value); });
   $('scanmode').addEventListener('change', updateAiHint);
   $('aiprofile').addEventListener('change', () => {
     updateAiHint();
@@ -679,6 +1186,7 @@ function init() {
       method:'POST', headers: authHeaders(), body: JSON.stringify({ai_profile: v})
     }).then(r=>r.json()).then(()=>{}).catch(()=>{});
   });
+  // single auth probe on load: restores an existing session (cookie) or shows login.
   loadOrgs();
 }
 
@@ -708,8 +1216,7 @@ function doLogin() {
         return;
       }
       hideLogin();
-      loadAiProfiles();
-      loadOrgs();
+      loadOrgs();  // success path also loads AI profiles + runtime logs
     })
     .catch(() => { msg.textContent = 'Login error'; msg.className = 'stmsg err'; });
 }
@@ -729,10 +1236,15 @@ function hideLogin() {
   if (ov) { ov.style.display = 'none'; ov.classList.add('hidden'); }
 }
 
+let _wsmsgTimer = null;
 function setWsMsg(msg, isErr) {
   const el = $('wsmsg');
   el.textContent = msg || '';
   el.className = 'wsmsg' + (isErr ? ' err' : (msg ? ' ok' : ''));
+  if (_wsmsgTimer) { clearTimeout(_wsmsgTimer); _wsmsgTimer = null; }
+  if (msg && !isErr) _wsmsgTimer = setTimeout(() => {
+    el.textContent = ''; el.className = 'wsmsg';
+  }, 8000);
 }
 
 function showJob(html) {
@@ -794,41 +1306,106 @@ function updateAiHint() {
   const prof = aiProfiles.find(p=>p.name===chosen);
   const hint = $('aihint');
   if (mode !== 'ai') { hint.textContent = prof ? 'AI: '+prof.name+' · '+prof.model : 'AI disabled (Fast mode)'; return; }
-  if (!prof) { hint.textContent = 'AI: no profile — AI scan will fail'; hint.style.color='var(--err)'; return; }
-  if (!prof.ready) { hint.textContent = 'AI: '+prof.name+' not ready (missing key)'; hint.style.color='var(--err)'; return; }
+  if (!prof) { hint.textContent = 'AI: no profile — AI scan will fail'; hint.style.color='var(--red)'; return; }
+  if (!prof.ready) { hint.textContent = 'AI: '+prof.name+' not ready (missing key)'; hint.style.color='var(--red)'; return; }
   hint.style.color='var(--dim)';
   hint.textContent = 'AI: '+prof.name+' · '+prof.provider+' · '+prof.model;
 }
+let _aiProfileReq = 0;   // guards against out-of-order org switches
+
+function syncOhModelForOrg(slug) {
+  // reflect the org's persisted openhack_model into the dropdown
+  fetch('/api/orgs/' + encodeURIComponent(slug)).then(r => r.json()).then(d => {
+    $('ohmodel').dataset.orgModel = d.openhack_model || '';
+    const sel = $('ohmodel');
+    if (sel.options.length > 1) sel.value = d.openhack_model || '';
+  }).catch(() => {});
+}
+
 function fetchAiProfileForOrg(slug) {
+  const seq = ++_aiProfileReq;
   fetch('/api/orgs/'+encodeURIComponent(slug)+'/ai_profile').then(r=>r.json()).then(d=>{
-    const eff = d.effective || d.ai_profile || aiDefault;
+    if (seq !== _aiProfileReq || slug !== currentOrg) return;
     // reset to auto if no explicit profile (prevents stale cross-org selection)
     $('aiprofile').value = d.ai_profile || "";
     updateAiHint();
-  }).catch(()=>updateAiHint());
+  }).catch(()=>{ if (seq === _aiProfileReq) updateAiHint(); });
 }
 
-function registerWorkspace() {
-  let slug = normalizeSlug($('ws-slug').value.trim());
-  $('ws-slug').value = slug;               // show normalized value in the field
-  const name = $('ws-name').value.trim();
-  const domainsRaw = $('ws-domains').value.trim();
-  if (!slug) return setWsMsg('slug is required (lowercase letters, digits, hyphens)', true);
-  if (!SLUG_RE.test(slug)) return setWsMsg('invalid slug: use lowercase a-z, 0-9 and hyphens only, max 32 chars', true);
-  const domains = domainsRaw.split(/[\s,]+/).map((d) => d.trim()).filter(Boolean);
-  setWsMsg('Registering workspace…');
+/* ---------- dedicated new-org creation (header "+ New org" button) ---------- */
+
+function showNewOrg() {
+  // expand the workspace panel if collapsed, then reveal the create form
+  const body = $('wsbody');
+  if (body.hidden) togglePanel('wsbody', 'ws-toggle');
+  $('neworg-block').hidden = false;
+  $('no-slug').value = '';
+  $('no-name').value = '';
+  $('no-domains').value = '';
+  $('no-slug').focus();
+  setWsMsg('New organization — fill slug + domains, then Create org');
+}
+
+function hideNewOrg() {
+  $('neworg-block').hidden = true;
+}
+
+function createNewOrg() {
+  let slug = normalizeSlug($('no-slug').value.trim());
+  $('no-slug').value = slug;
+  if (!slug) return setWsMsg('new org: slug is required (lowercase letters, digits, hyphens)', true);
+  if (!SLUG_RE.test(slug)) return setWsMsg('new org: invalid slug — lowercase a-z, 0-9, hyphens, max 32', true);
+  const domains = $('no-domains').value.split(/[\s,]+/).map((d) => d.trim()).filter(Boolean);
+  if (!domains.length) return setWsMsg('new org: enter at least one domain', true);
+  setWsMsg('Creating organization ' + slug + '…');
   fetch('/api/orgs/register', {
     method: 'POST',
     headers: authHeaders(),
-    body: JSON.stringify({ slug, name, domains })
+    body: JSON.stringify({ slug, name: $('no-name').value.trim(), domains })
   }).then((r) => r.json().then((body) => ({ ok: r.ok, body }))).then(({ ok, body }) => {
-    if (!ok) return setWsMsg('Register failed: ' + (body.error || 'error') + ' — slug must be lowercase a-z, 0-9, hyphens only, max 32', true);
-    setWsMsg('Workspace registered: ' + (body.slug || slug));
-    $('ws-slug').value = '';
-    $('ws-name').value = '';
-    $('ws-domains').value = '';
+    if (!ok) return setWsMsg('Create failed: ' + (body.error || 'error'), true);
+    setWsMsg('Organization created: ' + (body.slug || slug) + ' — selected. Run Scan when ready.');
+    hideNewOrg();
     loadOrgs(body.slug || slug);
-  }).catch(() => setWsMsg('Register failed (network error)', true));
+    loadHistory();
+  }).catch(() => setWsMsg('Create failed (network error)', true));
+}
+
+function sendDomainAction(action) {
+  const raw = $('ws-domains').value.trim();
+  const domains = raw.split(/[\s,]+/).map((d) => d.trim()).filter(Boolean);
+  if (!domains.length) return setWsMsg('Enter one or more domains first', true);
+  if (!currentOrg) return setWsMsg('Select a workspace first', true);
+  const add = action === 'add';
+  setWsMsg((add ? 'Adding' : 'Removing') + ' ' + domains.length + ' domain(s) ' + (add ? 'to' : 'from') + ' ' + currentOrg + '…');
+  fetch('/api/orgs/' + encodeURIComponent(currentOrg) + '/domains', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ domains, action })
+  }).then((r) => r.json().then((body) => ({ ok: r.ok, body }))).then(({ ok, body }) => {
+    if (!ok) return setWsMsg((add ? 'Add' : 'Remove') + ' failed: ' + (body.error || 'error'), true);
+    orgDomains[currentOrg] = (body.domains || []).slice();
+    $('ws-domains').value = '';
+    refreshDomainsField();
+    setWsMsg((add ? 'Added' : 'Removed') + '. Scope: ' + (body.domains || []).join(' '));
+    refreshAll();
+  }).catch(() => setWsMsg('Network error', true));
+}
+
+function removeDomainChip(domain) {
+  if (!currentOrg) return;
+  setWsMsg('Removing ' + domain + '…');
+  fetch('/api/orgs/' + encodeURIComponent(currentOrg) + '/domains', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ domains: [domain], action: 'remove' })
+  }).then((r) => r.json().then((body) => ({ ok: r.ok, body }))).then(({ ok, body }) => {
+    if (!ok) return setWsMsg('Remove failed: ' + (body.error || 'error'), true);
+    orgDomains[currentOrg] = (body.domains || []).slice();
+    refreshDomainsField();
+    setWsMsg('Removed ' + domain);
+    refreshAll();
+  }).catch(() => setWsMsg('Network error', true));
 }
 
 function scanSelected() {
@@ -841,12 +1418,18 @@ function scanSelected() {
     headers: authHeaders(),
     body: JSON.stringify(payload)
   }).then((r) => r.json().then((body) => ({ ok: r.ok, body }))).then(({ ok, body }) => {
-    if (!ok) return setWsMsg('Scan failed: ' + (body.error || 'error'), true);
+    if (!ok) { setWsMsg('Scan failed: ' + (body.error || 'error'), true); loadLogs(); return; }
     let msg = 'Scan queued for ' + (body.slug || currentOrg) + ' [' + (body.mode || mode) + ']';
     if (body.ai_profile) msg += ' · profile: ' + body.ai_profile;
     if (body.ai) msg += ' · ai: ' + body.ai;
+    if (mode === 'ai') msg += ' · AI-assisted scan may take longer';
     setWsMsg(msg);
-    setTimeout(() => { refreshAll(); loadHistory(); }, 4000);
+    if (body.job_id) {
+      showJob('<div class="jhead">Scanning ' + esc(currentOrg) + '…</div><div>submitting job…</div>');
+      pollScan(currentOrg, body.job_id, mode);
+    } else {
+      setTimeout(() => { refreshAll(); loadHistory(); loadLogs(); }, 4000);
+    }
   }).catch(() => setWsMsg('Scan failed (network error)', true));
 }
 
@@ -856,9 +1439,14 @@ function recheckSelected() {
     method: 'POST',
     headers: authHeaders()
   }).then((r) => r.json().then((body) => ({ ok: r.ok, body }))).then(({ ok, body }) => {
-    if (!ok) return setWsMsg('Recheck failed: ' + (body.error || 'error'), true);
-    setWsMsg('Recheck queued for ' + (body.slug || currentOrg) + ' — remediated findings will be flagged');
-    setTimeout(() => { refreshAll(); loadHistory(); }, 4000);
+    if (!ok) { setWsMsg('Recheck failed: ' + (body.error || 'error'), true); loadLogs(); return; }
+    setWsMsg('Recheck queued for ' + (body.slug || currentOrg));
+    if (body.job_id) {
+      showJob('<div class="jhead">Rechecking ' + esc(currentOrg) + '…</div><div>submitting job…</div>');
+      pollRecheck(currentOrg, body.job_id);
+    } else {
+      setTimeout(() => { refreshAll(); loadHistory(); loadLogs(); }, 4000);
+    }
   }).catch(() => setWsMsg('Recheck failed (network error)', true));
 }
 
@@ -873,36 +1461,293 @@ function correlateSelected() {
     if (!ok) {
       setWsMsg('Correlate failed: ' + (body.error || 'error'), true);
       hideJob();
+      loadLogs();
       return;
     }
-    const jobId = body.job_id || slug;
-    pollCorrelate(slug, jobId, 0);
+    pollCorrelate(slug, body.job_id || slug);
   }).catch(() => {
     setWsMsg('Correlate failed (network error)', true);
     hideJob();
+    loadLogs();
   });
 }
 
+function jobProgressHtml(title, d) {
+  const st = (d && d.status) || 'running';
+  const running = st === 'running';
+  const stage = d && d.stage;
+  const progress = d && d.progress;
+  const err = d && d.error;
+  const elapsed = (d && d.elapsed !== undefined) ? esc(String(d.elapsed)) + 's' : '';
+  const cls = st === 'failed' ? 'jerr' : (st === 'done' ? 'jok' : '');
+  let html = '<div class="jhead">' + esc(title) + '</div>';
+  html += '<div class="jstat">' + (running ? '<span class="spinner"></span>' : '') +
+          '<span class="' + cls + '">' + esc(st) + '</span>' + (elapsed ? ' · ' + elapsed : '') + '</div>';
+  if (stage) html += '<div>stage: ' + esc(stage) + '</div>';
+  if (progress) html += '<div>' + esc(progress) + '</div>';
+  if (err) html += '<div class="jerr">' + esc(err) + '</div>';
+  return html;
+}
+
+function pollScan(slug, jobId, mode, n) {
+  clearTimeout(scanPollTimer);
+  n = n || 0;
+  if (n > 300) {
+    showJob(jobProgressHtml('Scan still running', { status: 'running', stage: 'timeout', progress: 'polling stopped — refresh to see result' }));
+    loadLogs();
+    return;
+  }
+  fetch('/api/orgs/' + encodeURIComponent(slug) + '/scan/' + encodeURIComponent(jobId))
+    .then((r) => r.json()).then((d) => {
+      if (d.status === 'done' || d.status === 'failed') {
+        if (d.status === 'done') {
+          const r = (d && d.result) ? d.result : null;
+          const stats = r ? [
+            r.subdomains !== undefined ? 'hosts ' + esc(String(r.subdomains)) : '',
+            r.reachable !== undefined ? 'reachable ' + esc(String(r.reachable)) : '',
+            r.new_exposure > 0 ? '<b>' + esc(String(r.new_exposure)) + ' new exposure(s)</b>' : '',
+          ].filter(Boolean).join(' · ') : '';
+          showJob('<div class="jhead jok">Scan complete</div>' +
+                  (stats ? '<div>' + stats + '</div>' : '') +
+                  (d.progress ? '<div>' + esc(d.progress) + '</div>' : '') +
+                  (d.elapsed !== undefined ? '<div>elapsed: ' + esc(String(d.elapsed)) + 's</div>' : ''));
+          setWsMsg('Scan completed for ' + slug +
+                   (r && r.new_exposure > 0 ? ' — ' + r.new_exposure + ' new exposure(s)' : ''));
+        } else {
+          showJob(jobProgressHtml('Scan failed', d));
+          setWsMsg('Scan failed: ' + (d.error || 'error'), true);
+        }
+        refreshAll(); loadHistory(); loadLogs();
+      } else {
+        showJob(jobProgressHtml('Scanning ' + (mode === 'ai' ? '· AI-assisted' : '· fast'), d));
+        scanPollTimer = setTimeout(() => pollScan(slug, jobId, mode, n + 1), 1500);
+      }
+    }).catch(() => {
+      showJob(jobProgressHtml('Scan status error', { status: 'failed', error: 'network error' }));
+      loadLogs();
+    });
+}
+
+function pollRecheck(slug, jobId, n) {
+  clearTimeout(recheckPollTimer);
+  n = n || 0;
+  if (n > 300) {
+    showJob(jobProgressHtml('Recheck still running', { status: 'running', stage: 'timeout', progress: 'polling stopped — refresh to see result' }));
+    loadLogs();
+    return;
+  }
+  fetch('/api/orgs/' + encodeURIComponent(slug) + '/recheck/' + encodeURIComponent(jobId))
+    .then((r) => r.json()).then((d) => {
+      if (d.status === 'done' || d.status === 'failed') {
+        if (d.status === 'done') {
+          showJob('<div class="jhead jok">Recheck complete</div>' + (d.progress ? '<div>' + esc(d.progress) + '</div>' : ''));
+          setWsMsg('Recheck completed for ' + slug);
+        } else {
+          showJob(jobProgressHtml('Recheck failed', d));
+          setWsMsg('Recheck failed: ' + (d.error || 'error'), true);
+        }
+        refreshAll(); loadHistory(); loadLogs();
+      } else {
+        showJob(jobProgressHtml('Rechecking ' + slug, d));
+        recheckPollTimer = setTimeout(() => pollRecheck(slug, jobId, n + 1), 1500);
+      }
+    }).catch(() => {
+      showJob(jobProgressHtml('Recheck status error', { status: 'failed', error: 'network error' }));
+      loadLogs();
+    });
+}
+
 function pollCorrelate(slug, jobId, n) {
-  if (n >= 8) {
-    showJob('<div class="jhead">Correlation still running…</div><div>refresh the page to see results</div>');
+  n = n || 0;
+  if (n >= 150) {
+    showJob(jobProgressHtml('Correlation still running', { status: 'running', stage: 'timeout', progress: 'refresh the page to see results' }));
     setWsMsg('Correlation still running — refresh to see results');
+    loadLogs();
     return;
   }
   fetch('/api/orgs/' + encodeURIComponent(slug) + '/correlate/' + encodeURIComponent(jobId))
     .then((r) => r.json()).then((d) => {
-      if (d.status === 'done') {
-        const report = d.report || {};
-        renderJobDone(slug, d.correlated || 0, report.by_source || {});
-        setWsMsg('Correlation done — ' + (d.correlated || 0) + ' correlated');
-        refreshAll();
+      if (d.status === 'done' || d.status === 'failed') {
+        if (d.status === 'done') {
+          const report = d.report || {};
+          renderJobDone(slug, d.correlated || 0, report.by_source || {});
+          setWsMsg('Correlation done — ' + (d.correlated || 0) + ' correlated');
+        } else {
+          showJob(jobProgressHtml('Correlation failed', d));
+          setWsMsg('Correlation failed: ' + (d.error || 'error'), true);
+        }
+        refreshAll(); loadLogs();
       } else {
-        showJob('<div class="jhead">Correlating…</div><div>poll ' + esc(n + 1) + ' / 8</div>');
+        showJob(jobProgressHtml('Correlating ' + slug, d));
         setTimeout(() => pollCorrelate(slug, jobId, n + 1), 2000);
       }
     }).catch(() => {
       setWsMsg('Correlate poll failed', true);
       hideJob();
+      loadLogs();
+    });
+}
+
+function ohackEnableAndRetry(slug, mode) {
+  setWsMsg('Enabling OpenHack for ' + slug + '…');
+  fetch('/api/orgs/' + encodeURIComponent(slug) + '/openhack-config', {
+    method: 'POST', headers: authHeaders(), body: JSON.stringify({ enabled: true })
+  }).then(r => r.json()).then(d => {
+    if (!d.openhack_enabled) { setWsMsg('Enable failed: ' + (d.error || 'error'), true); return; }
+    setWsMsg('OpenHack authorized for ' + slug + ' — launching…');
+    openhackScan(mode);
+  }).catch(() => setWsMsg('Enable failed (network error)', true));
+}
+
+function openhackScan(mode) {
+  const slug = currentOrg;
+  if (!slug) return;
+  ['ws-ohack-quick', 'ws-ohack-deep'].forEach(id => { $(id).disabled = true; });
+  const label = mode === 'quick' ? 'OpenHack quick-pass (~8 min)' : 'OpenHack deep';
+  setWsMsg(label + ' on ' + slug + '…');
+  showJob('<div class="jhead">' + esc(label) + ' — ' + esc(slug) + '…</div><div>submitting job…</div>');
+  fetch('/api/orgs/' + encodeURIComponent(slug) + '/openhack-scan', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ mode, model: $('ohmodel').value || undefined })
+  }).then((r) => r.json().then((body) => ({ ok: r.ok, body }))).then(({ ok, body }) => {
+    if (!ok) {
+      hideJob();
+      ['ws-ohack-quick', 'ws-ohack-deep'].forEach(id => { $(id).disabled = false; });
+      const err = body.error || 'error';
+      const em = /orgs\/([^/]+)\/openhack-config/.exec(err);
+      if (err.indexOf('not enabled') !== -1 && em) {
+        // one-tap authorize + relaunch from the job panel
+        showJob('<div class="jhead">OpenHack not enabled for ' + esc(em[1]) +
+          '</div><div style="color:var(--dim);font-size:12px;">OpenHack performs active testing — each org must be authorized once.</div>' +
+          '<button class="btn primary" id="ohack-enable-retry" data-slug="' + esc(em[1]) +
+          '" data-mode="' + esc(mode) + '" type="button" style="margin-top:8px;">Enable &amp; retry ' +
+          esc(mode) + '</button>');
+        setWsMsg('OpenHack not enabled for ' + em[1], true);
+        loadLogs();
+        return;
+      }
+      setWsMsg('OpenHack ' + mode + ' failed: ' + err, true);
+      loadLogs();
+      return;
+    }
+    setWsMsg('OpenHack ' + (body.mode || mode) + ' queued — job ' + body.job_id);
+    pollOhack(slug, body.job_id, mode);
+  }).catch(() => {
+    ['ws-ohack-quick', 'ws-ohack-deep'].forEach(id => { $(id).disabled = false; });
+    setWsMsg('OpenHack failed (network error)', true);
+    hideJob();
+  });
+}
+
+function pollOhack(slug, jobId, mode, n) {
+  mode = mode || 'quick';
+  n = n || 0;
+  const maxN = mode === 'quick' ? 200 : 1200;   // 4s ticks: ~13min / ~80min
+  if (n >= maxN) {
+    ['ws-ohack-quick', 'ws-ohack-deep'].forEach(id => { $(id).disabled = false; });
+    showJob(jobProgressHtml('OpenHack still running', { status: 'running', stage: 'timeout', progress: 'check Runtime logs / refresh later' }));
+    setWsMsg('OpenHack still running — results appear when the job finishes');
+    loadLogs();
+    return;
+  }
+  fetch('/api/orgs/' + encodeURIComponent(slug) + '/openhack-scan/' + encodeURIComponent(jobId))
+    .then((r) => r.json()).then((d) => {
+      if (d.status === 'done' || d.status === 'failed') {
+        ['ws-ohack-quick', 'ws-ohack-deep'].forEach(id => { $(id).disabled = false; });
+        if (d.status === 'done') {
+          showJob(jobProgressHtml('OpenHack ' + mode + ' done', d));
+          setWsMsg('OpenHack done — see findings + runtime log for grade/enrich summary');
+        } else {
+          showJob(jobProgressHtml('OpenHack failed', d));
+          setWsMsg('OpenHack failed: ' + (d.error || 'error'), true);
+        }
+        refreshAll(); loadHistory(); loadLogs();
+      } else {
+        showJob(jobProgressHtml('OpenHack ' + mode + ' — ' + slug, d));
+        setTimeout(() => pollOhack(slug, jobId, mode, n + 1), 4000);
+      }
+    }).catch(() => {
+      setWsMsg('OpenHack poll failed', true);
+      hideJob();
+      loadLogs();
+    });
+}
+
+function loadOhModels() {
+  fetch('/api/openhack/models').then(r => r.json()).then(d => {
+    if (!d || !d.models) return;
+    const pref = d.preferred || 'ox-alpha';
+    const models = d.models.slice();
+    if (!models.some(m => m.id === pref))
+      models.unshift({ id: pref, label: pref + ' — unreleased GLM (recommended)' });
+    const sel = $('ohmodel');
+    const pinned = sel.dataset.orgModel || '';
+    // default choice = org pin, else the preferred runnable model
+    const chosen = pinned || pref;
+    sel.innerHTML = models.map(m => {
+      let lbl = m.label || m.id;
+      if (m.id === pref && !/recommended/i.test(lbl)) lbl += ' (recommended)';
+      return '<option value="' + esc(m.id) + '"' +
+        (m.id === chosen ? ' selected' : '') + '>' + esc(lbl) + '</option>';
+    }).join('');
+    sel.value = chosen;
+  }).catch(() => {});
+}
+
+function gradeSelected() {
+  const slug = currentOrg;
+  if (!slug) return;  const ai_profile = $('aiprofile').value || '';
+  const payload = ai_profile ? { ai_profile } : {};
+  setWsMsg('AI grading ' + slug + (ai_profile ? ' (' + ai_profile + ')' : '') + '…');
+  showJob('<div class="jhead">AI grading ' + esc(slug) + '…</div><div>submitting job…</div>');
+  fetch('/api/orgs/' + encodeURIComponent(slug) + '/ai-grade', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(payload)
+  }).then((r) => r.json().then((body) => ({ ok: r.ok, body }))).then(({ ok, body }) => {
+    if (!ok) {
+      setWsMsg('AI grade failed: ' + (body.error || 'error'), true);
+      hideJob();
+      loadLogs();
+      return;
+    }
+    pollGrade(slug, body.job_id || slug);
+  }).catch(() => {
+    setWsMsg('AI grade failed (network error)', true);
+    hideJob();
+    loadLogs();
+  });
+}
+
+function pollGrade(slug, jobId, n) {
+  clearTimeout(gradePollTimer);
+  n = n || 0;
+  if (n > 150) {
+    showJob(jobProgressHtml('AI grading still running', { status: 'running', stage: 'timeout', progress: 'polling stopped — refresh to see result' }));
+    loadLogs();
+    return;
+  }
+  fetch('/api/orgs/' + encodeURIComponent(slug) + '/ai-grade/' + encodeURIComponent(jobId))
+    .then((r) => r.json()).then((d) => {
+      if (d.status === 'done' || d.status === 'failed') {
+        if (d.status === 'done') {
+          showJob('<div class="jhead jok">AI grading complete</div>' +
+                  (d.progress ? '<div>' + esc(d.progress) + '</div>' : ''));
+          setWsMsg('AI grading completed for ' + slug);
+        } else {
+          showJob(jobProgressHtml('AI grading failed', d));
+          setWsMsg('AI grading failed: ' + (d.error || 'error'), true);
+        }
+        refreshAll(); loadHistory(); loadLogs();
+      } else {
+        showJob(jobProgressHtml('AI grading ' + slug, d));
+        gradePollTimer = setTimeout(() => pollGrade(slug, jobId, n + 1), 1500);
+      }
+    }).catch(() => {
+      setWsMsg('AI grade poll failed', true);
+      hideJob();
+      loadLogs();
     });
 }
 
@@ -915,6 +1760,45 @@ function renderJobDone(slug, correlated, bySource) {
     (rows ? '<table><thead><tr><th>source</th><th>count</th></tr></thead><tbody>' + rows + '</tbody></table>' : '') +
     '<div style="margin-top:6px">status: done</div>'
   );
+}
+
+function loadLogs() {
+  const org = $('logorg').value || '';
+  fetch('/api/admin/logs?limit=200' + (org ? '&org=' + encodeURIComponent(org) : ''))
+    .then((r) => r.json()).then(renderLogs).catch(() => {
+      $('adminlogs').innerHTML = '<tr><td colspan="5" class="empty">logs unavailable</td></tr>';
+    });
+}
+
+function renderLogs(d) {
+  const logs = (d && d.logs) || [];
+  lastLogs = logs;
+  $('logcount').textContent = logs.length;
+  const shown = logs.slice(0, logLimit);
+  const rows = shown.map((l) => {
+    const lvl = String(l.level || 'info').toLowerCase();
+    const cls = lvl === 'error' ? 'lvlerror' : (lvl === 'warn' ? 'lvlwarn' : 'lvlinfo');
+    const metaTitle = l.meta ? ' title="' + esc(JSON.stringify(l.meta)) + '"' : '';
+    return '<tr>' +
+      '<td class="mono">' + esc(String(l.ts || '').slice(0, 19)) + '</td>' +
+      '<td class="' + cls + '">' + esc(String(l.level || 'info').toUpperCase()) + '</td>' +
+      '<td>' + esc(l.kind || '') + '</td>' +
+      '<td>' + esc(l.org || '') + '</td>' +
+      '<td' + metaTitle + '>' + esc(l.message || '') + '</td>' +
+    '</tr>';
+  }).join('');
+  $('adminlogs').innerHTML = rows || '<tr><td colspan="5" class="empty">No runtime logs yet — run a scan, recheck, or correlate</td></tr>';
+  const more = $('logs-more');
+  more.hidden = logs.length <= logLimit;
+  more.textContent = 'show more (' + esc(String(logs.length - logLimit)) + ' more)';
+}
+
+function populateLogOrgs() {
+  const sel = $('logorg');
+  const cur = sel.value || '';
+  sel.innerHTML = '<option value="">All orgs</option>' + Object.keys(orgNames).map((s) =>
+    '<option value="' + esc(s) + '">' + esc(orgNames[s] || s) + '</option>').join('');
+  if (cur && orgNames[cur]) sel.value = cur;
 }
 
 function downloadPdf() {
@@ -937,8 +1821,10 @@ function loadOrgs(preferSlug, done) {
     const list = (d && d.orgs) || [];
     const sel = $('orgsel');
     orgNames = {};
+    orgDomains = {};
     sel.innerHTML = list.map((o) => {
       orgNames[o.slug] = o.name || o.slug;
+      orgDomains[o.slug] = (o.domains || []).slice();
       return '<option value="' + esc(o.slug) + '">' + esc(o.name || o.slug) + '</option>';
     }).join('');
     let prefer = null;
@@ -956,7 +1842,14 @@ function loadOrgs(preferSlug, done) {
     if (prefer) sel.value = prefer;
     currentOrg = prefer || 'sample';
     updateOrgName();
+    refreshDomainsField();
+    populateLogOrgs();
     refreshAll();
+    hideLogin();         // authenticated: restore session on reload
+    loadAiProfiles();
+    loadOhModels();
+    syncOhModelForOrg(currentOrg);
+    loadLogs();
     if (done) done();
   }).catch(() => {
     showLogin();
@@ -968,34 +1861,70 @@ function updateOrgName() {
   $('orgname').textContent = orgNames[currentOrg] || currentOrg || '';
 }
 
+function refreshDomainsField() {
+  // Show the selected workspace's current scope as text + removable chips.
+  const ds = orgDomains[currentOrg] || [];
+  $('ws-domains').value = ds.join(' ');
+  $('ws-domcount').textContent = ds.length + ' domain' + (ds.length === 1 ? '' : 's');
+  $('ws-domchips').innerHTML = ds.map((d) =>
+    '<span class="domchip"><span class="dtext">' + esc(d) + '</span>' +
+    '<button class="dx" data-domain="' + esc(d) + '" type="button" aria-label="Remove ' + esc(d) + '" title="Remove ' + esc(d) + '">×</button></span>'
+  ).join('') || '<span class="empty" style="font-size:11px;">No domains yet</span>';
+}
+
+let _refreshSeq = 0;   // guards against out-of-order responses (stale org data)
+
+function stampAsOf() {
+  $('asof').textContent = new Date().toISOString().slice(0, 16).replace('T', ' ');
+}
+
+function setRefreshing(on) {
+  ['refresh-btn', 'findings-refresh', 'history-refresh'].forEach((id) => {
+    const b = $(id);
+    if (b) b.disabled = on;
+  });
+}
+
 function refreshAll() {
+  const seq = ++_refreshSeq;
   const qs = '?org=' + encodeURIComponent(currentOrg) +
     '&sort=' + encodeURIComponent(sortBy) +
     '&status=' + encodeURIComponent(statusFilter);
-  fetch('/api/dashboard' + qs).then((r) => {
+  return fetch('/api/dashboard' + qs).then((r) => {
     if (!r.ok) throw new Error('aggregate ' + r.status);
     return r.json();
   }).then((d) => {
+    if (seq !== _refreshSeq) return;   // a newer refresh superseded this one
     try { if (d.summary) renderKpis(d.summary); } catch (e) {}
     try { if (d.graph) renderGraph(d.graph); } catch (e) {}
     try { if (d.fleet) renderFleet(d.fleet); } catch (e) {}
     try { if (d.ips) renderIps(d.ips); } catch (e) {}
     try { if (d.findings) renderFindings(d.findings); } catch (e) {}
     try { if (d.history) renderHistory(d.history); } catch (e) {}
+    stampAsOf();
   }).catch(() => {
+    if (seq !== _refreshSeq) return;
     // robust fallback: legacy routes in parallel, per-widget error isolation
+    const guard = (fn) => (data) => { if (seq === _refreshSeq) fn(data); };
     const tasks = [
-      fetch('/api/summary' + q()).then((r) => r.json()).then(renderKpis).catch(() => {}),
-      fetch('/api/graph' + q()).then((r) => r.json()).then(renderGraph).catch(() => {}),
-      fetch('/api/fleet' + q()).then((r) => r.json()).then(renderFleet).catch(() => {}),
-      fetch('/api/ips' + q()).then((r) => r.json()).then(renderIps).catch(() => {}),
+      fetch('/api/summary' + q()).then((r) => r.json()).then(guard(renderKpis)).catch(() => {}),
+      fetch('/api/graph' + q()).then((r) => r.json()).then(guard(renderGraph)).catch(() => {}),
+      fetch('/api/fleet' + q()).then((r) => r.json()).then(guard(renderFleet)).catch(() => {}),
+      fetch('/api/ips' + q()).then((r) => r.json()).then(guard(renderIps)).catch(() => {}),
       fetch('/api/findings?org=' + encodeURIComponent(currentOrg) +
         '&sort=' + encodeURIComponent(sortBy) +
-        '&status=' + encodeURIComponent(statusFilter)).then((r) => r.json()).then(renderFindings).catch(() => {}),
-      fetch('/api/orgs/' + encodeURIComponent(currentOrg) + '/history').then((r) => r.json()).then(renderHistory).catch(() => {})
+        '&status=' + encodeURIComponent(statusFilter)).then((r) => r.json()).then(guard(renderFindings)).catch(() => {}),
+      fetch('/api/orgs/' + encodeURIComponent(currentOrg) + '/history').then((r) => r.json()).then(guard(renderHistory)).catch(() => {})
     ];
-    Promise.allSettled(tasks).then(() => {});
+    return Promise.allSettled(tasks).then(() => { if (seq === _refreshSeq) stampAsOf(); });
   });
+}
+
+function refreshAllData() {
+  setRefreshing(true);
+  loadLogs();
+  // aggregate already carries history (rendered inside refreshAll)
+  Promise.resolve(refreshAll()).finally(() => setRefreshing(false));
 }
 
 function setSort(v) {
@@ -1026,7 +1955,8 @@ function drawKpis() {
     card('high', 'High', sev.HIGH || 0, 'prioritized action'),
     card('med', 'Medium', sev.MEDIUM || 0, 'schedule a fix'),
     card('low', 'Low', sev.LOW || 0, 'monitor or accept'),
-    card('total', 'Total findings', s.findings_total || 0, 'all reported items · ' + esc(orgLabel)),
+    card('total', 'Live findings', s.findings_total || 0,
+         ((s.resolved_total ? `+${s.resolved_total} resolved · ` : '') + 'open items · ' + esc(orgLabel))),
     card('assets', 'Affected assets', s.baseline || 0, 'known baseline hosts'),
     card('ent', 'Entities', entities, 'correlation nodes'),
     card('rel', 'Relationships', rels, 'correlation edges')
@@ -1046,6 +1976,22 @@ function renderGraph(g) {
     if (n.type === 'host') return 14;
     return 15;
   };
+  // small graphs: deterministic ring layout, no physics (instant render)
+  const small = graphMeta.nodes.length > 0 && graphMeta.nodes.length <= 60;
+  const positions = {};
+  if (small) {
+    const radii = { host: 90, ip: 150, cve: 210, brand: 270, class: 330 };
+    const buckets = {};
+    graphMeta.nodes.forEach(n => { (buckets[n.type] = buckets[n.type] || []).push(n); });
+    Object.keys(buckets).forEach(t => {
+      const arr = buckets[t] || [];
+      arr.forEach((n, i) => {
+        const angle = (i / Math.max(1, arr.length)) * 2 * Math.PI - Math.PI / 2;
+        const r = radii[t] || 240;
+        positions[n.id] = { x: Math.cos(angle) * r, y: Math.sin(angle) * r };
+      });
+    });
+  }
   const nodes = new vis.DataSet(graphMeta.nodes.map(n => {
     const crit = n.sev === 'CRITICAL';
     const lbl = showLabel(n);
@@ -1054,28 +2000,31 @@ function renderGraph(g) {
       label: lbl ? n.label : '',
       shape: 'dot',
       size: sizeOf(n),
-      color: { background: n.color, border: crit ? '#ff8a94' : n.color },
+      color: { background: n.color, border: crit ? '#ff5555' : n.color },
       borderWidth: crit ? 3 : (n.sev === 'HIGH' ? 2 : 1),
-      font: { color: '#e6f5ec', size: lbl ? (crit ? 13 : 12) : 9, face: 'monospace' },
+      font: { color: '#e0e0e0', size: lbl ? (crit ? 13 : 12) : 9, face: 'monospace' },
       title: n.title || n.label
     };
-    if (crit) opt.shadow = { enabled: true, color: 'rgba(255,77,94,.5)', size: 18, x: 0, y: 0 };
+    if (positions[n.id]) { opt.x = positions[n.id].x; opt.y = positions[n.id].y; }
+    if (crit) opt.shadow = { enabled: true, color: 'rgba(255,85,85,.5)', size: 18, x: 0, y: 0 };
     return opt;
   }));
   const edges = new vis.DataSet(graphMeta.edges.map(e => ({
     from: e.from, to: e.to, label: e.label, arrows: 'to',
-    font: { size: 9, color: '#9aa99e', face: 'monospace' },
-    color: { color: e.color || '#3d4d38', opacity: 0.4 },
+    font: { size: 9, color: '#7a7a7a', face: 'monospace' },
+    color: { color: e.color || '#2a2a2a', opacity: 0.5 },
     width: 1.2,
     dashes: !!e.dashes,
     smooth: { type: 'continuous' }
   })));
+  const big = graphMeta.nodes.length > 120;
   const opts = {
-    physics: { enabled: true, solver: 'forceAtlas2Based',
-               stabilization: { iterations: 150 },
-               forceAtlas2Based: { gravitationalConstant: -80, springLength: 120 } },
-    interaction: { hover: true, tooltipDelay: 80, navigationButtons: true, zoomView: true, dragView: true },
-    touch: { minTouchDragTime: 0 },
+    physics: { enabled: !small,
+               solver: big ? 'barnesHut' : 'forceAtlas2Based',
+               stabilization: { enabled: true, iterations: big ? 80 : 100, updateInterval: big ? 25 : 40 },
+               forceAtlas2Based: { gravitationalConstant: -80, springLength: 120 },
+               barnesHut: { gravitationalConstant: -8000, springLength: 110, springConstant: 0.001 } },
+    interaction: { hover: true, tooltipDelay: 100, navigationButtons: true, zoomView: true, dragView: true },
     height: '100%', width: '100%'
   };
   // destroy previous network to prevent leaks
@@ -1088,8 +2037,7 @@ function renderGraph(g) {
   const net = new vis.Network($('graph'), { nodes, edges }, opts);
   graphNetwork = net;
   const fit = () => { try { net.fit({ animation: false }); } catch(e){} };
-  graphFitTimers.push(setTimeout(fit, 400));
-  graphFitTimers.push(setTimeout(fit, 1200));
+  graphFitTimers.push(setTimeout(fit, 350));
   // stabilization then disable physics to reduce CPU
   net.once('stabilizationIterationsDone', () => { try { net.setOptions({ physics: false }); } catch(e){} });
   if (!graphResizeHandler) {
@@ -1103,15 +2051,78 @@ function renderGraph(g) {
 }
 
 function renderFleet(f) {
-  const rows = (f || []).filter(x => x.cve && x.cve !== 'None').map(x =>
-    `<tr><td class="mono cve">${esc(x.cve)}</td><td class="num">${esc(x.hosts.length)}</td></tr>`).join('');
-  $('fleet').innerHTML = rows || '<tr><td colspan="2" class="empty">No fleet CVEs</td></tr>';
+  fleetList = (f || []).filter(x => x.cve && x.cve !== 'None');
+  fleetPage = 1;
+  $('fleetcount').textContent = fleetList.length;
+  renderFleetPage();
+}
+
+function renderFleetPage() {
+  const total = fleetList.length;
+  const pages = Math.max(1, Math.ceil(total / fleetPageSize));
+  if (fleetPage > pages) fleetPage = pages;
+  if (fleetPage < 1) fleetPage = 1;
+  const start = (fleetPage - 1) * fleetPageSize;
+  const page = fleetList.slice(start, start + fleetPageSize);
+  $('fleet').innerHTML = page.map(x =>
+    `<tr><td class="mono cve">${esc(x.cve)}</td><td class="num">${esc(x.hosts.length)}</td></tr>`).join('')
+    || '<tr><td colspan="2" class="empty">No fleet CVEs</td></tr>';
+  const pag = $('fleetpagination');
+  if (!total) { pag.hidden = true; return; }
+  pag.hidden = false;
+  const from = start + 1;
+  const to = start + page.length;
+  $('fleetpinfo').textContent = `showing ${from}–${to} of ${total}`;
+  $('fleetprev').disabled = fleetPage <= 1;
+  $('fleetnext').disabled = fleetPage >= pages;
+}
+
+function changeFleetPage(delta) {
+  const pages = Math.max(1, Math.ceil(fleetList.length / fleetPageSize));
+  fleetPage = Math.min(pages, Math.max(1, fleetPage + delta));
+  renderFleetPage();
 }
 
 function renderIps(ips) {
-  const rows = (ips || []).filter(x => x.hosts.length >= 2).map(x =>
-    `<tr><td class="mono ip">${esc(x.ip)}</td><td class="num">${esc(x.hosts.length)}</td></tr>`).join('');
-  $('ips').innerHTML = rows || '<tr><td colspan="2" class="empty">No shared IPs</td></tr>';
+  ipList = (ips || []).filter(x => x.hosts.length >= 2);
+  ipPage = 1;
+  $('ipcount').textContent = ipList.length;
+  renderIpsPage();
+}
+
+function renderIpsPage() {
+  const total = ipList.length;
+  const pages = Math.max(1, Math.ceil(total / ipPageSize));
+  if (ipPage > pages) ipPage = pages;
+  if (ipPage < 1) ipPage = 1;
+  const start = (ipPage - 1) * ipPageSize;
+  const page = ipList.slice(start, start + ipPageSize);
+  $('ips').innerHTML = page.map(x =>
+    `<tr><td class="mono ip">${esc(x.ip)}</td><td class="num">${esc(x.hosts.length)}</td></tr>`).join('')
+    || '<tr><td colspan="2" class="empty">No shared IPs</td></tr>';
+  const pag = $('ipspagination');
+  if (!total) { pag.hidden = true; return; }
+  pag.hidden = false;
+  const from = start + 1;
+  const to = start + page.length;
+  $('ipspinfo').textContent = `showing ${from}–${to} of ${total}`;
+  $('ipsprev').disabled = ipPage <= 1;
+  $('ipsnext').disabled = ipPage >= pages;
+}
+
+function changeIpsPage(delta) {
+  const pages = Math.max(1, Math.ceil(ipList.length / ipPageSize));
+  ipPage = Math.min(pages, Math.max(1, ipPage + delta));
+  renderIpsPage();
+}
+
+function togglePanel(bodyId, btnId) {
+  const body = $(bodyId);
+  const btn = $(btnId);
+  const collapsed = !body.hidden;
+  body.hidden = collapsed;
+  btn.textContent = collapsed ? 'expand' : 'collapse';
+  btn.setAttribute('aria-expanded', String(!collapsed));
 }
 
 function applyTierFilter(list) {
@@ -1124,15 +2135,84 @@ function applyTierFilter(list) {
       const t = String(f.tier || '').toUpperCase();
       return t === 'CORRELATED' || t === 'AI';
     });
-  if (sevFilter && sevFilter !== 'all')
-    out = out.filter((f) => String(f.severity || 'INFO').toUpperCase() === String(sevFilter).toUpperCase());
+  if (newExpOnly)
+    out = out.filter((f) => String(f.category || '').toLowerCase().includes('new exposure'));
+  if (sevFilters.size)
+    out = out.filter((f) => sevFilters.has(String(f.severity || 'INFO').toUpperCase()));
   return out;
 }
 
 function renderFindings(d) {
-  const list = applyTierFilter((d && d.findings) || []);
-  $('fcount').textContent = list.length;
-  $('findings').innerHTML = list.map(findingCard).join('') || '<div class="empty">No findings in this view</div>';
+  lastFindingsRaw = (d && d.findings) || [];
+  findingList = applyTierFilter(lastFindingsRaw);
+  findingPage = 1;
+  $('fcount').textContent = findingList.length;
+  renderFindingPage();
+}
+
+function renderFindingPage() {
+  const total = findingList.length;
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  if (findingPage > pages) findingPage = pages;
+  if (findingPage < 1) findingPage = 1;
+  const start = (findingPage - 1) * pageSize;
+  const pageList = findingList.slice(start, start + pageSize);
+  $('findings').innerHTML = pageList.map(findingCard).join('') || '<div class="empty">No findings in this view</div>';
+  renderPagination(total, pages, start, pageList.length);
+  setAllCollapsed(true);
+}
+
+function renderPagination(total, pages, start, shown) {
+  const bar = $('pagination');
+  const bar2 = $('pagination-bottom');
+  if (!total) {
+    bar.hidden = true;
+    bar2.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  bar2.hidden = false;
+  const from = total ? start + 1 : 0;
+  const to = start + shown;
+  const info = `showing ${from}–${to} of ${total}` + (pages > 1 ? ` · page ${findingPage}/${pages}` : '');
+  $('pinfo').textContent = info;
+  $('pinfo2').textContent = info;
+  $('pageprev').disabled = findingPage <= 1;
+  $('pagenext').disabled = findingPage >= pages;
+  $('pageprev2').disabled = findingPage <= 1;
+  $('pagenext2').disabled = findingPage >= pages;
+  $('pagesize').value = String(pageSize);
+}
+
+function changePage(delta) {
+  const pages = Math.max(1, Math.ceil(findingList.length / pageSize));
+  findingPage = Math.min(pages, Math.max(1, findingPage + delta));
+  renderFindingPage();
+}
+
+function toggleCard(card) {
+  if (!card) return;
+  const nowCollapsed = card.classList.toggle('collapsed');
+  const head = card.querySelector('.fhead');
+  if (head) head.setAttribute('aria-expanded', String(!nowCollapsed));
+  updateCollapseAllButton();
+}
+
+function setAllCollapsed(collapsed) {
+  document.querySelectorAll('#findings .fcard').forEach((c) => {
+    c.classList.toggle('collapsed', collapsed);
+    const head = c.querySelector('.fhead');
+    if (head) head.setAttribute('aria-expanded', String(!collapsed));
+  });
+  allCollapsed = collapsed;
+  $('findings-collapseall').textContent = collapsed ? 'expand all' : 'collapse all';
+}
+
+function updateCollapseAllButton() {
+  const cards = Array.from(document.querySelectorAll('#findings .fcard'));
+  const anyExpanded = cards.some((c) => !c.classList.contains('collapsed'));
+  allCollapsed = !anyExpanded;
+  $('findings-collapseall').textContent = allCollapsed ? 'expand all' : 'collapse all';
 }
 
 function findingCard(f) {
@@ -1147,20 +2227,24 @@ function findingCard(f) {
   if (f.found_date) meta.push('<div class="mrow"><span class="mlabel">found</span><span class="mval">' + esc(f.found_date) + '</span></div>');
   if (f.first_seen) meta.push('<div class="mrow"><span class="mlabel">first</span><span class="mval">' + esc(f.first_seen) + '</span></div>');
   if (srcHtml) meta.push('<div class="mrow"><span class="mlabel">src</span><span class="mval">' + srcHtml + '</span></div>');
-  return '<div class="fcard" data-id="' + esc(f.id) + '" role="button" tabindex="0">' +
-    '<div class="fhead">' +
+  return '<div class="fcard collapsed" data-id="' + esc(f.id) + '">' +
+    '<div class="fhead" role="button" tabindex="0" aria-expanded="false">' +
+      '<span class="fchev" aria-hidden="true">▸</span>' +
       '<span class="fid">' + esc(f.id) + '</span>' +
       '<h4 class="ftitle">' + esc(f.title) + '</h4>' +
       '<span class="badge ' + badge + '">' + esc((f.severity || 'INFO').toUpperCase()) + '</span>' +
       tierTag(f.tier) +
+      confidenceTag(f) +
       statusBadgeHtml(f.status) +
       statusDetailTag(f) +
       positivePill(f) +
-      '<span class="viewhint">open</span>' +
+      '<span class="fview" role="button" tabindex="0">details</span>' +
     '</div>' +
-    (f.category ? '<div class="fcat">' + esc(f.category) + '</div>' : '') +
-    cveHtml +
-    (meta.length ? '<div class="fmeta">' + meta.join('') + '</div>' : '') +
+    '<div class="fbody">' +
+      (f.category ? '<div class="fcat">' + esc(f.category) + '</div>' : '') +
+      cveHtml +
+      (meta.length ? '<div class="fmeta">' + meta.join('') + '</div>' : '') +
+    '</div>' +
   '</div>';
 }
 
@@ -1254,6 +2338,59 @@ function submitStatus() {
   });
 }
 
+const feedbackHtml = (f) => {
+  const fb = Array.isArray(f.feedback) ? f.feedback : [];
+  if (!fb.length) return '';
+  const items = fb.slice().reverse().map((e) => {
+    const at = esc(e.at || '');
+    const by = String(e.by || 'analyst').toLowerCase();
+    const label = esc(e.by || 'analyst');
+    const note = esc(e.note || '');
+    const cls = by === 'ai' ? 'hevent ai' : 'hevent';
+    const who = by === 'ai' ? ' <span class="hby">[agent]</span>' : (label ? ' <span class="hby">[' + label + ']</span>' : '');
+    return '<div class="' + cls + '">' +
+      '<div class="htime">' + at + who + '</div>' +
+      '<div class="hnote">' + note + '</div>' +
+    '</div>';
+  }).join('');
+  return '<div class="history">' + items + '</div>';
+};
+
+const commentEditorHtml = () =>
+  '<div class="commentbox">' +
+    '<textarea id="comment-note" rows="2" placeholder="Analyst comment — agent will reply with targeted checks on next AI scan" autocomplete="off"></textarea>' +
+    '<div class="commentrow">' +
+      '<button class="btn primary" id="comment-save" type="button">Save comment</button>' +
+      '<span class="stmsg" id="comment-msg"></span>' +
+    '</div>' +
+  '</div>';
+
+function submitComment() {
+  if (!modalFinding) return;
+  const note = $('comment-note').value.trim();
+  if (!note) {
+    $('comment-msg').textContent = 'Comment is empty';
+    $('comment-msg').className = 'stmsg err';
+    return;
+  }
+  fetch('/api/orgs/' + encodeURIComponent(currentOrg) + '/findings/' +
+    encodeURIComponent(modalFinding.id) + '/comment', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ note, by: 'analyst' })
+  }).then((r) => r.json().then((body) => ({ ok: r.ok, body }))).then(({ ok, body }) => {
+    if (!ok) {
+      $('comment-msg').textContent = 'Save failed: ' + (body.error || 'error');
+      $('comment-msg').className = 'stmsg err';
+      return;
+    }
+    openFinding(modalFinding.id);
+  }).catch(() => {
+    $('comment-msg').textContent = 'Save failed (network error)';
+    $('comment-msg').className = 'stmsg err';
+  });
+}
+
 function openFinding(id) {
   const body = $('modalbody');
   body.innerHTML = '<div class="empty">Loading…</div>';
@@ -1278,13 +2415,33 @@ function renderModal(f) {
 
   $('mhead').innerHTML =
     `<div class="mtitle">${title}</div>` +
-    `<div class="mheadrow"><span class="badge ${badge}">${sevTxt}</span>${tierTag(f.tier)}<span class="mid">${id}</span></div>`;
+    `<div class="mheadrow"><span class="badge ${badge}">${sevTxt}</span>${tierTag(f.tier)}${confidenceTag(f)}<span class="mid">${id}</span></div>`;
 
   const rows = [];
 
   rows.push(drow('Finding ID', `<span class="mono">${id}</span>`));
   rows.push(drow('Title', `<span class="dtitle">${title}</span>`));
   rows.push(drow('Severity', `<span class="badge ${badge}">${sevTxt}</span>`));
+  if (f.ai_grading || f.ai_impact) {
+    let gradingHtml = '';
+    if (f.ai_impact) gradingHtml += `<div>AI impact: ${esc(f.ai_impact)}</div>`;
+    if (f.ai_grading) {
+      const base = f.ai_grading.severity_baseline;
+      if (base && String(base).toUpperCase() !== String(f.severity || '').toUpperCase())
+        gradingHtml += `<div>baseline severity (deterministic): ${esc(String(base).toUpperCase())}</div>`;
+      if (f.ai_grading.model)
+        gradingHtml += `<div>model: ${esc(f.ai_grading.model)}${f.ai_grading.at ? ' · ' + esc(f.ai_grading.at) : ''}</div>`;
+    }
+    rows.push(drow('AI grading', gradingHtml || '<span style="color:var(--dim)">graded</span>'));
+  }
+  if (f.ai_still_open && f.ai_still_open.verdict) {
+    const v = String(f.ai_still_open.verdict).toLowerCase();
+    const color = v === 'yes' ? 'var(--ok,#7ee787)' : v === 'no' ? 'var(--warn,#f0883e)' : 'var(--dim)';
+    let so = `<span style="color:${color}">still open: ${esc(v)}</span>`;
+    if (f.ai_still_open.at) so += ` · ${esc(f.ai_still_open.at)}`;
+    if (f.ai_still_open.probe_basis) so += `<div style="color:var(--dim)">basis: ${esc(f.ai_still_open.probe_basis)}</div>`;
+    rows.push(drow('AI exposure check', so));
+  }
   if (f.found_date) rows.push(drow('Found', `<span class="mono">${esc(f.found_date)}</span>`));
   rows.push(drow('Status', statusSectionHtml(f)));
   if (f.first_seen) rows.push(drow('First seen', `<span class="mono">${esc(f.first_seen)}</span>`));
@@ -1292,6 +2449,10 @@ function renderModal(f) {
   const hist = statusHistoryHtml(f);
   if (hist) rows.push(drow('Status history', hist));
   rows.push(drow('Update status', statusEditorHtml(f)));
+  const fbHtml = feedbackHtml(f);
+  rows.push(drow('Analyst comments',
+    fbHtml || '<span style="color:var(--dim)">None yet — comments are fed back to the AI on the next scan.</span>'));
+  rows.push(drow('Add comment', commentEditorHtml()));
   if (f.cvss_estimate !== undefined && f.cvss_estimate !== null && f.cvss_estimate !== '')
     rows.push(drow('CVSS estimate', `<span class="mono">${esc(f.cvss_estimate)}</span>`));
   if (f.cvss_vector !== undefined && f.cvss_vector !== null && f.cvss_vector !== '')

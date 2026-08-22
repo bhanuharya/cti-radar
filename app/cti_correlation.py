@@ -13,6 +13,7 @@ Correlation axes:
   5. Confirmed status  — CONFIRMED / VERSION-CONFIRMED / clean triangulation
 """
 import html as _html
+import copy
 import json, os, re, threading, time
 from collections import defaultdict
 
@@ -25,8 +26,14 @@ DATA_ROOT = os.path.abspath(os.path.expanduser(
 # per-org data dirs live under <data-root>/orgs/<slug>
 ORG_ROOT = os.path.join(DATA_ROOT, "orgs")
 
-# canonical lifecycle status per finding
-CANONICAL_STATUSES = ("OPEN", "IN_PROGRESS", "MITIGATED", "ACCEPTED_RISK")
+# canonical lifecycle status per finding.
+# RESOLVED: the finding's evidence disappeared from the surface (retired by
+# the reconciliation pass) or a renewed cert / fixed service was observed.
+# It is set ONLY by the deterministic reconciliation logic, never by AI.
+CANONICAL_STATUSES = ("OPEN", "IN_PROGRESS", "MITIGATED", "ACCEPTED_RISK", "RESOLVED")
+
+# statuses the analyst owns outright — reconciliation never auto-changes them
+ANALYST_OWNED_STATUSES = ("IN_PROGRESS", "MITIGATED", "ACCEPTED_RISK")
 
 # Entity grouping is derived only from each registered org's configured domains.
 
@@ -35,13 +42,13 @@ DEFAULT_ORG = "sample"
 _REGISTRY_FILE = os.path.join(DATA_ROOT, "orgs.json")
 
 
-# entity types -> color (vis-friendly)
+# entity types -> color (retro terminal palette)
 NODE_COLORS = {
-    "host":  "#2ecc71",   # green
-    "ip":    "#3498db",   # blue
-    "cve":   "#e74c3c",   # red
-    "brand": "#9b59b6",   # purple
-    "class": "#f39c12",   # amber
+    "host":  "#50fa7b",   # green
+    "ip":    "#8be9fd",   # cyan
+    "cve":   "#ff5555",   # red
+    "brand": "#bd93f9",   # purple
+    "class": "#ffb86c",   # amber
 }
 
 _SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
@@ -85,20 +92,23 @@ def _resolve_registry_path(value):
 
     Existing registries may store paths as ``data/orgs/...``; newer external
     registries may use ``orgs/...``. Both resolve under the configured runtime
-    data root. Absolute paths remain supported for backwards compatibility.
+    data root. Absolute paths remain supported only when their canonical target
+    stays beneath that root; symlink escapes are rejected.
     """
     if not value:
         return None
     value = os.path.expanduser(str(value))
+    root = os.path.realpath(DATA_ROOT)
     if os.path.isabs(value):
-        return os.path.abspath(value)
+        resolved = os.path.realpath(value)
+        return resolved if os.path.commonpath([root, resolved]) == root else None
     norm = os.path.normpath(value)
     if norm == "data":
         norm = "."
     elif norm.startswith("data" + os.sep):
         norm = norm[len("data" + os.sep):]
-    resolved = os.path.abspath(os.path.join(DATA_ROOT, norm))
-    if os.path.commonpath([DATA_ROOT, resolved]) != DATA_ROOT:
+    resolved = os.path.realpath(os.path.join(root, norm))
+    if os.path.commonpath([root, resolved]) != root:
         return None
     return resolved
 
@@ -174,20 +184,8 @@ def single_public_ip(v):
 
 
 def load_meta_date(org=DEFAULT_ORG):
-    """Return the org scan meta date (ISO 'YYYY-MM-DD') or None."""
-    findings_path, _ = _org_paths(org)
-    if findings_path and os.path.exists(findings_path):
-        try:
-            with open(findings_path) as f:
-                d = json.load(f)
-            meta = d.get("meta") if isinstance(d, dict) else None
-            if isinstance(meta, dict):
-                m = _DATE_RE.search(str(meta.get("date") or meta.get("scan_date") or ""))
-                if m:
-                    return m.group(0)
-        except Exception:
-            pass
-    return None
+    """Return the org scan meta date (ISO 'YYYY-MM-DD') or None (cached)."""
+    return _cached_org_data(org)[2]
 
 
 # --------------------------------------------------------------------------
@@ -283,7 +281,8 @@ def _mask_finding_deep(nf):
     for field in ("description", "impact", "status", "discovery", "title",
                   "category", "remediation", "proof_chain", "reproduction_steps",
                   "topics_exposed", "evidence", "status_detail",
-                  "ai_provenance", "ai_suggestions", "status_history"):
+                  "ai_provenance", "ai_suggestions", "ai_impact", "ai_grading",
+                  "status_history"):
         if field in out:
             out[field] = _mask_deep(out[field], field)
     return out
@@ -354,6 +353,85 @@ def canonical_status(f):
 def _is_positive_status(s):
     u = str(s or "").upper()
     return ("SECURE" in u) or ("CLEAN" in u)
+
+
+# --------------------------------------------------------------------------
+# stable finding identity (reconciliation backbone)
+# --------------------------------------------------------------------------
+def _finding_port(f):
+    """Best-effort explicit port for a finding (int or '')."""
+    for cand in (f.get("port"), (f.get("evidence") or {}).get("port")
+                 if isinstance(f.get("evidence"), dict) else None):
+        try:
+            p = int(cand)
+            if 1 <= p <= 65535:
+                return p
+        except (TypeError, ValueError):
+            continue
+    return ""
+
+
+def identity_key(f):
+    """Stable, content-derived identity for a finding.
+
+    identity_key = <family>|<target>|<signature>. It survives rescans (unlike
+    the timestamped display id) and is the unit of observation tracking:
+    present in scan -> last_seen refreshed; absent -> missing_streak++.
+    """
+    tgt = str(f.get("target", "")).strip().lower()
+    src = str(f.get("source", "")).strip().lower()
+    cat = str(f.get("category", "")).strip().lower()
+    port = _finding_port(f)
+
+    if src == "scan-tls":
+        return f"tls|{tgt}|{port}"
+    if src == "scan-login":
+        return f"login|{tgt}|"
+    if src == "scan-headers":
+        return f"headers|{tgt}|"
+    if src == "baseline-diff":
+        port = f.get("port")
+        return f"diff|{tgt}|{int(port) if port else 'host'}"
+    if src == "scan-version":
+        ev = f.get("evidence") or {}
+        prods = ""
+        if isinstance(ev, dict):
+            vs = ev.get("versions") or []
+            if isinstance(vs, list):
+                prods = ",".join(sorted(str(v.get("product", "")) for v in vs
+                                        if isinstance(v, dict)))[:120]
+        return f"version|{tgt}|{prods}"
+    if src == "scan-cve":
+        cves = ",".join(sorted(str(c) for c in (f.get("related_cves") or [])))[:160]
+        return f"cve|{tgt}|{cves or cat}"
+    if src == "ai-assess":
+        return f"ai|{tgt}|{cat}"
+    if src == "scan-enum":
+        return f"surface-enum|{tgt}|"
+    if src == "scan-surface":
+        return f"surface-web|{tgt}|{port}"
+    if src == "scan-services":
+        return f"surface-tcp|{tgt}|{port}"
+    if src in ("cve-share", "ip-co-residency", "internetdb") or src.startswith("corr"):
+        cves = ",".join(sorted(str(c) for c in (f.get("related_cves") or [])))[:160]
+        sig = cves or cat
+        return f"corr|{src}|{tgt}|{sig}"
+    if src.startswith("ohack"):
+        # URL-targeted external findings: host + normalized path + category
+        target_url = str(f.get("evidence", {}).get("url", "") if isinstance(f.get("evidence"), dict) else "")
+        path = target_url.split("://", 1)[-1].rstrip("/").lower()[:160]
+        return f"ohack|{tgt}|{path}|{cat}"
+    # generic fallback: mirrors the historical dedup semantics
+    return f"{src or 'unknown'}|{tgt}|{cat}"
+
+
+def ensure_identity(f):
+    """In-place: backfill identity_key for legacy findings. Idempotent — an
+    existing identity_key is trusted (analyst/tool continuity beats remapping)."""
+    ik = str(f.get("identity_key", "")).strip()
+    if not ik:
+        f["identity_key"] = identity_key(f)
+    return f["identity_key"]
 
 
 def _extract_found_date(f, org, meta_date):
@@ -520,6 +598,7 @@ def record_event_and_snapshot(org, kind, mode=None, note=""):
         data["meta"] = meta
         if fp:
             _atomic_write_json(fp, data)
+            invalidate_org_cache(slug)
         hp = history_path(slug)
         os.makedirs(os.path.dirname(hp), exist_ok=True)
         _append_history_locked(hp, event)
@@ -599,6 +678,7 @@ def persist_ai_findings(org, ai_findings):
         data["findings"] = existing
         if fp:
             _atomic_write_json(fp, data)
+            invalidate_org_cache(slug)
     return added
 
 
@@ -639,6 +719,7 @@ def set_finding_status(org, id_, new_status, note=""):
         target["status"] = new_status
         target["last_seen"] = now
         _atomic_write_json(fp, data)
+        invalidate_org_cache(slug)
         event = {
             "ts": now,
             "kind": "status_change",
@@ -650,6 +731,61 @@ def set_finding_status(org, id_, new_status, note=""):
         hp = history_path(slug)
         os.makedirs(os.path.dirname(hp), exist_ok=True)
         _append_history_locked(hp, event)
+        return target, None
+
+
+def add_finding_comment(org, id_, note, by=""):
+    """Append one analyst feedback/comment to a finding (token-gated helper).
+
+    Stored as finding["feedback"] = [{at, by, note}, ...] (capped to the most
+    recent 50 entries). The scanner's AI triage pass later reads the latest
+    feedback per host and weighs it on the next `mode=ai` scan.
+    Returns (finding, err).
+    """
+    slug = _slug_from_org(org)
+    note = (note or "").strip()
+    if not note:
+        return None, "empty note"
+    note = note[:2000]
+    by = (by or "").strip()[:60] or "analyst"
+    fp = org_findings_path(slug)
+    if not fp or not os.path.exists(fp):
+        return None, "not found"
+    lock = _org_lock(slug)
+    with lock:
+        data = {"findings": []}
+        try:
+            with open(fp) as fh:
+                d = json.load(fh)
+            if isinstance(d, dict):
+                data = d
+        except Exception:
+            data = {"findings": []}
+        fs = data.get("findings") or []
+        target = None
+        for f in fs:
+            if str(f.get("id")) == str(id_):
+                target = f
+                break
+        if target is None:
+            return None, "not found"
+        migrate_finding(target, org=slug)
+        fb = target.get("feedback")
+        if not isinstance(fb, list):
+            fb = []
+        fb.append({"at": _now_iso(), "by": by, "note": note})
+        target["feedback"] = fb[-50:]
+        _atomic_write_json(fp, data)
+        invalidate_org_cache(slug)
+        hp = history_path(slug)
+        os.makedirs(os.path.dirname(hp), exist_ok=True)
+        _append_history_locked(hp, {
+            "ts": _now_iso(),
+            "kind": "comment",
+            "mode": None,
+            "summary": {"found": len(fs)},
+            "note": "comment on %s: %s" % (id_, note[:120]),
+        })
         return target, None
 
 
@@ -704,6 +840,57 @@ def normalize_finding(f, org=DEFAULT_ORG, meta_date=None):
     return nf
 
 
+def normalize_finding_light(f, org=DEFAULT_ORG, meta_date=None):
+    """Lightweight list-view normalization (small payload, no deep PII scan).
+
+    Returns only the fields the findings list / graph summaries need, with
+    masking applied to the short display strings. Heavy evidence fields are
+    omitted so large orgs stay fast; /api/findings/{id} still returns the full
+    masked detail.
+    """
+    nf = dict(f)
+    if meta_date is None:
+        meta_date = load_meta_date(org)
+    nf["found_date"] = _extract_found_date(f, org, meta_date)
+    migrate_finding(nf, org=org, meta_date=meta_date)
+
+    st = str(nf.get("status", "")).upper()
+    sd = str(nf.get("status_detail", "")).upper()
+    if "AI-ASSESSED" in sd:
+        tier = "AI"
+    elif "CONFIRMED" in sd:
+        tier = "CONFIRMED"
+    elif "CORRELATED" in sd or "CORRELATED" in st:
+        tier = "CORRELATED"
+    else:
+        tier = "OTHER"
+
+    cves = extract_cves(f.get("related_cves"))
+    ip = single_public_ip(f.get("ip"))
+    prov = nf.get("provenance")
+    confidence = prov.get("confidence") if isinstance(prov, dict) else None
+    return {
+        "id": nf.get("id"),
+        "title": _mask_value("title", nf.get("title")),
+        "severity": nf.get("severity"),
+        "category": _mask_value("category", nf.get("category")),
+        "status": nf.get("status"),
+        "status_detail": _mask_value("status_detail", nf.get("status_detail")),
+        "positive": bool(nf.get("positive")),
+        "tier": tier,
+        "confidence": confidence,
+        "target": nf.get("target"),
+        "ip": nf.get("ip"),
+        "found_date": nf.get("found_date"),
+        "first_seen": nf.get("first_seen"),
+        "last_seen": nf.get("last_seen"),
+        "related_cves": f.get("related_cves"),
+        "cve_links": ["https://nvd.nist.gov/vuln/detail/" + c for c in cves],
+        "shodan_link": "https://www.shodan.io/host/" + ip if ip else None,
+        "internetdb_link": "https://internetdb.shodan.io/" + ip if ip else None,
+    }
+
+
 # --------------------------------------------------------------------------
 # persistence (per-org lock + atomic write + dedup)
 # --------------------------------------------------------------------------
@@ -724,12 +911,72 @@ def org_findings_path(org):
     return fp
 
 
+def _atomic_write_bytes(path, data, mode=0o600):
+    """Atomic durable file write: unique temp name in the target dir,
+    flushed+fsynced before replace, restrictive permissions."""
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    tmp = os.path.join(d, ".%s.tmp.%d.%d" % (os.path.basename(path), os.getpid(),
+                                             threading.get_ident()))
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _atomic_write_json(path, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-    os.replace(tmp, path)
+    _atomic_write_bytes(path, (json.dumps(data, indent=2) + "\n").encode("utf-8"))
+
+
+def _atomic_write_text(path, text):
+    _atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def migrate_data_permissions():
+    """One-time best-effort tightening of runtime data files: 0600 files,
+    0700 dirs under DATA_ROOT/orgs plus top-level json/log artifacts.
+    Called at app startup; safe to run repeatedly."""
+    changed = 0
+    roots = [os.path.join(DATA_ROOT, "orgs")]
+    for name in ("orgs.json",):
+        p = os.path.join(DATA_ROOT, name)
+        if os.path.isfile(p):
+            roots.append(p)
+    for root in roots:
+        if os.path.isdir(root):
+            for cur, dirs, files in os.walk(root):
+                for dname in dirs:
+                    try:
+                        p = os.path.join(cur, dname)
+                        os.chmod(p, 0o700)
+                        changed += 1
+                    except OSError:
+                        pass
+                for fname in files:
+                    if fname.startswith("."):
+                        continue
+                    try:
+                        p = os.path.join(cur, fname)
+                        os.chmod(p, 0o600)
+                        changed += 1
+                    except OSError:
+                        pass
+        elif os.path.isfile(root):
+            try:
+                os.chmod(root, 0o600)
+                changed += 1
+            except OSError:
+                pass
+    return changed
 
 
 def _dedup_key(f):
@@ -779,6 +1026,7 @@ def persist_correlated(org, new_findings, report=None):
             data["meta"] = meta
         if fp:
             _atomic_write_json(fp, data)
+            invalidate_org_cache(slug)
     return added
 
 
@@ -811,34 +1059,93 @@ def _root_domain(host, domains=None):
     return "other"
 
 
-def load_data(org=DEFAULT_ORG):
-    fs = []
+# --- read-through cache for org files (findings/baseline/meta date) ---
+_DATA_CACHE = {}
+_DATA_CACHE_LOCK = threading.Lock()
+_DATA_CACHE_TTL = 15.0  # seconds
+
+
+def _read_org_files(org):
+    fs, baseline, meta_date = [], [], None
     findings_path, baseline_path = _org_paths(org)
     if findings_path and os.path.exists(findings_path):
         try:
             with open(findings_path) as f:
                 d = json.load(f)
-            fs = d.get("findings", []) if isinstance(d, dict) else []
+            if isinstance(d, dict):
+                fs = d.get("findings") or []
+                meta = d.get("meta")
+                if isinstance(meta, dict):
+                    m = _DATE_RE.search(str(meta.get("date") or meta.get("scan_date") or ""))
+                    if m:
+                        meta_date = m.group(0)
         except Exception:
             fs = []
-    baseline = []
     if baseline_path and os.path.exists(baseline_path):
         try:
             with open(baseline_path) as f:
                 baseline = [l.strip() for l in f if l.strip() and not l.startswith("#")]
         except Exception:
             baseline = []
-    return fs, baseline
+    return fs, baseline, meta_date
+
+
+def _cached_org_data(org):
+    """Return (findings, baseline, meta_date) using a small TTL cache.
+
+    The lock is held across read-and-store so a reader that misses the cache
+    cannot interleave with a writer's invalidate and re-cache *stale* file
+    content after the invalidation (the classic stale-after-write race).
+    File reads under the lock are short (local disk, small JSON).
+    """
+    now = time.time()
+    with _DATA_CACHE_LOCK:
+        entry = _DATA_CACHE.get(org)
+        if entry and now - entry.get("ts", 0) < _DATA_CACHE_TTL:
+            return entry["data"]
+        # read while holding the lock: an invalidate_org_cache() from a writer
+        # either happens fully before our store (we then read fresh files) or
+        # fully after (our fresh entry is dropped and the next read re-reads).
+        data = _read_org_files(org)
+        _DATA_CACHE[org] = {"data": data, "ts": time.time()}
+        return data
+
+
+def invalidate_org_cache(org):
+    """Drop the cached read-through data for an org (call after file writes)."""
+    with _DATA_CACHE_LOCK:
+        _DATA_CACHE.pop(org, None)
+
+
+def load_data(org=DEFAULT_ORG):
+    """Return (findings, baseline) for an org (read-through cache).
+
+    Return independent copies, including nested finding fields. Callers
+    mutate findings during enrichment and must never alter shared cached data.
+    """
+    fs, baseline, _ = _cached_org_data(org)
+    return copy.deepcopy(fs or []), copy.deepcopy(baseline or [])
 
 
 # --- reusable in-memory builders (for aggregate request reuse) ---
 def summary_from_data(fs, baseline):
-    """Build summary payload from in-memory findings/baseline without re-reading files."""
+    """Build summary payload from in-memory findings/baseline without re-reading files.
+
+    Live-surface semantics: RESOLVED findings (evidence gone, retired by the
+    reconciliation pass) are excluded from findings_total/severity so KPIs
+    cannot inflate forever; their count is exposed separately."""
     sev = defaultdict(int)
+    live = 0
+    resolved = 0
     for f in (fs or []):
+        if canonical_status(f) == "RESOLVED":
+            resolved += 1
+            continue
+        live += 1
         sev[str(f.get("severity", "INFO")).upper()] += 1
     bl = baseline if isinstance(baseline, list) else []
-    return {"findings_total": len(fs or []), "severity": dict(sev), "baseline": len(bl)}
+    return {"findings_total": live, "resolved_total": resolved,
+            "severity": dict(sev), "baseline": len(bl)}
 
 
 def fleet_spread_from_data(fs):
@@ -936,7 +1243,7 @@ def build_graph_from_data(fs, baseline, domains=None):
             add_node("ip:" + ip, _html.escape(ip.split(":", 1)[1]), "ip",
                      cluster=True, title=f"<b>Shared box</b><br>{len(hosts)} hosts")
             for h in hosts[1:]:
-                add_edge(hosts[0], h, "co-resident", dashes=True, color="#7f8c8d")
+                add_edge(hosts[0], h, "co-resident", dashes=True, color="#6a6a6a")
 
     for cve, hosts in cve_hosts.items():
         if len(hosts) >= 2:

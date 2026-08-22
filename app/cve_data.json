@@ -1,0 +1,227 @@
+{
+  "_meta": {
+    "updated": "2026-08-22",
+    "policy": "High-impact (CVSS >= 7.0), well-known CVEs only. Matches are advisory: findings are tiered CORRELATED and must be verified against the affected range before action. Ranges are OR-combined; operators within a range are AND-combined. Versions are compared by leading numeric components (7.1p2 -> 7.1).",
+    "confidence": "single numeric component (e.g. 'Apache/2') -> low; two or more components -> medium"
+  },
+  "products": {
+    "nginx": {
+      "aliases": ["nginx"],
+      "cves": [
+        {"cve": "CVE-2021-23017", "severity": "HIGH", "cvss": 7.7, "fix_version": "1.20.1",
+         "ranges": [">=0.6.18,<1.20.1"],
+         "summary": "DNS resolver off-by-one (1-byte write) enables attacker-controlled DNS cache poisoning"},
+        {"cve": "CVE-2018-16843", "severity": "HIGH", "cvss": 7.5, "fix_version": "1.15.6",
+         "ranges": [">=1.9.5,<1.15.6"],
+         "summary": "HTTP/2 implementation memory consumption enables remote denial of service"}
+      ]
+    },
+    "apache": {
+      "aliases": ["apache", "httpd", "apache httpd", "apache2"],
+      "cves": [
+        {"cve": "CVE-2021-41773", "severity": "HIGH", "cvss": 7.5, "fix_version": "2.4.50",
+         "ranges": ["=2.4.49"],
+         "summary": "Path traversal + disclosure of files outside the document root (w/ CGI enabled: RCE)"},
+        {"cve": "CVE-2021-42013", "severity": "HIGH", "cvss": 7.5, "fix_version": "2.4.51",
+         "ranges": ["=2.4.49", "=2.4.50"],
+         "summary": "Path traversal bypass of the CVE-2021-41773 fix; RCE with CGI enabled"},
+        {"cve": "CVE-2019-0211", "severity": "HIGH", "cvss": 7.8, "fix_version": "2.4.39",
+         "ranges": ["<=2.4.38"],
+         "summary": "Local privilege escalation from www-data to root via CARP / mod_auth"}
+      ]
+    },
+    "openssh": {
+      "aliases": ["openssh", "ssh"],
+      "cves": [
+        {"cve": "CVE-2024-6387", "severity": "HIGH", "cvss": 8.1, "fix_version": "9.8p1",
+         "ranges": [">=8.5,<=9.7"],
+         "summary": "regreSSHion: signal-handler race enables unauthenticated RCE as root (glibc)"},
+        {"cve": "CVE-2023-38408", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "9.3p2",
+         "ranges": [">=5.5,<=9.3"],
+         "summary": "ssh-agent forwarding PKCS#11 command injection enables RCE on the agent host"}
+      ]
+    },
+    "php": {
+      "aliases": ["php", "php-fpm"],
+      "cves": [
+        {"cve": "CVE-2024-4577", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "8.3.8",
+         "ranges": [">=8.1,<8.1.29", ">=8.2,<8.2.20", ">=8.3,<8.3.8"],
+         "summary": "PHP-CGI argument injection -> RCE (best-fit encoding bypass, CVE-2012-1823 class)"},
+        {"cve": "CVE-2019-11043", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "7.3.11",
+         "ranges": [">=7.1,<7.1.33", ">=7.2,<7.2.24", ">=7.3,<7.3.11"],
+         "summary": "PHP-FPM underflow in env path handling enables unauthenticated RCE (nginx+fastcgi)"}
+      ]
+    },
+    "wordpress": {
+      "aliases": ["wordpress", "wp"],
+      "cves": [
+        {"cve": "CVE-2017-1001000", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "4.7.2",
+         "ranges": [">=4.7,<4.7.2"],
+         "summary": "REST API type-juggling privilege escalation enables unauthenticated content injection / defacement"},
+        {"cve": "CVE-2022-21661", "severity": "HIGH", "cvss": 8.2, "fix_version": "5.8.3",
+         "ranges": ["<5.8.3"],
+         "summary": "WP_Query SQL injection enables authenticated (author+) RCE via plugin/theme upload"}
+      ]
+    },
+    "tomcat": {
+      "aliases": ["tomcat", "apache-coyote", "coyote", "apache coyote"],
+      "cves": [
+        {"cve": "CVE-2020-1938", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "9.0.31",
+         "ranges": [">=9.0,<9.0.31", ">=8.5,<8.5.51", ">=7.0,<7.0.100"],
+         "summary": "Ghostcat: AJP connector file read/include enables RCE when files are readable"},
+        {"cve": "CVE-2017-12617", "severity": "HIGH", "cvss": 8.1, "fix_version": "7.0.82",
+         "ranges": [">=7.0,<7.0.82"],
+         "summary": "JSP upload bypass on read-only PUT-enabled contexts enables RCE"}
+      ]
+    },
+    "iis": {
+      "aliases": ["iis", "microsoft-iis", "internet information services"],
+      "cves": [
+        {"cve": "CVE-2017-7269", "severity": "HIGH", "cvss": 7.5, "fix_version": null,
+         "ranges": ["<=6.0"],
+         "summary": "WebDAV PROPFIND buffer overflow enables unauthenticated RCE (IIS 6.0, Server 2003 — EOL)"}
+      ]
+    },
+    "exim": {
+      "aliases": ["exim"],
+      "cves": [
+        {"cve": "CVE-2019-10149", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "4.92",
+         "ranges": [">=4.87,<=4.91"],
+         "summary": "RETURN of the WIZARD: ${} string expansion in recipients enables unauthenticated RCE as root"},
+        {"cve": "CVE-2023-42115", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "4.96.1",
+         "ranges": ["<4.96.1"],
+         "summary": "SMTP String::format buffer overflow enables pre-auth RCE"}
+      ]
+    },
+    "vsftpd": {
+      "aliases": ["vsftpd"],
+      "cves": [
+        {"cve": "CVE-2011-2523", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "2.3.5",
+         "ranges": ["=2.3.4"],
+         "summary": "Backdoored distribution (vsftpd-2.3.4.tar.gz) opens a root shell on port 6200"}
+      ]
+    },
+    "proftpd": {
+      "aliases": ["proftpd", "proftp"],
+      "cves": [
+        {"cve": "CVE-2015-3306", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "1.3.5a",
+         "ranges": ["=1.3.5"],
+         "summary": "mod_copy SITE CPFR/CPTO copy-to-spool path traversal enables unauthenticated RCE"}
+      ]
+    },
+    "redis": {
+      "aliases": ["redis"],
+      "cves": [
+        {"cve": "CVE-2022-0543", "severity": "CRITICAL", "cvss": 10.0, "fix_version": null,
+         "ranges": [">=2.2,<=7.0.0"],
+         "summary": "Lua sandbox escape in distro-packaged Redis (Debian/Ubuntu) enables RCE — check packaging source"},
+        {"cve": "CVE-2023-28856", "severity": "HIGH", "cvss": 7.0, "fix_version": "7.0.11",
+         "ranges": [">=7.0,<7.0.11", ">=6.2,<6.2.12"],
+         "summary": "Async command completion race enables replica read/write of arbitrary files"}
+      ]
+    },
+    "elasticsearch": {
+      "aliases": ["elasticsearch"],
+      "cves": [
+        {"cve": "CVE-2015-1427", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "1.4.3",
+         "ranges": [">=1.3,<1.3.8", ">=1.4,<1.4.3"],
+         "summary": "Groovy sandbox bypass in search scripts enables unauthenticated RCE"},
+        {"cve": "CVE-2014-3120", "severity": "HIGH", "cvss": 8.8, "fix_version": "1.2",
+         "ranges": ["<1.2"],
+         "summary": "Script execution enabled by default permits RCE via the search API"}
+      ]
+    },
+    "mysql": {
+      "aliases": ["mysql", "mariadb"],
+      "cves": [
+        {"cve": "CVE-2012-2122", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "5.5.24",
+         "ranges": [">=5.1,<5.1.63", ">=5.5,<5.5.24"],
+         "summary": "Password comparison memcmp truncation authenticates with any password (~300 attempts)"}
+      ]
+    },
+    "django": {
+      "aliases": ["django"],
+      "cves": [
+        {"cve": "CVE-2019-19844", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "2.2.9",
+         "ranges": [">=2.2,<2.2.9", ">=2.1,<2.1.16", ">=1.11,<1.11.27"],
+         "summary": "Password-reset SQL injection / account takeover via crafted reset email (PostgreSQL)"}
+      ]
+    },
+    "drupal": {
+      "aliases": ["drupal"],
+      "cves": [
+        {"cve": "CVE-2018-7600", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "8.5.1",
+         "ranges": ["<7.58", ">=8.0,<8.5.1"],
+         "summary": "Drupalgeddon2: Form API rendering injection enables unauthenticated RCE"},
+        {"cve": "CVE-2014-3704", "severity": "HIGH", "cvss": 7.5, "fix_version": "7.32",
+         "ranges": [">=7.0,<=7.31"],
+         "summary": "Drupalgeddon: expandArray SQL injection enables arbitrary code execution"}
+      ]
+    },
+    "struts": {
+      "aliases": ["struts", "struts2", "apache struts"],
+      "cves": [
+        {"cve": "CVE-2017-5638", "severity": "CRITICAL", "cvss": 10.0, "fix_version": "2.3.32",
+         "ranges": [">=2.3.5,<=2.3.31", ">=2.5,<=2.5.10"],
+         "summary": "Jakarta Multipart Content-Type OGNL injection enables unauthenticated RCE (Equifax)"},
+        {"cve": "CVE-2018-11776", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "2.5.17",
+         "ranges": [">=2.3,<=2.3.34", ">=2.5,<=2.5.16"],
+         "summary": "Namespace OGNL injection enables RCE even without configured actions"}
+      ]
+    },
+    "spring": {
+      "aliases": ["spring", "spring-framework", "springboot", "spring boot"],
+      "cves": [
+        {"cve": "CVE-2022-22965", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "5.3.18",
+         "ranges": [">=5.3,<5.3.18", ">=5.2,<5.2.20"],
+         "summary": "Spring4Shell: data binding to ClassLoader enables RCE (JDK9+, WAR on Tomcat)"}
+      ]
+    },
+    "confluence": {
+      "aliases": ["confluence"],
+      "cves": [
+        {"cve": "CVE-2022-26134", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "7.4.17",
+         "ranges": ["<7.4.17"],
+         "summary": "OGNL injection in the URI enables unauthenticated RCE"},
+        {"cve": "CVE-2023-22515", "severity": "CRITICAL", "cvss": 10.0, "fix_version": "8.5.2",
+         "ranges": [">=8.0,<8.5.2"],
+         "summary": "Broken access control on the setup action enables unauthorized admin creation"}
+      ]
+    },
+    "gitlab": {
+      "aliases": ["gitlab"],
+      "cves": [
+        {"cve": "CVE-2023-7028", "severity": "CRITICAL", "cvss": 10.0, "fix_version": "16.7.2",
+         "ranges": [">=16.0,<16.7.2"],
+         "summary": "Password reset to attacker-controlled email enables account takeover of arbitrary users"},
+        {"cve": "CVE-2021-22205", "severity": "CRITICAL", "cvss": 9.9, "fix_version": "13.10.3",
+         "ranges": [">=11.9,<13.10.3"],
+         "summary": "ExifTool unrestricted file upload enables unauthenticated RCE"}
+      ]
+    },
+    "grafana": {
+      "aliases": ["grafana"],
+      "cves": [
+        {"cve": "CVE-2021-43798", "severity": "HIGH", "cvss": 7.2, "fix_version": "8.3.1",
+         "ranges": [">=8.0,<8.3.1"],
+         "summary": "Plugin URL path traversal enables unauthenticated arbitrary file read (config/secrets)"}
+      ]
+    },
+    "jenkins": {
+      "aliases": ["jenkins", "hudson"],
+      "cves": [
+        {"cve": "CVE-2024-23897", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "2.442",
+         "ranges": ["<2.442"],
+         "summary": "CLI expansion of @-file arguments enables unauthenticated arbitrary file read -> RCE"}
+      ]
+    },
+    "zabbix": {
+      "aliases": ["zabbix"],
+      "cves": [
+        {"cve": "CVE-2016-10134", "severity": "CRITICAL", "cvss": 9.8, "fix_version": "3.0.4",
+         "ranges": [">=2.2,<2.2.14", ">=3.0,<3.0.4"],
+         "summary": "JSON-RPC profile.idx2 SQL injection enables login bypass and data exfiltration"}
+      ]
+    }
+  }
+}

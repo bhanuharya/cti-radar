@@ -32,7 +32,12 @@ data/*baseline*.txt
 !data/ai_config.example.json
 data/ai_config.json
 
-# ---- OpenCode/session exports (internal transcripts; NEVER commit) ----
+# ---- coding-agent/session exports (internal transcripts; NEVER commit) ----
+/.commandcode/
+/.opencode/
+/home/
+/for-pi*.md
+/pi-session-*.html
 /session-*.md
 /cti-*.md
 app/HOW_TO_RUN.md

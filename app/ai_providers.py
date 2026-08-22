@@ -14,6 +14,7 @@ import ipaddress
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -34,6 +35,28 @@ CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,7}$")
 PROMPT_VERSION = "cti-v1"
 
 _ALLOWED_API_KEY_RE = re.compile(r"^(CTI_AI_[A-Z0-9_]+|OPENCODE_GO_B_API_KEY|OPENROUTER_API_KEY|[A-Z][A-Z0-9_]*_API_KEY)$")
+
+_USER_AGENT = "cti-radar/1.0 (urllib)"
+
+# Optional log hook so the web backend can route AI diagnostics into the
+# persisted runtime log (JSONL) + in-memory ring. Falls back to stderr.
+_LOG_HOOK = None
+
+
+def set_log_hook(fn):
+    """Install a logger: fn(level, message, meta_dict_or_None)."""
+    global _LOG_HOOK
+    _LOG_HOOK = fn
+
+
+def _log(level, message, meta=None):
+    try:
+        if _LOG_HOOK is not None:
+            _LOG_HOOK(level, message, meta)
+            return
+    except Exception:
+        pass
+    print(f"[ai:{level}] {message}", file=sys.stderr)
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -160,7 +183,7 @@ def _build_default_config() -> dict:
                 "model": "muse-spark-1.2-contributor",
                 "api_key_env": "OPENCODE_GO_B_API_KEY",
                 "timeout": 90,
-                "max_hosts": 25,
+                "max_hosts": 10,
             }
         }
     }
@@ -196,9 +219,9 @@ def load_profiles() -> Tuple[Dict[str, dict], Optional[str]]:
             timeout = 90
         timeout = max(10, min(timeout, 300))
         try:
-            max_hosts = int(p.get("max_hosts", 25) or 25)
+            max_hosts = int(p.get("max_hosts", 10) or 10)
         except Exception:
-            max_hosts = 25
+            max_hosts = 10
         max_hosts = max(1, min(max_hosts, 50))
         norm[name] = {
             "provider": provider,
@@ -234,52 +257,196 @@ def _limited_read(resp, limit=262144) -> bytes:
         return b""
 
 
-def _call_ollama(base_url: str, model: str, prompt: str, timeout: int, options: dict) -> Optional[str]:
+def _read_http_error_body(e):
+    """Best-effort body read from an urllib HTTPError (size-limited)."""
+    try:
+        return (e.read(1000) or b"").decode(errors="replace")
+    except Exception:
+        return ""
+
+
+def _extract_openai_content_reasoning(d):
+    """Return (content, reasoning) from an OpenAI-compatible response dict.
+
+    Handles both the standard shape ``{"choices": [...]}`` and the cline.bot
+    wrapper ``{"data": {"choices": [...]}}``. Reasoning is read from
+    ``reasoning`` / ``reasoning_content`` / ``reasoning_details[]`` fields and
+    from array-style ``content`` parts.
+    """
+    if not isinstance(d, dict):
+        return None, None
+    choices = d.get("choices")
+    if not isinstance(choices, list):
+        data = d.get("data")
+        if isinstance(data, dict):
+            choices = data.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return None, None
+    first = choices[0]
+    msg = first.get("message") if isinstance(first.get("message"), dict) else {}
+    content = msg.get("content")
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict):
+                t = p.get("text")
+                if isinstance(t, str) and t.strip():
+                    parts.append(t.strip())
+            elif isinstance(p, str) and p.strip():
+                parts.append(p.strip())
+        content = "\n".join(parts) if parts else None
+    if content is not None and not isinstance(content, str):
+        content = str(content)
+    if isinstance(content, str):
+        content = content.strip() or None
+    reasoning = None
+    for key in ("reasoning", "reasoning_content"):
+        v = msg.get(key)
+        if isinstance(v, str) and v.strip():
+            reasoning = v.strip()
+            break
+    if reasoning is None:
+        rd = msg.get("reasoning_details")
+        if not isinstance(rd, list):
+            rd = first.get("reasoning_details")
+        if isinstance(rd, list):
+            texts = []
+            for item in rd:
+                if isinstance(item, dict):
+                    t = item.get("text") or item.get("content")
+                    if isinstance(t, str) and t.strip():
+                        texts.append(t.strip())
+            if texts:
+                reasoning = "\n".join(texts)
+    return content, reasoning
+
+
+def _call_ollama(base_url: str, model: str, prompt: str, timeout: int, options: dict):
+    """Call Ollama. Returns (content, reasoning, diagnostics).
+
+    Uses Ollama's native ``format: "json"`` (structured JSON mode) and a bounded
+    ``num_predict`` ceiling so cheap models stay fast and well-formed. User
+    profile ``options`` may override either.
+    """
     url = base_url.rstrip("/") + "/api/chat"
     body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
-        "options": {"temperature": 0, **(options or {})},
+        "format": "json",
+        "options": {"temperature": 0, "num_predict": 1024, **(options or {})},
     }
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", _USER_AGENT)
     try:
         with _urlopen_no_redirect(req, timeout=timeout) as r:
-            d = json.loads(_limited_read(r).decode() or "{}")
-        # Ollama returns {"message": {"content": "..."}, "done": true}
+            resp_bytes = _limited_read(r)
+            d = json.loads(resp_bytes.decode(errors="replace") or "{}")
+        status = getattr(r, "status", None)
         msg = d.get("message", {}) if isinstance(d, dict) else {}
         content = msg.get("content")
-        if content:
-            return str(content)
+        reasoning = msg.get("thinking") or msg.get("reasoning")
+        if isinstance(reasoning, str) and not reasoning.strip():
+            reasoning = None
         # fallback: some ollama wrappers return choices
-        choices = d.get("choices") or []
-        if choices and isinstance(choices[0], dict):
-            return choices[0].get("message", {}).get("content")
-        return None
-    except Exception:
-        return None
+        if not content:
+            choices = d.get("choices") or []
+            if choices and isinstance(choices[0], dict):
+                content = choices[0].get("message", {}).get("content")
+        if content is not None and not isinstance(content, str):
+            content = str(content)
+        if isinstance(content, str):
+            content = content.strip() or None
+        if content:
+            _log("info", f"AI provider responded ({model}): {len(content)} chars"
+                 + (f", reasoning {len(reasoning)} chars" if reasoning else ""))
+            return content, (reasoning[:2000] if isinstance(reasoning, str) else None), {"status": status or 200}
+        _log("warn", f"AI provider returned no content ({model})",
+             {"body_excerpt": resp_bytes[:1000].decode(errors="replace")})
+        return None, None, {"status": status or 200, "response_excerpt": resp_bytes[:1000].decode(errors="replace")}
+    except urllib.error.HTTPError as e:
+        body = _read_http_error_body(e)
+        _log("error", f"AI provider HTTP {e.code} for {model}: {body[:300]}")
+        return None, None, {"status": e.code, "error": f"HTTP {e.code}", "response_excerpt": body[:500]}
+    except Exception as e:
+        _log("error", f"AI provider request failed for {model}: {type(e).__name__}: {e}")
+        return None, None, {"error": f"{type(e).__name__}: {e}"}
 
-def _call_openai_compatible(base_url: str, model: str, prompt: str, timeout: int, api_key_env: Optional[str]) -> Optional[str]:
+
+def _call_openai_compatible(base_url: str, model: str, prompt: str, timeout: int, api_key_env: Optional[str]):
+    """Call an OpenAI-compatible endpoint. Returns (content, reasoning, diagnostics).
+
+    Requests structured JSON output (``response_format: json_object``) and caps
+    ``max_tokens`` so cheap models stay bounded. Endpoints that reject the
+    ``response_format`` field are retried once without it.
+    """
     key = os.environ.get(api_key_env or "", "") if api_key_env else ""
     # allow no key for local openai-compatible (e.g., vLLM without auth)
     url = base_url.rstrip("/") + "/chat/completions"
-    body = {"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0}
-    data = json.dumps(body).encode()
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    if key:
-        req.add_header("Authorization", "Bearer " + key)
     # If api_key_env is set but missing, fail gracefully (return None -> fallback)
     if api_key_env and not key:
-        return None
-    try:
+        _log("warn", f"AI profile {model} requires {api_key_env} but it is not set")
+        return None, None, {"error": f"missing API key ({api_key_env})"}
+
+    def _post(payload):
+        data = json.dumps(payload).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", _USER_AGENT)
+        if key:
+            req.add_header("Authorization", "Bearer " + key)
         with _urlopen_no_redirect(req, timeout=timeout) as r:
-            d = json.loads(_limited_read(r).decode() or "{}")
-        return (d.get("choices") or [{}])[0].get("message", {}).get("content") or None
+            resp_bytes = _limited_read(r)
+            status = getattr(r, "status", None)
+            return status, resp_bytes
+
+    base_payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0, "max_tokens": 1024}
+    with_format = dict(base_payload)
+    with_format["response_format"] = {"type": "json_object"}
+
+    status, resp_bytes = None, b""
+    try:
+        status, resp_bytes = _post(with_format)
+    except urllib.error.HTTPError as e:
+        status = e.code
+        resp_bytes = b""
+        if e.code in (400, 404, 406, 415, 422, 500, 501):
+            # Some OpenAI-compatible endpoints reject response_format (or
+            # intermittently 500 on zen/go). Retry once without it.
+            try:
+                status, resp_bytes = _post(base_payload)
+            except urllib.error.HTTPError as e2:
+                body = _read_http_error_body(e2)
+                _log("error", f"AI provider HTTP {e2.code} for {model}: {body[:300]}")
+                return None, None, {"status": e2.code, "error": f"HTTP {e2.code}", "response_excerpt": body[:500]}
+        else:
+            body = _read_http_error_body(e)
+            _log("error", f"AI provider HTTP {e.code} for {model}: {body[:300]}")
+            return None, None, {"status": e.code, "error": f"HTTP {e.code}", "response_excerpt": body[:500]}
+    except Exception as e:
+        _log("error", f"AI provider request failed for {model}: {type(e).__name__}: {e}")
+        return None, None, {"error": f"{type(e).__name__}: {e}"}
+
+    try:
+        d = json.loads(resp_bytes.decode(errors="replace") or "{}")
     except Exception:
-        return None
+        d = {}
+    content, reasoning = _extract_openai_content_reasoning(d)
+    reasoning_out = reasoning[:2000] if reasoning else None
+    if content:
+        _log("info", f"AI provider responded ({model}): {len(content)} chars"
+             + (f", reasoning {len(reasoning)} chars" if reasoning else ""))
+        return content, reasoning_out, {"status": status or 200}
+    _log("warn", f"AI provider returned no content ({model})",
+         {"body_excerpt": resp_bytes[:1000].decode(errors="replace")})
+    return None, reasoning_out, {
+        "status": status or 200,
+        "response_excerpt": resp_bytes[:1000].decode(errors="replace"),
+    }
+
 
 def call_ai(prompt: str, profile_name: Optional[str] = None) -> Tuple[Optional[str], Optional[dict]]:
     """Call configured AI profile. Returns (content_str or None, provenance dict or None)."""
@@ -290,18 +457,27 @@ def call_ai(prompt: str, profile_name: Optional[str] = None) -> Tuple[Optional[s
     prof = profiles[name]
     provider = prof["provider"]
     content = None
+    reasoning = None
+    diag = {}
     if provider == "ollama":
-        content = _call_ollama(prof["base_url"], prof["model"], prompt, prof["timeout"], prof["options"])
+        content, reasoning, diag = _call_ollama(prof["base_url"], prof["model"], prompt, prof["timeout"], prof["options"])
     elif provider == "openai-compatible":
-        content = _call_openai_compatible(prof["base_url"], prof["model"], prompt, prof["timeout"], prof["api_key_env"])
+        content, reasoning, diag = _call_openai_compatible(prof["base_url"], prof["model"], prompt, prof["timeout"], prof["api_key_env"])
     provenance = {
         "profile": name,
         "provider": provider,
         "model": prof["model"],
         "prompt_version": PROMPT_VERSION,
     }
+    if diag:
+        provenance.update({k: v for k, v in diag.items() if v is not None})
+    if reasoning:
+        provenance["reasoning"] = reasoning[:2000]
     if content is None:
         return None, provenance
+    # keep a bounded excerpt so operators can see model reasoning/JSON in logs
+    # and history even when a provider folds reasoning into `content`.
+    provenance["content_excerpt"] = content[:1000]
     return content, provenance
 
 # ---------------------------------------------------------------------------
@@ -375,12 +551,33 @@ def validate_ai_finding(obj: dict, allowed_targets: set) -> Optional[dict]:
         "related_cves": cves,
     }
 
+def strip_json_fences(raw):
+    """Remove markdown code fences so json.loads sees the payload directly.
+
+    Models frequently wrap JSON in ```json ... ``` or leave a stray opening
+    fence; previously the first parse attempt failed on such output and the
+    fallback bracket-slicing only rescued array-shaped payloads.
+    """
+    if not isinstance(raw, str):
+        return ""
+    s = raw.strip()
+    m = re.match(r"^```[a-zA-Z0-9_-]*[ \t]*\r?\n?(.*?)\r?\n?[ \t]*```$",
+                 s, re.S)
+    if m:
+        return m.group(1).strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*[ \t]*\r?\n?", "", s)
+    if s.endswith("```"):
+        s = s[:-3].rstrip()
+    return s.strip()
+
+
 def parse_ai_response(raw: str, allowed_targets: set) -> Optional[List[dict]]:
     """Extract and validate AI response. Supports both array and {findings:[]} shapes."""
     if not raw:
         return None
     # Try to find JSON object/array. Prefer object with findings, fallback to array.
-    raw = raw.strip()
+    raw = strip_json_fences(raw)
     # 1. Try full JSON parse
     try:
         d = json.loads(raw)

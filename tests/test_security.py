@@ -184,8 +184,8 @@ def test_report_uses_normalized_findings():
 def test_job_failure_retained_and_reported():
     import main as m
     m._jobs.clear()
-    m._try_acquire_job("testorg", "scan")
-    m._release_job("testorg", "scan", error=ValueError("test failure"))
+    _, jid = m._try_acquire_job("testorg", "scan")
+    m._release_job("testorg", "scan", jid, error=ValueError("test failure"))
     key = m._job_key("testorg", "scan")
     with m._jobs_lock:
         entry = m._jobs.get(key)
@@ -200,7 +200,7 @@ def test_job_success_status():
     m._jobs.clear()
     ok, jid = m._try_acquire_job("testorg2", "scan")
     assert ok
-    m._release_job("testorg2", "scan")
+    m._release_job("testorg2", "scan", jid)
     key = m._job_key("testorg2", "scan")
     with m._jobs_lock:
         entry = m._jobs.get(key)
@@ -311,3 +311,48 @@ def test_register_rejects_long_name(tmp_path, monkeypatch):
         "slug": "longname", "name": "x" * 300, "domains": ["example.com"]
     })
     assert r.status_code == 400
+
+
+def test_add_remove_domains_endpoint(tmp_path, monkeypatch):
+    _patch_data_paths(monkeypatch, tmp_path)
+    import main
+    from fastapi.testclient import TestClient
+    client = TestClient(main.app)
+    auth = {"X-CTI-Token": os.environ["CTI_SCAN_TOKEN"]}
+    # add (merges + dedups + drops invalid)
+    r = client.post("/api/orgs/sample/domains", headers=auth, json={
+        "domains": ["new.example.com", "example.com", "not a domain!!"],
+        "action": "add",
+    })
+    assert r.status_code == 200, r.text
+    assert set(r.json()["domains"]) == {"example.com", "new.example.com"}
+    # remove
+    r = client.post("/api/orgs/sample/domains", headers=auth, json={
+        "domains": ["example.com"], "action": "remove",
+    })
+    assert r.status_code == 200, r.text
+    assert "example.com" not in r.json()["domains"]
+    # invalid action
+    r = client.post("/api/orgs/sample/domains", headers=auth, json={
+        "domains": ["example.com"], "action": "wipe",
+    })
+    assert r.status_code == 400
+
+
+def test_extract_openai_reasoning_and_cline_wrapper():
+    import ai_providers
+    # standard openai shape with separate reasoning field
+    content, reasoning = ai_providers._extract_openai_content_reasoning({
+        "choices": [{"message": {"content": "OK", "reasoning": "step by step"}}]
+    })
+    assert content == "OK"
+    assert reasoning == "step by step"
+    # cline.bot wrapper `{"data": {"choices": [...]}}` with reasoning_details
+    content, reasoning = ai_providers._extract_openai_content_reasoning({
+        "data": {"choices": [{"message": {
+            "content": "OK",
+            "reasoning_details": [{"index": 0, "text": "think1"}, {"index": 1, "text": "think2"}],
+        }}]}
+    })
+    assert content == "OK"
+    assert reasoning == "think1\nthink2"

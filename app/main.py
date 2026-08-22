@@ -10,11 +10,12 @@ Serves:
   /api/orgs    — registered orgs
   /api/orgs/{slug}       — org info + summary
   /api/findings/{id}     — full finding detail       [?org=slug]
-  POST /api/orgs/register      — register a new org (token-gated)
-  POST /api/orgs/{slug}/scan   — trigger passive scan (token-gated)
+   POST /api/orgs/register      — register a new org (token-gated)
+   POST /api/orgs/{slug}/scan   — trigger passive scan (token-gated)
+   POST /api/orgs/{slug}/ai-grade — AI grading of existing findings (token-gated)
 
 Security (secure-dev gates):
-  - binds tailnet-only by default (HOST=100.76.85.44) — never 0.0.0.0/LAN
+  - binds loopback-only by default (HOST=127.0.0.1) — never 0.0.0.0
   - security headers on every response (CSP, nosniff, frame deny, referrer)
   - GETs are read-only; only POSTs that mutate are token-gated
   - slug validated against ^[a-z0-9-]{1,32}$ before ANY filesystem use
@@ -22,16 +23,19 @@ Security (secure-dev gates):
   - all request bodies are Pydantic-validated; no eval/exec
 """
 import html as _html
-import json, os, re, subprocess, sys, tempfile, threading, time
+import json, os, re, shutil, subprocess, sys, tempfile, threading, time
+from datetime import datetime, timezone
 # ensure this file's dir is importable regardless of launch cwd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import Optional
 import cti_correlation as cc
 import scanner
 import ai_providers
+import openhack_source as oh
 from fastapi.middleware.gzip import GZipMiddleware
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,9 +48,19 @@ _SLUG_RE = re.compile(r"^[a-z0-9-]{1,32}$")
 _DEFAULT_ORG = "sample"
 
 _SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
-_CHROMIUM = "/home/bhanuharya/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome"
+_CHROMIUM = (os.environ.get("CTI_CHROMIUM_PATH") or shutil.which("chromium")
+             or shutil.which("chromium-browser") or shutil.which("google-chrome"))
 
 app = FastAPI(title="CTI Radar", docs_url=None, redoc_url=None)
+
+# tighten runtime data permissions once at startup (0600 files / 0700 dirs);
+# best-effort, never blocks boot
+try:
+    _migrated = cc.migrate_data_permissions()
+    if _migrated:
+        print(f"[cti] tightened permissions on {_migrated} data path(s)", file=sys.stderr)
+except Exception as _perm_err:  # pragma: no cover
+    print(f"[cti] permission migration skipped: {_perm_err}", file=sys.stderr)
 
 # serve vendored static assets (vis-network) from app/static/
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -60,38 +74,84 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 import uuid as _uuid
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 
+
+def _int_env(name, default):
+    try:
+        return int(os.environ.get(name, "") or default)
+    except Exception:
+        return default
+
+
 _executor = _ThreadPoolExecutor(max_workers=4, thread_name_prefix="cti-job")
 _jobs_lock = threading.Lock()
-_jobs = {}  # (slug, kind) -> {id, started, kind, status, error}
+_jobs = {}  # (slug, kind) -> {id, started, kind, status, stage, progress, error}
 _registry_lock = threading.Lock()
 _JOB_TTL = 3600  # retain completed jobs for 1h
+
+# runtime job/scan log (in-memory ring + persistent JSONL file)
+_JOB_LOG_LOCK = threading.Lock()
+_JOB_LOGS = []
+_MAX_JOB_LOGS = 500
+_LOG_FILE = os.path.join(DATA_ROOT, "logs", "cti-runtime.log")
 
 
 def _job_key(slug, kind):
     return f"{slug}:{kind}"
 
 
-def _try_acquire_job(slug, kind):
+_JOB_STALE_SECS = max(60, _int_env("CTI_JOB_STALE_SECS", 1800))     # running-job deadline
+_MAX_ACTIVE_JOBS = max(1, _int_env("CTI_MAX_ACTIVE_JOBS", 8))       # global concurrency cap
+
+
+def _try_acquire_job(slug, kind, stale_after=None):
     key = _job_key(slug, kind)
     prefix = f"{slug}:"
+    now = time.time()
     with _jobs_lock:
+        # Running entries are never reclaimed by age. A process restart clears
+        # this in-memory table; while alive, the entry is the serialization fence.
         # per-org serialization: any running job for this org blocks new mutations
         for k, v in _jobs.items():
             if k.startswith(prefix) and v.get("status") == "running":
                 return False, v["id"]
+        # global active-job cap: bounded queue protection
+        if sum(1 for v in _jobs.values() if v.get("status") == "running") >= _MAX_ACTIVE_JOBS:
+            return False, None
         jid = f"{slug}-{kind}-{_uuid.uuid4().hex[:8]}"
-        _jobs[key] = {"id": jid, "started": time.time(), "kind": kind, "status": "running"}
+        entry = {"id": jid, "started": time.time(), "kind": kind,
+                 "status": "running", "stage": "queued", "progress": "",
+                 "error": None}
+        if stale_after:
+            entry["stale_after"] = int(stale_after)
+        _jobs[key] = entry
         return True, jid
 
 
-def _release_job(slug, kind, error=None):
+def _job_busy_response(slug, kind, jid):
+    """409 when this org has a running job; 429 when the global cap is hit."""
+    if jid:
+        return JSONResponse({"error": f"{kind} already running", "slug": slug,
+                             "job_id": jid}, status_code=409)
+    return JSONResponse({"error": f"{kind} rejected: server busy (max {_MAX_ACTIVE_JOBS} active jobs)",
+                         "slug": slug, "job_id": None}, status_code=429)
+
+
+def _release_job(slug, kind, jid, error=None, result=None):
     key = _job_key(slug, kind)
     with _jobs_lock:
         entry = _jobs.get(key)
-        if entry:
+        if entry and entry.get("id") == jid:
             entry["status"] = "failed" if error else "done"
             if error:
                 entry["error"] = str(error)[:500]
+                entry["stage"] = entry.get("stage") or "error"
+            else:
+                entry["stage"] = "done"
+                entry["progress"] = "finished"
+            if isinstance(result, dict):
+                entry["result"] = {k: result.get(k) for k in result
+                                   if isinstance(result.get(k), (str, int, float, bool,
+                                                                 type(None)))}
             entry["finished"] = time.time()
             # retain for TTL so status polling works; prune old entries
             _prune_jobs()
@@ -126,11 +186,107 @@ def _get_job(slug, kind, job_id):
         entry = _jobs.get(key)
         if entry and entry.get("id") == job_id:
             return dict(entry)
-        # check if it was a completed job with matching id
-        for k, v in _jobs.items():
-            if v.get("id") == job_id and k.startswith(f"{slug}:"):
-                return dict(v)
     return None
+
+
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _log_event(level, kind, slug, message, job_id=None, meta=None):
+    """Append an event to the in-memory ring and the persisted JSONL log."""
+    ev = {"ts": _now_iso(), "level": level, "kind": kind, "org": slug or "",
+          "job_id": job_id or "", "message": message}
+    if meta is not None:
+        ev["meta"] = meta
+    with _JOB_LOG_LOCK:
+        _JOB_LOGS.append(ev)
+        if len(_JOB_LOGS) > _MAX_JOB_LOGS:
+            del _JOB_LOGS[:len(_JOB_LOGS) - _MAX_JOB_LOGS]
+        try:
+            os.makedirs(os.path.dirname(_LOG_FILE), exist_ok=True)
+            with open(_LOG_FILE, "a") as f:
+                f.write(json.dumps(ev) + "\n")
+        except Exception:
+            pass
+
+
+def _ai_log_hook(level, message, meta=None):
+    """Route low-level AI provider diagnostics into the runtime log ring."""
+    _log_event(level, "ai", "", message, job_id=None, meta=meta)
+
+
+ai_providers.set_log_hook(_ai_log_hook)
+
+
+def _load_recent_logs(n=300):
+    if not os.path.exists(_LOG_FILE):
+        return []
+    out = []
+    try:
+        with open(_LOG_FILE) as f:
+            for line in f.readlines()[-n:]:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return out
+
+
+def _job_update(slug, kind, jid, **fields):
+    key = _job_key(slug, kind)
+    with _jobs_lock:
+        entry = _jobs.get(key)
+        if entry and entry.get("id") == jid:
+            entry.update(fields)
+            entry["updated"] = time.time()
+
+
+def _job_progress(slug, kind, jid, stage, message):
+    _job_update(slug, kind, jid, stage=stage, progress=message)
+    _log_event("info", kind, slug, message, job_id=jid)
+
+
+def _structured_job_failure(result):
+    """Extract explicit failure from scanner's structured result."""
+    if not isinstance(result, dict):
+        return None
+    if result.get("error"):
+        return str(result["error"])
+    status = str(result.get("status", "")).lower()
+    if status in {"failed", "failure", "error"} or result.get("failed") is True or result.get("success") is False:
+        return str(result.get("message") or result.get("status") or "scanner reported failure")
+    report = result.get("report")
+    if isinstance(report, dict) and report.get("error"):
+        return str(report["error"])
+    return None
+
+
+def _job_status(slug, kind, job_id, running=None):
+    """Return status only for this exact org, kind, and job id."""
+    job = _get_job(slug, kind, job_id)
+    if job is None:
+        return JSONResponse({"error": "unknown job", "job_id": job_id,
+                             "slug": slug, "kind": kind}, status_code=404)
+    payload = {"status": job.get("status", "failed"), "job_id": job_id}
+    for key in ("stage", "progress", "error", "started", "finished"):
+        if job.get(key) is not None:
+            payload[key] = job[key]
+    if isinstance(job.get("result"), dict):
+        payload["result"] = job["result"]
+    if job.get("started"):
+        end = job.get("finished") if job.get("status") != "running" else time.time()
+        payload["elapsed"] = round(max(0, end - job["started"]), 1)
+    return payload
+
+
+# seed in-memory ring from persisted logs (survives server restarts)
+_JOB_LOGS.extend(_load_recent_logs())
 
 
 # --------------------------------------------------------------------------
@@ -143,6 +299,39 @@ def _valid_slug(slug):
 _SESSIONS = {}   # cookie-session id -> expiry epoch (in-memory, single-user)
 _SESSION_TTL = 12 * 3600   # 12h idle session
 _SESSION_COOKIE = "cti_session"
+_LOGIN_FAILS = {}  # source IP -> [failure timestamps]
+_LOGIN_FAIL_LOCK = threading.Lock()
+_LOGIN_FAIL_MAX = 4096
+
+def _login_limit(ip):
+    now = time.time()
+    threshold = max(1, _int_env("CTI_LOGIN_FAIL_THRESHOLD", 5))
+    window = max(1, _int_env("CTI_LOGIN_FAIL_WINDOW", 300))
+    retry = max(1, _int_env("CTI_LOGIN_RETRY_AFTER", 60))
+    with _LOGIN_FAIL_LOCK:
+        for key, vals in list(_LOGIN_FAILS.items()):
+            vals[:] = [t for t in vals if now - t < window]
+            if not vals:
+                _LOGIN_FAILS.pop(key, None)
+        vals = _LOGIN_FAILS.get(ip, [])
+        if len(vals) >= threshold:
+            return True, retry
+    return False, retry
+
+def _record_login_failure(ip):
+    now = time.time()
+    window = max(1, _int_env("CTI_LOGIN_FAIL_WINDOW", 300))
+    with _LOGIN_FAIL_LOCK:
+        vals = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < window]
+        if len(_LOGIN_FAILS) >= _LOGIN_FAIL_MAX and ip not in _LOGIN_FAILS:
+            oldest = min(_LOGIN_FAILS, key=lambda k: _LOGIN_FAILS[k][-1])
+            _LOGIN_FAILS.pop(oldest, None)
+        vals.append(now)
+        _LOGIN_FAILS[ip] = vals
+
+def _reset_login_failures(ip):
+    with _LOGIN_FAIL_LOCK:
+        _LOGIN_FAILS.pop(ip, None)
 
 
 def _cookie_token(req):
@@ -168,9 +357,11 @@ def _auth_ok(req):
             return True
         if exp:
             _SESSIONS.pop(sid, None)
-    # (2) static API token for scripted/CI scans
+    # (2) static API token for scripted/CI scans (constant-time compare)
+    import secrets as _s
     tok = os.environ.get("CTI_SCAN_TOKEN", "")
-    if tok and req.headers.get("X-CTI-Token") == tok:
+    supplied = req.headers.get("X-CTI-Token") or ""
+    if tok and supplied and _s.compare_digest(tok, supplied):
         return True
     return False
 
@@ -206,6 +397,70 @@ def _org_not_found(slug):
     return JSONResponse({"error": "org not found", "slug": slug}, status_code=404)
 
 
+def _canonical_openhack_domain(value):
+    """Return a strict DNS name, or None (never normalize unsafe syntax)."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or value.endswith(".."):
+        return None
+    value = value.lower()
+    if value.endswith("."):
+        value = value[:-1]
+    # Reuse the scanner's deliberately conservative DNS validator.  In
+    # particular this excludes URLs, paths, ports, wildcards, and IPs.
+    return value if scanner._is_valid_domain(value) else None
+
+
+def _openhack_authorization_error(org):
+    """Fail-closed server-level authorization for active external assessment."""
+    if os.environ.get("CTI_OPENHACK_ACTIVE") != "1":
+        return "CTI_OPENHACK_ACTIVE must equal 1"
+    if os.environ.get("CTI_OPENHACK_ISOLATED") != "1":
+        return "CTI_OPENHACK_ISOLATED must equal 1 (use a disposable-container wrapper)"
+    bin_path = os.environ.get("CTI_OPENHACK_BIN", "").strip()
+    if not bin_path or not os.path.isabs(bin_path) or not os.path.isfile(bin_path) or not os.access(bin_path, os.X_OK):
+        return "CTI_OPENHACK_BIN must be an explicit absolute executable (disposable-container wrapper)"
+
+    raw = os.environ.get("CTI_OPENHACK_ALLOWED_DOMAINS")
+    if raw is None or not raw.strip():
+        return "CTI_OPENHACK_ALLOWED_DOMAINS is missing or empty"
+    entries = raw.split(",")
+    allowed = set()
+    for item in entries:
+        domain = _canonical_openhack_domain(item)
+        if domain is None:
+            return "CTI_OPENHACK_ALLOWED_DOMAINS contains an invalid domain"
+        allowed.add(domain)
+
+    targets = org.get("domains") if isinstance(org, dict) else None
+    if not isinstance(targets, list) or not targets:
+        return "the organization has no registered target domains"
+    canonical_targets = []
+    for target in targets:
+        domain = _canonical_openhack_domain(target)
+        if domain is None:
+            return "the organization has an invalid registered target domain"
+        canonical_targets.append(domain)
+    outside = [domain for domain in canonical_targets if domain not in allowed]
+    if outside:
+        return "registered target domain outside CTI_OPENHACK_ALLOWED_DOMAINS"
+
+    raw_expiry = os.environ.get("CTI_OPENHACK_ROE_EXPIRES", "")
+    try:
+        stamp = raw_expiry.strip()
+        if stamp.endswith(("Z", "z")):
+            stamp = stamp[:-1] + "+00:00"
+        expires = datetime.fromisoformat(stamp)
+        if expires.tzinfo is None or expires.utcoffset() is None:
+            return "CTI_OPENHACK_ROE_EXPIRES must be timezone-aware RFC3339/ISO-8601"
+        if expires.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+            return "CTI_OPENHACK_ROE_EXPIRES is expired"
+    except (TypeError, ValueError, OverflowError):
+        return "CTI_OPENHACK_ROE_EXPIRES is not a valid RFC3339/ISO-8601 timestamp"
+    return None
+
+
 def _use_secure_cookie(req):
     """Set Secure flag on cookies when the request came over HTTPS."""
     if req and (req.headers.get("x-forwarded-proto", "") == "https" or
@@ -232,11 +487,17 @@ def _require_org(slug, req):
 # --------------------------------------------------------------------------
 @app.post("/api/login")
 def api_login(req: Request):
-    import time as _t
+    ip = req.client.host if req.client else "unknown"
+    limited, retry = _login_limit(ip)
+    if limited:
+        return JSONResponse({"error": "too many failed login attempts"},
+                            status_code=429, headers={"Retry-After": str(retry)})
     sid = _login_ok(req)
     if not sid:
+        _record_login_failure(ip)
         return JSONResponse({"error": "invalid username or password"},
                             status_code=401)
+    _reset_login_failures(ip)
     resp = JSONResponse({"ok": True, "expires_in": _SESSION_TTL,
                          "user": os.environ.get("CTI_USER", "")})
     resp.set_cookie(_SESSION_COOKIE, sid, max_age=_SESSION_TTL,
@@ -308,6 +569,7 @@ def api_findings(org: str = _DEFAULT_ORG, sort: str = None, status: str = "all",
         return err
     fs, _ = cc.load_data(org)
     meta_date = cc.load_meta_date(org)
+    # This legacy endpoint intentionally returns the complete finding contract.
     nf = [cc.normalize_finding(f, org, meta_date=meta_date) for f in fs]
     if status and status != "all":
         nf = [f for f in nf if str(f.get("status", "OPEN")).upper() == status.upper()]
@@ -326,37 +588,16 @@ def _build_dashboard_payload(org: str, sort: str = None, status: str = "all"):
     """Aggregate dashboard payload reusing ONE findings/correlation load per request.
 
     Returns shapes identical to /api/summary, /api/graph, /api/fleet, /api/ips,
-    /api/findings (filtered/sorted), and /api/orgs/{slug}/history. Avoids global
-    or time-based caching — pure per-request reuse of in-memory data.
+    /api/findings (filtered/sorted), and /api/orgs/{slug}/history. Uses the
+    read-through cache in cti_correlation so repeated views avoid disk reads.
     """
-    # single findings file read for fs + meta_date (avoids second open)
-    fp, baseline_path = cc._org_paths(org)
-    fs = []
-    baseline = []
-    meta_date = None
-    if fp and os.path.exists(fp):
-        try:
-            with open(fp) as fh:
-                d = json.load(fh)
-            if isinstance(d, dict):
-                fs = d.get("findings", []) if isinstance(d.get("findings"), list) else []
-                meta = d.get("meta") if isinstance(d.get("meta"), dict) else None
-                if isinstance(meta, dict):
-                    m = re.search(r"20\d\d-\d\d-\d\d", str(meta.get("date") or meta.get("scan_date") or ""))
-                    if m:
-                        meta_date = m.group(0)
-        except Exception:
-            fs = []
-    if baseline_path and os.path.exists(baseline_path):
-        try:
-            with open(baseline_path) as fh:
-                baseline = [l.strip() for l in fh if l.strip() and not l.startswith("#")]
-        except Exception:
-            baseline = []
+    fs, baseline = cc.load_data(org)
+    meta_date = cc.load_meta_date(org)
     domains = (cc.REGISTRY.get(org) or {}).get("domains") or []
 
-    # findings: normalize once, then filter/sort (same semantics as /api/findings)
-    nf = [cc.normalize_finding(f, org, meta_date=meta_date) for f in fs]
+    # The aggregate endpoint intentionally uses the lightweight list projection;
+    # callers fetch full details from /api/findings/{id} on demand.
+    nf = [cc.normalize_finding_light(f, org, meta_date=meta_date) for f in fs]
     if status and status != "all":
         nf = [f for f in nf if str(f.get("status", "OPEN")).upper() == status.upper()]
     if sort == "severity":
@@ -421,6 +662,19 @@ def api_orgs(req: Request = None):
     return {"orgs": cc.org_list()}
 
 
+@app.get("/api/admin/logs")
+def api_admin_logs(org: str = None, limit: int = 200, req: Request = None):
+    """Recent runtime logs (scan/recheck/correlate/AI attempts + failures)."""
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    lim = max(1, min(int(limit or 200), 1000))
+    with _JOB_LOG_LOCK:
+        logs = list(_JOB_LOGS[-lim:])
+    if org:
+        logs = [l for l in logs if l.get("org") == org][-lim:]
+    return {"logs": logs[::-1], "total": len(logs)}
+
+
 @app.get("/api/orgs/{slug}")
 def api_org_get(slug: str, req: Request = None):
     err, org = _require_org(slug, req)
@@ -436,7 +690,173 @@ def api_org_get(slug: str, req: Request = None):
             "ai_profile": stored,
             "effective_ai_profile": effective,
             "ai_capabilities": caps,
+            "openhack_enabled": bool(org.get("openhack_enabled")),
+            "openhack_model": org.get("openhack_model") or "",
             "summary": cc.summary(slug)}
+
+
+# --------------------------------------------------------------------------
+# OpenHack ingestion source (opt-in, ACTIVE testing)
+# --------------------------------------------------------------------------
+class OpenhackConfigBody(BaseModel):
+    enabled: Optional[bool] = None
+    model: Optional[str] = None
+
+
+class OpenhackScanBody(BaseModel):
+    mode: str = "quick"
+    model: Optional[str] = None
+
+
+_MODEL_RE = re.compile(r"^[\w.\-/]{1,64}$")   # provider-namespaced ids
+
+
+@app.get("/api/openhack/models")
+def api_openhack_models(req: Request = None):
+    """Live model catalog from the OpenHack inference service."""
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if not oh.openhack_bin():
+        return JSONResponse({"error": "openhack binary not available"},
+                            status_code=503)
+    return oh.list_models()
+
+
+@app.post("/api/orgs/{slug}/openhack-config")
+def api_openhack_config(slug: str, body: OpenhackConfigBody, req: Request = None):
+    """Opt this org in/out of the OpenHack source and/or pin a model override
+    (empty string resets to the server default)."""
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if not _valid_slug(slug):
+        return JSONResponse({"error": "invalid slug"}, status_code=400)
+    model = (body.model or "").strip() if body else ""
+    if model and not _MODEL_RE.match(model):
+        return JSONResponse({"error": "invalid model id"}, status_code=400)
+    enabled = body.enabled if (body and body.enabled is not None) else None
+    with _registry_lock:
+        try:
+            with open(ORGS_JSON) as f:
+                reg = json.load(f)
+            if not isinstance(reg, dict):
+                raise ValueError("registry not a dict")
+        except Exception:
+            return JSONResponse({"error": "registry unreadable/corrupted"},
+                                status_code=500)
+        if slug not in reg:
+            return _org_not_found(slug)
+        entry = reg[slug]
+        if not isinstance(entry, dict):
+            return JSONResponse({"error": "corrupt registry entry"}, status_code=500)
+        if enabled is not None:
+            if enabled:
+                entry["openhack_enabled"] = True
+            else:
+                entry.pop("openhack_enabled", None)
+        if model:
+            entry["openhack_model"] = model
+        elif body is not None and body.model is not None:
+            entry.pop("openhack_model", None)   # explicit "" resets to default
+        cc._atomic_write_json(ORGS_JSON, reg)
+    cc._reload_registry()
+    _log_event("info", "system", slug,
+               f"openhack config updated (enabled={enabled}, model={model or 'default'})")
+    # reflect what was just WRITTEN — a re-read can hit a stale patched cache
+    return {"slug": slug,
+            "openhack_enabled": bool(entry.get("openhack_enabled")),
+            "openhack_model": entry.get("openhack_model") or ""}
+
+
+@app.post("/api/orgs/{slug}/openhack-scan")
+def api_org_openhack_scan(slug: str, body: OpenhackScanBody = None,
+                          req: Request = None):
+    """Run an OpenHack assessment over the org's registered domains and
+    ingest its findings into the standard lifecycle.
+
+    mode="quick" (default): ~8-minute budgeted pass over a ref-keyed manifest
+    of OPEN findings — verifies each, grades severity (verified full range /
+    unverified ±1 clamp) and enriches evidence.
+    mode="deep": full unbounded agentic run."""
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized: missing or bad credentials"},
+                            status_code=401)
+    if not _valid_slug(slug):
+        return JSONResponse({"error": "invalid slug"}, status_code=400)
+    mode = (body.mode if body else "quick") or "quick"
+    if mode not in ("quick", "deep"):
+        return JSONResponse({"error": "mode must be 'quick' or 'deep'"},
+                            status_code=400)
+    model = (body.model or "").strip() if body else ""
+    if model and not _MODEL_RE.match(model):
+        return JSONResponse({"error": "invalid model id"}, status_code=400)
+    model = (model
+             or (cc.org_get(slug) or {}).get("openhack_model")
+             or oh.OHACK_PREFERRED_MODEL)   # ox-alpha: proven runnable default
+    org = cc.org_get(slug)
+    if org is None:
+        return _org_not_found(slug)
+    if not org.get("openhack_enabled"):
+        return JSONResponse(
+            {"error": ("openhack source not enabled for this org — "
+                       "POST /api/orgs/%s/openhack-config {\"enabled\": true}" % slug)},
+            status_code=403)
+    # This is immediately before acquisition: no binary lookup or worker can
+    # occur until the operator gate, exact target scope, and live ROE pass.
+    gate_error = _openhack_authorization_error(org)
+    if gate_error:
+        return JSONResponse(
+            {"error": "OpenHack active assessment authorization denied: " + gate_error},
+            status_code=403)
+    if not oh.openhack_bin():
+        return JSONResponse({"error": "openhack binary not available "
+                                      "(set explicit absolute CTI_OPENHACK_BIN)"}, status_code=503)
+    if mode == "quick":
+        stale_after = oh.quick_budget() + 600
+    else:
+        stale_after = int(oh._env_float("CTI_OHACK_TIMEOUT", 1800, lo=60,
+                                        hi=7200)) + 600
+    ok, jid = _try_acquire_job(slug, "ohack", stale_after=stale_after)
+    if not ok:
+        return _job_busy_response(slug, "openhack-scan", jid)
+    domains = list(org.get("domains") or [])
+    _log_event("info", "openhack", slug,
+               f"openHack {mode} queued ({len(domains)} domain(s))", job_id=jid)
+
+    def _on_progress(stage, message):
+        _job_progress(slug, "ohack", jid, stage, message)
+
+    def _oh_wrap():
+        try:
+            result = oh.run_and_ingest(slug, domains, on_progress=_on_progress,
+                                       mode=mode, model=model or None)
+            err = result.get("error") if isinstance(result, dict) else None
+            if err:
+                _release_job(slug, "ohack", jid, error=err)
+                _log_event("error", "openhack", slug, f"openHack failed: {err}", job_id=jid)
+            else:
+                _release_job(slug, "ohack", jid)
+                _log_event("info", "openhack", slug,
+                           f"openHack {mode} done (+{result.get('added', 0)} new,"
+                           f" {result.get('graded', 0)} graded)", job_id=jid)
+        except Exception as e:
+            _release_job(slug, "ohack", jid, error=e)
+            _log_event("error", "openhack", slug, f"openHack failed: {e}", job_id=jid)
+
+    _executor.submit(_oh_wrap)
+    return {"queued": True, "slug": slug, "mode": mode, "job_id": jid}
+
+
+@app.get("/api/orgs/{slug}/openhack-scan/{job_id}")
+def api_openhack_status(slug: str, job_id: str, req: Request = None):
+    err, _ = _require_org(slug, req)
+    if err:
+        return err
+    running = False
+    key = _job_key(slug, "ohack")
+    with _jobs_lock:
+        v = _jobs.get(key)
+        running = bool(v and v.get("status") == "running" and v.get("id") == job_id)
+    return _job_status(slug, "ohack", job_id, running)
 
 
 # --------------------------------------------------------------------------
@@ -552,34 +972,89 @@ def api_org_register(body: RegisterOrg, req: Request):
             "findings": f"data/orgs/{slug}/findings.json",
             "baseline": f"data/orgs/{slug}/baseline.txt",
         }
-        tmp = ORGS_JSON + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(registry, f, indent=2)
-            f.write("\n")
-        os.replace(tmp, ORGS_JSON)
+        cc._atomic_write_json(ORGS_JSON, registry)
     cc._reload_registry()
 
     # filesystem creation after successful registry commit (with cleanup on failure)
     try:
         org_dir = os.path.join(DATA_ORG_DIR, slug)
-        os.makedirs(org_dir, exist_ok=True)
-        # use atomic writes for org files as well
-        base_tmp = os.path.join(org_dir, "baseline.txt.tmp")
-        with open(base_tmp, "w") as f:
-            f.write("")
-        os.replace(base_tmp, os.path.join(org_dir, "baseline.txt"))
-        find_tmp = os.path.join(org_dir, "findings.json.tmp")
-        with open(find_tmp, "w") as f:
-            json.dump({"findings": []}, f, indent=2)
-            f.write("\n")
-        os.replace(find_tmp, os.path.join(org_dir, "findings.json"))
+        os.makedirs(org_dir, mode=0o700, exist_ok=True)
+        cc._atomic_write_text(os.path.join(org_dir, "baseline.txt"), "")
+        cc._atomic_write_json(os.path.join(org_dir, "findings.json"), {"findings": []})
     except Exception:
         # cleanup partial registry on failure? keep registry but org will be empty
         pass
     if ai_profile:
         ai_providers.set_org_profile(slug, ai_profile)
 
+    _log_event("info", "system", slug, f"workspace registered ({name}, {len(domains)} domain(s))")
     return {"slug": slug, "name": name, "domains": domains, "ai_profile": ai_profile or None}
+
+
+class DomainsBody(BaseModel):
+    domains: list = []
+    action: str = "add"
+
+
+@app.post("/api/orgs/{slug}/domains")
+def api_org_domains(slug: str, body: DomainsBody, req: Request):
+    """Add / remove / replace domains for an existing workspace.
+
+    Lets operators grow a workspace's scan scope after registration without
+    re-registering (which would 409) or hand-editing orgs.json.
+    """
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized: missing or bad credentials (username/password)"},
+                            status_code=401)
+    if not _valid_slug(slug):
+        return JSONResponse({"error": "invalid slug"}, status_code=400)
+    if cc.org_get(slug) is None:
+        return _org_not_found(slug)
+    action = str(getattr(body, "action", "add") or "add").strip().lower()
+    if action not in ("add", "remove", "set"):
+        return JSONResponse({"error": "invalid action (add|remove|set)"}, status_code=400)
+    import scanner as _scanner
+    domains = []
+    for d in body.domains or []:
+        d = str(d).strip().lower().rstrip(".")
+        if _scanner._is_valid_domain(d):
+            domains.append(d)
+    domains = list(dict.fromkeys(domains))  # dedup, order preserved
+    if body.domains and not domains:
+        return JSONResponse({"error": "no valid domains (strict DNS name required)"}, status_code=400)
+
+    with _registry_lock:
+        registry = {}
+        corrupted = False
+        if os.path.exists(ORGS_JSON):
+            try:
+                with open(ORGS_JSON) as f:
+                    registry = json.load(f)
+                if not isinstance(registry, dict):
+                    corrupted = True
+            except Exception:
+                corrupted = True
+        if corrupted:
+            return JSONResponse({"error": "registry corrupted, aborting"}, status_code=500)
+        entry = registry.get(slug)
+        if not isinstance(entry, dict):
+            return _org_not_found(slug)
+        cur = [str(d).strip() for d in (entry.get("domains") or []) if str(d).strip()]
+        if action == "add":
+            new_domains = list(dict.fromkeys(cur + domains))
+        elif action == "remove":
+            new_domains = [d for d in cur if d not in domains]
+        else:
+            new_domains = domains
+        if len(new_domains) > 20:
+            return JSONResponse({"error": "too many domains (max 20)"}, status_code=400)
+        entry["domains"] = new_domains
+        registry[slug] = entry
+        cc._atomic_write_json(ORGS_JSON, registry)
+    cc._reload_registry()
+    _log_event("info", "system", slug,
+               f"domains updated ({action}): {', '.join(new_domains) or '(none)'}")
+    return {"slug": slug, "domains": new_domains}
 
 
 class ScanBody(BaseModel):
@@ -620,15 +1095,37 @@ def api_org_scan(slug: str, body: ScanBody = None, req: Request = None):
             effective_profile = None
     ok, jid = _try_acquire_job(slug, "scan")
     if not ok:
-        return JSONResponse({"error": "scan already running", "slug": slug, "job_id": jid}, status_code=409)
+        return _job_busy_response(slug, "scan", jid)
     org = dict(org, slug=slug)
+    if mode == "ai" and not effective_profile:
+        _log_event("warn", "scan", slug,
+                   "AI mode requested but no ready profile — falling back to deterministic scan",
+                   job_id=jid)
+    _log_event("info", "scan", slug,
+               f"scan queued (mode={mode}, ai_profile={effective_profile or 'auto'})",
+               job_id=jid)
+
+    def _on_progress(stage, message):
+        _job_progress(slug, "scan", jid, stage, message)
 
     def _scan_wrap():
         try:
-            scanner.generate_org(org, mode=mode, ai_profile=effective_profile or ai_profile_req)
-            _release_job(slug, "scan")
+            result = scanner.generate_org(org, mode=mode, ai_profile=effective_profile or ai_profile_req,
+                                          on_progress=_on_progress)
+            # fatal scan failures (e.g. corrupted findings.json) return an
+            # "error" key instead of raising — surface them as failed jobs.
+            # Optional AI failure does NOT set this key: a good deterministic
+            # scan still finishes "done".
+            err = _structured_job_failure(result)
+            if err:
+                _release_job(slug, "scan", jid, error=err, result=result)
+                _log_event("error", "scan", slug, f"scan failed: {err}", job_id=jid)
+            else:
+                _release_job(slug, "scan", jid, result=result if isinstance(result, dict) else None)
+                _log_event("info", "scan", slug, "scan completed", job_id=jid)
         except Exception as e:
-            _release_job(slug, "scan", error=e)
+            _release_job(slug, "scan", jid, error=e)
+            _log_event("error", "scan", slug, f"scan failed: {e}", job_id=jid)
 
     _executor.submit(_scan_wrap)
     return {"queued": True, "slug": slug, "mode": mode, "ai_profile": effective_profile, "job_id": jid}
@@ -647,18 +1144,24 @@ def api_org_recheck(slug: str, req: Request):
 
     ok, jid = _try_acquire_job(slug, "recheck")
     if not ok:
-        return JSONResponse({"error": "recheck already running", "slug": slug, "job_id": jid}, status_code=409)
+        return _job_busy_response(slug, "recheck", jid)
+    _log_event("info", "recheck", slug, "recheck queued", job_id=jid)
+
+    def _on_progress(stage, message):
+        _job_progress(slug, "recheck", jid, stage, message)
 
     def _run():
         try:
-            changed = scanner.recheck_findings(slug)
+            changed = scanner.recheck_findings(slug, on_progress=_on_progress)
             scanner.append_history(slug, {"kind": "recheck", "mode": "fast",
                                            "summary": {"changed": changed, "finding": "probe own ip/port"},
                                            "note": "light remediation recheck"})
-            _release_job(slug, "recheck")
+            _release_job(slug, "recheck", jid)
+            _log_event("info", "recheck", slug, f"recheck completed ({changed} change(s))", job_id=jid)
             return changed
         except Exception as e:
-            _release_job(slug, "recheck", error=e)
+            _release_job(slug, "recheck", jid, error=e)
+            _log_event("error", "recheck", slug, f"recheck failed: {e}", job_id=jid)
             return 0
 
     _executor.submit(_run)
@@ -671,11 +1174,7 @@ def api_recheck_status(slug: str, job_id: str, req: Request = None):
     if err:
         return err
     running = _is_job_running(slug, "recheck")
-    status = "running" if running else "done"
-    job = _get_job(slug, "recheck", job_id)
-    if job and job.get("error"):
-        status = "failed"
-    return {"status": status, "job_id": job_id}
+    return _job_status(slug, "recheck", job_id, running)
 
 
 @app.get("/api/orgs/{slug}/history")
@@ -715,6 +1214,35 @@ def api_status_change(slug: str, id_: str, body: StatusBody, req: Request):
         if err == "not found":
             return JSONResponse({"error": "finding not found", "id": id_}, status_code=404)
         return JSONResponse({"error": err}, status_code=400)
+    _log_event("info", "status", slug, f"finding {id_} status -> {status}")
+    return {"org": slug, "finding": cc.normalize_finding(finding, slug)}
+
+
+class CommentBody(BaseModel):
+    note: str
+    by: str = ""
+
+
+@app.post("/api/orgs/{slug}/findings/{id_}/comment")
+def api_finding_comment(slug: str, id_: str, body: CommentBody, req: Request):
+    """Append an analyst comment to a finding; this feedback is weighed by the
+    AI triage pass on the next `mode=ai` scan of the org."""
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized: missing or bad credentials (username/password)"},
+                            status_code=401)
+    if not _valid_slug(slug):
+        return JSONResponse({"error": "invalid slug"}, status_code=400)
+    if cc.org_get(slug) is None:
+        return _org_not_found(slug)
+    note = (body.note or "").strip()
+    if not note:
+        return JSONResponse({"error": "note is required"}, status_code=400)
+    finding, err = cc.add_finding_comment(slug, id_, note, by=(body.by or "").strip())
+    if err:
+        if err == "not found":
+            return JSONResponse({"error": "finding not found", "id": id_}, status_code=404)
+        return JSONResponse({"error": err}, status_code=400)
+    _log_event("info", "comment", slug, f"finding {id_} commented (analyst feedback)")
     return {"org": slug, "finding": cc.normalize_finding(finding, slug)}
 
 
@@ -730,15 +1258,26 @@ def api_org_correlate(slug: str, req: Request):
         return _org_not_found(slug)
     ok, jid = _try_acquire_job(slug, "correlate")
     if not ok:
-        return JSONResponse({"error": "correlate already running", "slug": slug, "job_id": jid}, status_code=409)
+        return _job_busy_response(slug, "correlate", jid)
     org = dict(org, slug=slug)
+    _log_event("info", "correlate", slug, "correlation queued", job_id=jid)
+
+    def _on_progress(stage, message):
+        _job_progress(slug, "correlate", jid, stage, message)
 
     def _corr_wrap():
         try:
-            scanner.correlate_org(org)
-            _release_job(slug, "correlate")
+            result = scanner.correlate_org(org, on_progress=_on_progress)
+            err = _structured_job_failure(result)
+            if err:
+                _release_job(slug, "correlate", jid, error=err, result=result)
+                _log_event("error", "correlate", slug, f"correlation failed: {err}", job_id=jid)
+            else:
+                _release_job(slug, "correlate", jid, result=result if isinstance(result, dict) else None)
+                _log_event("info", "correlate", slug, "correlation completed", job_id=jid)
         except Exception as e:
-            _release_job(slug, "correlate", error=e)
+            _release_job(slug, "correlate", jid, error=e)
+            _log_event("error", "correlate", slug, f"correlation failed: {e}", job_id=jid)
 
     _executor.submit(_corr_wrap)
     return {"queued": True, "job_id": jid}
@@ -750,13 +1289,13 @@ def api_correlate_status(slug: str, job_id: str, req: Request = None):
     if err:
         return err
     running = _is_job_running(slug, "correlate") or scanner.is_correlating(slug)
-    status = "running" if running else "done"
-    job = _get_job(slug, "correlate", job_id)
-    if job and job.get("error"):
-        status = "failed"
+    payload = _job_status(slug, "correlate", job_id, running)
+    if isinstance(payload, JSONResponse):
+        return payload
     report = cc.correlation_report(slug) or {}
-    return {"status": status, "correlated": report.get("added", 0),
-            "report": report, "job_id": job_id}
+    payload["correlated"] = report.get("added", 0)
+    payload["report"] = report
+    return payload
 
 
 @app.get("/api/orgs/{slug}/scan/{job_id}")
@@ -765,11 +1304,62 @@ def api_scan_status(slug: str, job_id: str, req: Request = None):
     if err:
         return err
     running = _is_job_running(slug, "scan")
-    status = "running" if running else "done"
-    job = _get_job(slug, "scan", job_id)
-    if job and job.get("error"):
-        status = "failed"
-    return {"status": status, "job_id": job_id}
+    return _job_status(slug, "scan", job_id, running)
+
+
+class GradeBody(BaseModel):
+    ai_profile: str = ""
+
+
+@app.post("/api/orgs/{slug}/ai-grade")
+def api_org_ai_grade(slug: str, body: GradeBody = None, req: Request = None):
+    """Standalone Stage-B AI grading: re-severity/impact existing OPEN findings
+    by ID (judgment only — deterministic findings are never removed or invented)."""
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized: missing or bad credentials (username/password)"},
+                            status_code=401)
+    if not _valid_slug(slug):
+        return JSONResponse({"error": "invalid slug"}, status_code=400)
+    if cc.org_get(slug) is None:
+        return _org_not_found(slug)
+    ai_profile_req = str(getattr(body, "ai_profile", "") or "").strip() if body else ""
+    if ai_profile_req:
+        profiles, _ = ai_providers.load_profiles()
+        if ai_profile_req not in profiles:
+            return JSONResponse({"error": "invalid ai_profile", "allowed": sorted(profiles.keys())}, status_code=400)
+    ok, jid = _try_acquire_job(slug, "grade")
+    if not ok:
+        return _job_busy_response(slug, "grading", jid)
+    _log_event("info", "ai_grade", slug, f"AI grading queued (profile={ai_profile_req or 'auto'})", job_id=jid)
+
+    def _on_progress(stage, message):
+        _job_progress(slug, "grade", jid, stage, message)
+
+    def _grade_wrap():
+        try:
+            result = scanner.ai_grade_org(slug, profile_name=ai_profile_req or None, on_progress=_on_progress)
+            # ai_grade_org never raises; "failed" means grading could not run
+            if result == "failed":
+                _release_job(slug, "grade", jid, error="AI grading failed (provider or persistence error)")
+                _log_event("error", "ai_grade", slug, "AI grading failed", job_id=jid)
+            else:
+                _release_job(slug, "grade", jid)
+                _log_event("info", "ai_grade", slug, f"AI grading completed ({result})", job_id=jid)
+        except Exception as e:
+            _release_job(slug, "grade", jid, error=e)
+            _log_event("error", "ai_grade", slug, f"AI grading failed: {e}", job_id=jid)
+
+    _executor.submit(_grade_wrap)
+    return {"queued": True, "slug": slug, "job_id": jid}
+
+
+@app.get("/api/orgs/{slug}/ai-grade/{job_id}")
+def api_ai_grade_status(slug: str, job_id: str, req: Request = None):
+    err, _ = _require_org(slug, req)
+    if err:
+        return err
+    running = _is_job_running(slug, "grade")
+    return _job_status(slug, "grade", job_id, running)
 
 
 def _esc(s):
@@ -800,7 +1390,11 @@ def _build_report_html(slug, org, fs, domains):
     # use normalized (PII-masked) findings for report
     meta_date = cc.load_meta_date(slug)
     nfs = [cc.normalize_finding(f, slug, meta_date=meta_date) for f in fs]
-    fs = nfs
+    # resolved findings are lifecycle-noise in a point-in-time report: count
+    # them, but keep sections focused on live items
+    resolved_n = sum(1 for f in nfs
+                     if str(f.get("status", "")).upper() == "RESOLVED")
+    fs = [f for f in nfs if str(f.get("status", "")).upper() != "RESOLVED"]
     sev = {}
     for f in fs:
         s = str(f.get("severity", "INFO")).upper()
@@ -808,6 +1402,9 @@ def _build_report_html(slug, org, fs, domains):
     sev_rows = "".join(
         f"<tr><td>{_esc(k)}</td><td>{_esc(v)}</td></tr>"
         for k, v in sorted(sev.items(), key=lambda kv: _SEV_ORDER.get(kv[0], 99)))
+    if resolved_n:
+        sev_rows += (f"<tr><td>RESOLVED (excluded from sections)</td>"
+                     f"<td>{resolved_n}</td></tr>")
 
     sections = []
     for i, f in enumerate(fs, 1):
@@ -875,6 +1472,9 @@ def api_org_report_pdf(slug: str, req: Request = None):
     report_html = _build_report_html(slug, org, fs, domains)
     if len(report_html) > _MAX_PDF_HTML_SIZE:
         return JSONResponse({"error": "report too large", "max": _MAX_PDF_HTML_SIZE}, status_code=413)
+    if not _CHROMIUM:
+        return JSONResponse(
+            {"error": "Chromium not found; set CTI_CHROMIUM_PATH"}, status_code=503)
     if not _PDF_SEMAPHORE.acquire(blocking=False):
         return JSONResponse({"error": "PDF generation busy, try again"}, status_code=503)
 
@@ -937,15 +1537,19 @@ _DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dash
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
+    # no-cache: the UI ships in this single file — phones must revalidate so
+    # deploys actually reach mobile browsers instead of serving stale HTML
+    headers = {"Cache-Control": "no-cache"}
     if os.path.exists(_DASHBOARD_HTML):
-        return HTMLResponse(open(_DASHBOARD_HTML).read())
-    return HTMLResponse("<h1>CTI Dashboard</h1><p>dashboard.html missing</p>", status_code=500)
+        return HTMLResponse(open(_DASHBOARD_HTML).read(), headers=headers)
+    return HTMLResponse("<h1>CTI Dashboard</h1><p>dashboard.html missing</p>",
+                        status_code=500, headers=headers)
 
 
 if __name__ == "__main__":
     import uvicorn
-    host = os.environ.get("CTI_HOST", "100.76.85.44")
+    host = os.environ.get("CTI_HOST", "127.0.0.1")
     if host in ("0.0.0.0", "::"):
         raise SystemExit("Refusing to bind 0.0.0.0 — set CTI_HOST to a specific tailnet/LAN IP")
     port = int(os.environ.get("CTI_PORT", "8084"))
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    uvicorn.run(app, host=host, port=port, log_level="warning", server_header=False)
