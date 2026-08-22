@@ -104,6 +104,11 @@ requirements.txt
 
 - **Python 3.11+**
 - **fastapi** + **uvicorn** (see `requirements.txt`)
+- **One process on one host.** State is JSON files guarded by process-local
+  locks with in-memory sessions/jobs — multiple workers or two instances
+  sharing a data directory can lose updates. See
+  [DEPLOYMENT.md](DEPLOYMENT.md) for the supported shape, hardened systemd
+  unit, and reverse-proxy/trusted-proxy notes.
 - **curl** (used by the passive scanner / fingerprinting)
 - **Optional — headless Chromium** for PDF export
   (`~/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome` style path).
