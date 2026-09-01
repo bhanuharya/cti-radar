@@ -1,19 +1,21 @@
 # CTI Radar — Rust backend
 
-A Rust rewrite of the CTI Radar attack-surface correlation dashboard backend,
-built to exploit Rust's native strengths over the original FastAPI+Python
-implementation: async I/O, data-parallel CPU, zero deep-copies, and bounded
-memory. **Same data schema, same env vars, same observable behavior** — a
-drop-in swap that runs faster and lighter.
+The CTI Radar backend is a Rust service for authenticated attack-surface
+correlation, passive reconnaissance, finding lifecycle management, reporting,
+and optional AI-assisted analysis. It is built with Axum, Tokio, Rayon, and
+Rustls for a compact, asynchronous, and memory-conscious deployment.
 
-## Why Rust (what actually got faster)
+## Runtime architecture
 
-| Concern | Python (FastAPI) | Rust (axum + tokio) |
-|---|---|---|
-| Scanner I/O | Threads + `curl` subprocess per probe | Single tokio event loop; thousands of in-flight `reqwest`/`tokio::net` probes |
-| CPU-bound work (PII mask, normalize, graph) | GIL-locked, serial + `copy.deepcopy` | `rayon` `par_iter` across cores, borrowed data |
-| Memory per scan | Per-probe thread stacks + process spawns | One shared client + resolver (Arc), no per-conn threads |
-| Startup | Interpreter + imports (~1s) | Compiled binary (~ms) |
+- **Axum** provides the HTTP router, typed handlers, JSON responses, and
+  security-header middleware.
+- **Tokio** handles concurrent DNS, HTTP, TCP, TLS, and background-job I/O
+  without spawning a process for each probe.
+- **Rayon** parallelizes independent CPU-bound normalization, masking, and
+  graph-preparation work.
+- **Serde JSON** preserves the dashboard data schema while keeping parsing and
+  serialization explicit at API and storage boundaries.
+- **Rustls** provides TLS support without an OpenSSL runtime dependency.
 
 ## Layout
 
@@ -36,7 +38,6 @@ rust/
     handlers.rs        read endpoints
     handlers_mut.rs    mutation endpoints (register/scan/status/...)
   PORT.md              full port spec (module map + API surface + data schema)
-  SCANNER_TASK.md      delegated scanner-port brief
 ```
 
 ## Build & test
@@ -57,9 +58,9 @@ CTI_DATA_DIR=/path/to/data CTI_HOST=127.0.0.1 CTI_PORT=8085 \
 ./target/release/cti-radar
 ```
 
-Binds `127.0.0.1` by default; refuses `0.0.0.0`/`::` (same as Python).
+Binds `127.0.0.1` by default and refuses `0.0.0.0`/`::`.
 
-## Security invariants (preserved 1:1 from the Python)
+## Security invariants
 
 - Auth on every route (session cookie OR `X-CTI-Token`, constant-time compare).
 - Slug regex `^[a-z0-9-]{1,32}$` before any filesystem use.
@@ -67,14 +68,17 @@ Binds `127.0.0.1` by default; refuses `0.0.0.0`/`::` (same as Python).
 - Atomic 0600/0700 writes; security headers on every response.
 - OpenHack active assessment fail-closed (active+isolated+bin+allowlist+ROE).
 
-## Benchmark (vs Python)
+## Benchmarking
+
+The benchmark harness in `../bench/` measures authenticated API latency,
+throughput, CPU, and resident memory. Run the API and scan workloads separately:
 
 ```bash
-bash bench/bench.sh 5 api      # HTTP endpoint latency / RSS / CPU
-bash bench/bench.sh 3 scan     # full scan pipeline wall-clock
+bash bench/bench.sh 5 api
+bash bench/bench.sh 3 scan
 python3 bench/compare.py bench/results/<timestamp>
 ```
 
-Both servers run against the same `CTI_DATA_DIR`, same `sample` org, same
-workload — the harness reports median wall-clock, peak RSS, and CPU for each,
-plus the rust/py ratio.
+Use one data directory and one fixed workload for every measured run. Treat
+network-heavy scan timing separately from local API timing, because remote DNS,
+TCP, TLS, and HTTP latency can dominate a scan.
