@@ -170,20 +170,21 @@ def _load_raw_config() -> dict:
     return {}
 
 def _build_default_config() -> dict:
-    """If OPENCODE_GO_B_API_KEY is set and no config exists, provide compat profile."""
-    key = os.environ.get("OPENCODE_GO_B_API_KEY", "").strip()
+    """If HERMES_CUSTOM_API_CLINE_BOT_API_KEY is set and no config exists, provide compat profile."""
+    key = os.environ.get("HERMES_CUSTOM_API_CLINE_BOT_API_KEY", "").strip()
     if not key:
         return {"default_profile": None, "profiles": {}}
     return {
-        "default_profile": "opencode",
+        "default_profile": "cline",
         "profiles": {
-            "opencode": {
+            "cline": {
                 "provider": "openai-compatible",
-                "base_url": "https://opencode.ai/zen/go/v1",
-                "model": "muse-spark-1.2-contributor",
-                "api_key_env": "OPENCODE_GO_B_API_KEY",
+                "base_url": "https://api.cline.bot/api/v1",
+                "model": "cline-pass/mimo-v2.5-pro",
+                "api_key_env": "HERMES_CUSTOM_API_CLINE_BOT_API_KEY",
                 "timeout": 90,
                 "max_hosts": 10,
+                "max_tokens": 3072,
             }
         }
     }

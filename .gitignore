@@ -48,3 +48,6 @@ data/ai_org_profiles.json
 preview-*.png
 dashboard-preview.png
 
+# ---- rust rewrite build artifacts ----
+rust/target/
+bench/results/

@@ -12,11 +12,11 @@
         "temperature": 0
       }
     },
-    "opencode": {
+    "cline": {
       "provider": "openai-compatible",
-      "base_url": "https://opencode.ai/zen/go/v1",
-      "model": "muse-spark-1.2-contributor",
-      "api_key_env": "OPENCODE_GO_B_API_KEY",
+      "base_url": "https://api.cline.bot/api/v1",
+      "model": "cline-pass/mimo-v2.5-pro",
+      "api_key_env": "HERMES_CUSTOM_API_CLINE_BOT_API_KEY",
       "timeout": 90,
       "max_hosts": 25,
       "max_tokens": 3072
