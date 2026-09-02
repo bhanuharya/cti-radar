@@ -49,8 +49,8 @@ Environment=CTI_AI_CONFIG_FILE=/home/you/.config/cti-radar/ai_config.json
 # NOTE: no host/port here on purpose — the entry point below reads
 # CTI_HOST/CTI_PORT from server.env, so there is exactly one place to
 # change the bind address.
-WorkingDirectory=/home/you/code/cti-dashboard
-ExecStart=/home/you/code/cti-dashboard/.venv/bin/python -m app.main
+WorkingDirectory=/home/you/code/cti-radar
+ExecStart=/home/you/code/cti-radar/.venv/bin/python -m app.main
 Restart=always
 RestartSec=3
 

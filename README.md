@@ -124,7 +124,7 @@ requirements.txt
 ## Setup
 
 ```bash
-cd cti-dashboard
+cd cti-radar
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 
@@ -380,7 +380,7 @@ Keep targets exact and scoped to the written ROE. Login throttling uses the dire
 ## Testing
 
 ```bash
-cd cti-dashboard
+cd cti-radar
 . .venv/bin/activate
 python -m pytest tests/ -v
 ```
