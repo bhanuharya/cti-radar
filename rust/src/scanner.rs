@@ -282,6 +282,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_pinned_client_pin_validation() {
+        // global pin -> client builds; private/loopback/unparseable -> None
+        assert!(pinned_client("example.com", "93.184.216.34", 443).is_some());
+        assert!(pinned_client("example.com", "93.184.216.34", 80).is_some());
+        assert!(pinned_client("example.com", "10.0.0.1", 443).is_none());
+        assert!(pinned_client("example.com", "127.0.0.1", 443).is_none());
+        assert!(pinned_client("example.com", "not-an-ip", 443).is_none());
+    }
+
+    // Live-network regression test for the resolve_to_addrs override:
+    // a port-0 override silently connects to IP:0 and fails everything.
+    // Run explicitly: cargo test -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_fetch_fingerprint_live() {
+        let ips = resolve("example.com").await;
+        assert!(!ips.is_empty(), "DNS must resolve example.com");
+        let (probe, snippet) = fetch_fingerprint("example.com", &ips).await;
+        assert!(probe.is_some(), "fingerprint must succeed against example.com");
+        assert!(snippet.is_some());
+    }
+
+    #[test]
     fn test_is_valid_domain() {
         assert!(is_valid_domain("example.com"));
         assert!(is_valid_domain("api.example.com"));
@@ -380,26 +403,39 @@ pub async fn fetch_text(url: &str) -> String {
     }
 }
 
-/// Resolve a hostname to A/AAAA records via the shared hickory resolver,
-/// filtered to global IPs only (SSRF guard).
+/// Resolve a hostname to A/AAAA records via the shared hickory resolver.
+///
+/// Parity with Python `_resolve`: if ANY resolved address is non-global the
+/// whole host is rejected (DNS-rebinding protection) — filtering would let
+/// a mixed answer steer probing. Results are stable-sorted IPv4-first,
+/// approximating typical `getaddrinfo` order (which the Python `curl`
+/// pinning relies on when it takes the first validated IP).
 pub async fn resolve(host: &str) -> Vec<String> {
-    match dns_resolver().lookup_ip(host).await {
-        Ok(lookup) => lookup
-            .iter()
-            .map(|ip| ip.to_string())
-            .filter(|ip| is_global_ip(ip))
-            .collect(),
-        Err(_) => Vec::new(),
+    let mut ips: Vec<String> = match dns_resolver().lookup_ip(host).await {
+        Ok(lookup) => lookup.iter().map(|ip| ip.to_string()).collect(),
+        Err(_) => return Vec::new(),
+    };
+    ips.sort();
+    ips.dedup();
+    if ips.iter().any(|ip| !is_global_ip(ip)) {
+        return Vec::new();
     }
+    // stable IPv4-first (getaddrinfo-order approximation for pin selection)
+    ips.sort_by_key(|ip| ip.contains(':'));
+    ips
 }
 
 /// Build an HTTP client pinned to a validated IP for `host` (curl
-/// `--resolve` semantics via reqwest `resolve_to_addrs`, port 0 = use the
-/// URL scheme's conventional port). The pin is re-validated as global
-/// immediately before use so a rebinding race cannot redirect the probe at
-/// an internal address. Returns None when the pin is unusable (caller falls
-/// back to the shared client, same fail-open posture as Python).
-fn pinned_client(host: &str, ip: &str) -> Option<reqwest::Client> {
+/// `--resolve` semantics via reqwest `resolve_to_addrs`). The pin is
+/// re-validated as global immediately before use so a rebinding race cannot
+/// redirect the probe at an internal address. Returns None when the pin is
+/// unusable (caller falls back to the shared client, same fail-open posture
+/// as Python).
+///
+/// NOTE: the override port must be explicit — reqwest only substitutes
+/// port 0 with the scheme default on the `socks` feature path, which we
+/// do not enable. Passing port 0 connects to IP:0 and fails everything.
+fn pinned_client(host: &str, ip: &str, port: u16) -> Option<reqwest::Client> {
     let addr: std::net::IpAddr = ip.parse().ok()?;
     if !is_global_ip(&addr.to_string()) {
         return None;
@@ -409,7 +445,7 @@ fn pinned_client(host: &str, ip: &str) -> Option<reqwest::Client> {
         .no_proxy()
         .connect_timeout(std::time::Duration::from_secs(8))
         .timeout(std::time::Duration::from_secs(12))
-        .resolve_to_addrs(host, &[std::net::SocketAddr::new(addr, 0)])
+        .resolve_to_addrs(host, &[std::net::SocketAddr::new(addr, port)])
         .build()
         .ok()
 }
@@ -643,21 +679,26 @@ pub async fn enumerate_subdomains(domains: &[String]) -> HashSet<String> {
 // --- HTTP fingerprint -----------------------------------------------------
 
 pub async fn fetch_fingerprint(host: &str, ips: &[String]) -> (Option<Value>, Option<Value>) {
-    let ip = match ips.first() {
-        Some(i) => i.clone(),
-        None => return (None, None),
-    };
-    // Pin the connection to the validated IP (anti-DNS-rebinding). When no
-    // usable pin exists, fall back to the shared client (fail-open, like
-    // Python's unpinned curl path).
-    let pinned = pinned_client(host, &ip);
+    if ips.is_empty() {
+        return (None, None);
+    }
+    // Try validated IPs in order (at most 3 — bounded): the first address
+    // may be unreachable from here (e.g. no IPv6 egress) while a later one
+    // works. Python pins only the first; trying further is a strict
+    // robustness superset with identical output shapes.
     let fallback = http_client().clone();
-    let client = pinned.as_ref().unwrap_or(&fallback);
-    // Probe https first, then http (like the Python curl --resolve pinning).
     let mut probe: Option<Value> = None;
     let mut snippet: Option<Value> = None;
-    for scheme in ["https", "http"] {
-        let url = format!("{}://{}", scheme, host);
+    'ips: for ip in ips.iter().take(3) {
+        // Pin the connection to the validated IP (anti-DNS-rebinding), with
+        // a per-scheme client so the override carries an explicit port. When
+        // no usable pin exists, fall back to the shared client (fail-open,
+        // like Python's unpinned curl path).
+        // Probe https first, then http (like the Python curl --resolve pinning).
+        for (scheme, port) in [("https", 443u16), ("http", 80u16)] {
+            let url = format!("{}://{}", scheme, host);
+            let pinned = pinned_client(host, ip, port);
+            let client = pinned.as_ref().unwrap_or(&fallback);
         let result = client.get(&url).header("Host", host).send().await;
         if let Ok(resp) = result {
             let status = resp.status();
@@ -736,8 +777,9 @@ pub async fn fetch_fingerprint(host: &str, ips: &[String]) -> (Option<Value>, Op
                 "title": title,
                 "versions": versions,
             }));
-            break;
+            break 'ips;
         }
+    }
     }
     (probe, snippet)
 }
