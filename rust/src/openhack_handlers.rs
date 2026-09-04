@@ -32,6 +32,7 @@ pub async fn api_openhack_config(
     Json(body): Json<OpenhackConfigBody>,
 ) -> AppResult<Json<Value>> {
     require_org(&slug, &headers)?;
+    let _org_guard = cc::org_write_lock(&slug).await;
     let model = body.model.clone().unwrap_or_default().trim().to_string();
     if !model.is_empty() && !valid_model_id(&model) {
         return Err(AppError::BadRequest("invalid model id".into()));

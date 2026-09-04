@@ -69,6 +69,30 @@ fn cfg() -> &'static Config {
 /// Backed by an RwLock so writes (register/domains) can reload it safely.
 static REGISTRY: OnceCell<RwLock<Map<String, Value>>> = OnceCell::new();
 
+// Per-org async write locks: every read-modify-write cycle (status/comment/
+// domains/register/config/scanner persist) holds its org's guard so parallel
+// mutations of the same org cannot lose updates (parity with Python
+// `_org_lock(slug)`).
+static ORG_LOCKS: OnceCell<parking_lot::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+    OnceCell::new();
+
+fn org_locks() -> &'static parking_lot::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>> {
+    ORG_LOCKS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// Acquire the org's exclusive write guard. Hold across the full
+/// load -> mutate -> persist (+ cache invalidate) sequence.
+pub async fn org_write_lock(slug: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let m = {
+        org_locks()
+            .lock()
+            .entry(slug.to_string())
+            .or_default()
+            .clone()
+    };
+    m.lock_owned().await
+}
+
 fn registry() -> &'static RwLock<Map<String, Value>> {
     REGISTRY.get_or_init(|| {
         let m = load_registry_file();

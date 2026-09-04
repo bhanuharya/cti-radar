@@ -53,6 +53,8 @@ pub async fn api_org_register(
             slug: Some(slug.clone()),
         });
     }
+    // serialize concurrent registrations/mutations of this slug
+    let _org_guard = cc::org_write_lock(&slug).await;
     let raw_name = body.name.unwrap_or_default();
     let name = {
         let t = raw_name.trim();
@@ -411,6 +413,7 @@ pub async fn api_status_change(
     Json(body): Json<StatusBody>,
 ) -> AppResult<Json<Value>> {
     require_org(&slug, &headers)?;
+    let _org_guard = cc::org_write_lock(&slug).await;
     let status = body.status.trim().to_uppercase();
     if !cc::CANONICAL_STATUSES.contains(&status.as_str()) {
         return Err(AppError::BadRequest("invalid status".into()));
@@ -582,6 +585,7 @@ pub async fn api_finding_comment(
     Json(body): Json<CommentBody>,
 ) -> AppResult<Json<Value>> {
     require_org(&slug, &headers)?;
+    let _org_guard = cc::org_write_lock(&slug).await;
     let mut note = body.note.trim().to_string();
     if note.is_empty() {
         return Err(AppError::BadRequest("note is required".into()));
@@ -666,6 +670,7 @@ pub async fn api_org_domains(
     Json(body): Json<DomainsBody>,
 ) -> AppResult<Json<Value>> {
     require_org(&slug, &headers)?;
+    let _org_guard = cc::org_write_lock(&slug).await;
     let action = body
         .action
         .clone()

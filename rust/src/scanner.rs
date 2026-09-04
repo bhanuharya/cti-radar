@@ -1986,6 +1986,25 @@ pub async fn generate_org(
         }
     }
 
+    // snapshot analyst-owned fields at load: at persist time, a finding
+    // whose analyst fields changed mid-scan keeps the FILE version (analyst
+    // wins, mirroring Python's "analyst-owned statuses never auto-changed").
+    let analyst_snap: HashMap<String, Value> = existing
+        .iter()
+        .filter_map(|f| {
+            let id = f.get("id")?.as_str()?.to_string();
+            Some((
+                id,
+                json!({
+                    "status": f.get("status").cloned().unwrap_or(Value::Null),
+                    "status_history": f.get("status_history").cloned().unwrap_or(Value::Null),
+                    "feedback": f.get("feedback").cloned().unwrap_or(Value::Null),
+                    "comments": f.get("comments").cloned().unwrap_or(Value::Null),
+                }),
+            ))
+        })
+        .collect();
+
     // synthesize new findings (dedup against existing) BEFORE reconcile so
     // newly-observed surfaces get identity/lifecycle bookkeeping this pass.
     let enumerated: Vec<String> = hosts.keys().cloned().collect();
@@ -2044,7 +2063,51 @@ pub async fn generate_org(
     });
     let merged_meta = merge_meta(old_meta, scan_meta);
 
-    let payload = json!({"meta": merged_meta, "findings": existing});
+    // serialize with concurrent analyst mutations: re-read under the org
+    // lock and restore analyst-owned fields for findings touched mid-scan
+    // (status/history/feedback), so a parallel status/comment is not lost.
+    let _persist_guard = cc::org_write_lock(&slug).await;
+    let found_count = existing.len();
+    let mut findings_to_write = std::mem::take(&mut existing);
+    if let Ok(txt) = tokio::fs::read_to_string(&findings_path).await {
+        if let Ok(doc) = serde_json::from_str::<Value>(&txt) {
+            if let Some(current) = doc.get("findings").and_then(|v| v.as_array()) {
+                let by_id: HashMap<&str, &Value> = current
+                    .iter()
+                    .filter_map(|f| {
+                        f.get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|id| (id, f))
+                    })
+                    .collect();
+                for f in &mut findings_to_write {
+                    let Some(id) = f.get("id").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let (Some(cur), Some(snap)) = (by_id.get(id), analyst_snap.get(id)) else {
+                        continue;
+                    };
+                    let cur_a = json!({
+                        "status": cur.get("status").cloned().unwrap_or(Value::Null),
+                        "status_history": cur.get("status_history").cloned().unwrap_or(Value::Null),
+                        "feedback": cur.get("feedback").cloned().unwrap_or(Value::Null),
+                        "comments": cur.get("comments").cloned().unwrap_or(Value::Null),
+                    });
+                    // analyst touched it mid-scan -> file version wins
+                    if cur_a != *snap {
+                        if let Some(map) = f.as_object_mut() {
+                            for k in ["status", "status_history", "feedback", "comments"] {
+                                if let Some(v) = cur.get(k) {
+                                    map.insert(k.to_string(), v.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let payload = json!({"meta": merged_meta, "findings": findings_to_write});
     if let Err(e) = cc::atomic_write_json(&findings_path, &payload).await {
         return json!({"error": format!("write failed: {}", e)});
     }
@@ -2061,7 +2124,7 @@ pub async fn generate_org(
         &slug,
         json!({
             "kind": "scan", "mode": mode,
-            "summary": {"found": existing.len(), "subdomains": hosts.len(), "resolved": baseline.len(), "reachable": reached.len()},
+            "summary": {"found": found_count, "subdomains": hosts.len(), "resolved": baseline.len(), "reachable": reached.len()},
             "note": "passive surface scan"
         }),
     ).await;
@@ -2841,7 +2904,14 @@ pub async fn recheck_findings(slug: &str, max_probe: usize) -> usize {
         ));
     }
 
-    // apply atomically
+    // apply atomically: re-read under the org lock and replay probe
+    // results onto fresh data so concurrent analyst mutations survive
+    let _guard = cc::org_write_lock(slug).await;
+    if let Ok(txt) = tokio::fs::read_to_string(&fp).await {
+        if let Ok(fresh) = serde_json::from_str::<Value>(&txt) {
+            doc = fresh;
+        }
+    }
     let mut changed = 0usize;
     if let Value::Object(doc_obj) = &mut doc {
         let fs2 = doc_obj
@@ -3369,8 +3439,10 @@ pub async fn correlate_org(org: Value) -> Value {
         })
         .collect();
 
-    // persist
+    // persist (fresh read-modify-write under the org lock so concurrent
+    // analyst mutations survive)
     if !filtered.is_empty() {
+        let _corr_guard = cc::org_write_lock(&slug).await;
         if let Some(fp) = cc::org_findings_path(&slug) {
             if let Ok(txt) = tokio::fs::read_to_string(&fp).await {
                 if let Ok(mut doc) = serde_json::from_str::<Value>(&txt) {
@@ -3477,6 +3549,9 @@ pub async fn ai_grade_org(slug: &str, profile_name: Option<String>) -> Value {
     };
 
     let mut applied = 0usize;
+    // hold the org lock across the fresh read-modify-write so a concurrent
+    // analyst mutation is not clobbered
+    let _grade_guard = cc::org_write_lock(slug).await;
     if let Some(fp) = cc::org_findings_path(slug) {
         if let Ok(txt) = tokio::fs::read_to_string(&fp).await {
             if let Ok(mut doc) = serde_json::from_str::<Value>(&txt) {
