@@ -48,12 +48,11 @@ fancy-regex = "0.13"   # look-around support for PII-masking patterns (regex cra
 url = "2"
 
 # dns resolution + pinning (SSRF protection)
-hickory-resolver = "0.24"
+hickory-resolver = "0.26"
 
 # TLS cert inspection (expired/self-signed findings)
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
 webpki-roots = "0.26"
 x509-parser = "0.16"   # X.509 cert parsing (notAfter / issuer / SAN / self-signed)
 

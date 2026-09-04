@@ -329,16 +329,21 @@ mod tests {
 
 /// Shared hickory DNS resolver (system /etc/resolv.conf, tokio runtime).
 /// ONE resolver for the whole scan — cloned via Arc semantics internally
-/// (TokioAsyncResolver is Clone + Send + Sync).
-pub fn dns_resolver() -> &'static hickory_resolver::TokioAsyncResolver {
-    static RESOLVER: OnceCell<hickory_resolver::TokioAsyncResolver> = OnceCell::new();
+/// (TokioResolver is Clone + Send + Sync).
+pub fn dns_resolver() -> &'static hickory_resolver::TokioResolver {
+    static RESOLVER: OnceCell<hickory_resolver::TokioResolver> = OnceCell::new();
     RESOLVER.get_or_init(|| {
-        hickory_resolver::TokioAsyncResolver::tokio_from_system_conf()
+        hickory_resolver::TokioResolver::builder_tokio()
+            .and_then(|b| b.build())
             .unwrap_or_else(|_| {
-                hickory_resolver::TokioAsyncResolver::tokio(
-                    hickory_resolver::config::ResolverConfig::cloudflare(),
-                    hickory_resolver::config::ResolverOpts::default(),
+                hickory_resolver::TokioResolver::builder_with_config(
+                    hickory_resolver::config::ResolverConfig::udp_and_tcp(
+                        &hickory_resolver::config::CLOUDFLARE,
+                    ),
+                    Default::default(),
                 )
+                .build()
+                .expect("cloudflare resolver build failed")
             })
     })
 }
