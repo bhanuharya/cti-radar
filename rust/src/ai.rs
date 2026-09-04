@@ -10,6 +10,61 @@ use std::net::IpAddr;
 
 const VALID_PROVIDERS: [&str; 2] = ["ollama", "openai-compatible"];
 
+/// Prompt template version advertised via `get_capabilities` (parity with Python).
+pub const PROMPT_VERSION: &str = "cti-v1";
+
+fn data_root() -> String {
+    std::env::var("CTI_DATA_DIR")
+        .map(|d| d.trim_end_matches('/').to_string())
+        .unwrap_or_else(|_| "data".to_string())
+}
+
+fn org_profiles_path() -> String {
+    format!("{}/ai_org_profiles.json", data_root())
+}
+
+fn load_org_profile_map() -> HashMap<String, String> {
+    let path = org_profiles_path();
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|txt| serde_json::from_str::<Value>(&txt).ok())
+        .and_then(|v| v.as_object().cloned())
+        .map(|o| {
+            o.into_iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Preferred per-org profile from the ignored runtime file (parity with Python
+/// `get_org_profile`). Returns None when unset.
+pub fn get_org_profile(slug: &str) -> Option<String> {
+    load_org_profile_map()
+        .get(slug)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Persist a per-org profile preference to the ignored runtime file
+/// (atomic; empty clears). Parity with Python `set_org_profile`.
+pub fn set_org_profile(slug: &str, profile: &str) {
+    let mut m = load_org_profile_map();
+    if profile.trim().is_empty() {
+        m.remove(slug);
+    } else {
+        m.insert(slug.to_string(), profile.trim().to_string());
+    }
+    let mut obj = serde_json::Map::new();
+    for (k, v) in m {
+        obj.insert(k, Value::String(v));
+    }
+    let _ = crate::correlation::atomic_write_json(
+        &std::path::PathBuf::from(org_profiles_path()),
+        &Value::Object(obj),
+    );
+}
+
 fn allowed_api_key_re() -> &'static Regex {
     static RE: OnceCell<Regex> = OnceCell::new();
     RE.get_or_init(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").unwrap())
@@ -284,14 +339,93 @@ pub fn is_ai_configured() -> bool {
     !profiles.is_empty()
 }
 
-pub fn resolve_profile_for_org(_slug: &str, _override: Option<&str>) -> Option<String> {
+/// Resolve the effective profile for an org:
+/// override > runtime-file preference > legacy orgs.json ai_profile > default.
+/// Parity with Python `resolve_profile_for_org`.
+pub fn resolve_profile_for_org(slug: &str, override_: Option<&str>) -> Option<String> {
     let (profiles, default) = load_profiles();
-    if let Some(o) = _override {
+    if let Some(o) = override_ {
         if profiles.contains_key(o) {
             return Some(o.to_string());
         }
     }
+    if !slug.is_empty() {
+        // 1. ignored runtime file (preferred, does not dirty tracked registry)
+        if let Some(pref) = get_org_profile(slug) {
+            if profiles.contains_key(&pref) {
+                return Some(pref);
+            }
+        }
+        // 2. legacy orgs.json ai_profile (backwards compat)
+        let reg_path = format!("{}/orgs.json", data_root());
+        if let Ok(txt) = std::fs::read_to_string(&reg_path) {
+            if let Ok(reg) = serde_json::from_str::<Value>(&txt) {
+                if let Some(pref) = reg
+                    .get(slug)
+                    .and_then(|e| e.get("ai_profile"))
+                    .and_then(|v| v.as_str())
+                {
+                    let pref = pref.trim().to_string();
+                    if profiles.contains_key(&pref) {
+                        return Some(pref);
+                    }
+                }
+            }
+        }
+    }
     default
+}
+
+/// Effective profile that is also *ready* (an openai-compatible profile whose
+/// API key env var is missing degrades to None). Mirrors the scan-handler
+/// fallback in Python `api_org_scan`: deterministic work always proceeds.
+pub fn effective_ready_profile(slug: &str, override_: Option<&str>) -> Option<String> {
+    let eff = resolve_profile_for_org(slug, override_)?;
+    let (profiles, _) = load_profiles();
+    let p = profiles.get(&eff)?;
+    if p.get("provider").and_then(|v| v.as_str()) == Some("openai-compatible") {
+        if let Some(k) = p.get("api_key_env").and_then(|v| v.as_str()) {
+            if std::env::var(k).map(|v| v.trim().is_empty()).unwrap_or(true) {
+                return None;
+            }
+        }
+    }
+    Some(eff)
+}
+
+/// Safe public view of provider capabilities: no secrets, no base URLs.
+/// Parity with Python `get_capabilities`.
+pub fn get_capabilities() -> Value {
+    let (profiles, default) = load_profiles();
+    let mut names: Vec<&String> = profiles.keys().collect();
+    names.sort();
+    let mut caps = Vec::new();
+    for name in names {
+        let p = &profiles[name];
+        let provider = p.get("provider").and_then(|v| v.as_str()).unwrap_or("");
+        let mut ready = true;
+        if provider == "openai-compatible" {
+            if let Some(k) = p.get("api_key_env").and_then(|v| v.as_str()) {
+                if std::env::var(k).map(|v| v.trim().is_empty()).unwrap_or(true) {
+                    ready = false;
+                }
+            }
+        }
+        caps.push(json!({
+            "name": name,
+            "provider": provider,
+            "model": p.get("model").cloned().unwrap_or(Value::Null),
+            "timeout": p.get("timeout").cloned().unwrap_or(Value::Null),
+            "max_hosts": p.get("max_hosts").cloned().unwrap_or(Value::Null),
+            "ready": ready,
+            "default": Some(name.as_str()) == default.as_deref(),
+        }));
+    }
+    json!({
+        "default_profile": default,
+        "profiles": caps,
+        "prompt_version": PROMPT_VERSION,
+    })
 }
 
 /// Make a chat-completion call. Returns Some(text) or None (fail-open).

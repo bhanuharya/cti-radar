@@ -129,6 +129,14 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// Drop the session id carried by the request cookie (server-side logout).
+/// Mirrors Python `api_logout` (`_SESSIONS.pop(sid, None)`).
+pub fn invalidate_session(headers: &HeaderMap) {
+    if let Some(sid) = cookie_token(headers) {
+        sessions().write().unwrap().remove(&sid);
+    }
+}
+
 /// Auth is satisfied by EITHER a valid session cookie OR the static API token.
 pub fn auth_ok(headers: &HeaderMap) -> bool {
     // (1) session cookie

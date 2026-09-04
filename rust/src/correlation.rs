@@ -1054,10 +1054,19 @@ pub fn cfg_path_orgs_json() -> PathBuf {
     cfg().orgs_json()
 }
 
-/// Return the org's raw meta dict (read-only).
+/// Return the raw meta dict (read-only).
 pub fn load_meta(org: &str) -> Value {
     let (_, _, _, meta) = cached_org_data(org);
     meta
+}
+
+/// Latest correlation report stored in findings meta (parity with Python
+/// `correlation_report`; Value::Null when absent).
+pub fn correlation_report(org: &str) -> Value {
+    load_meta(org)
+        .get("correlation")
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 pub fn summary_from_data(fs: &[Value], baseline: &[String]) -> Value {

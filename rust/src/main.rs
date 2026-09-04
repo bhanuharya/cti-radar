@@ -8,8 +8,37 @@ use axum::routing::{get, post};
 use axum::Router;
 use cti_radar::config::Config;
 use cti_radar::AppState;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
 const DASHBOARD_HTML: &str = include_str!("../../app/dashboard.html");
+
+/// Locate the vendored `app/static` dir: walk up from the executable (works
+/// when installed), then fall back to CWD-relative dev layouts.
+fn resolve_static_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        let mut anc = exe.as_path();
+        for _ in 0..6 {
+            match anc.parent() {
+                Some(parent) => {
+                    let cand = parent.join("app/static");
+                    if cand.is_dir() {
+                        return cand;
+                    }
+                    anc = parent;
+                }
+                None => break,
+            }
+        }
+    }
+    for cand in ["../app/static", "app/static"] {
+        let p = PathBuf::from(cand);
+        if p.is_dir() {
+            return p;
+        }
+    }
+    PathBuf::from("../app/static")
+}
 
 async fn security_headers(req: Request, next: Next) -> Response {
     let mut resp = next.run(req).await;
@@ -47,6 +76,11 @@ fn build_router(state: AppState) -> Router {
                     DASHBOARD_HTML,
                 )
             }),
+        )
+        // vendored static assets (vis-network, etc.) from app/static
+        .nest_service(
+            "/static",
+            tower_http::services::ServeDir::new(resolve_static_dir()),
         )
         // session auth
         .route("/api/login", post(h::api_login))
@@ -130,6 +164,7 @@ async fn main() {
     cti_radar::correlation::init(cfg.clone());
     cti_radar::auth::init(cfg.clone());
     cti_radar::jobs::init(cfg.clone());
+    cti_radar::logs::init(&cfg.data_dir);
 
     let state = AppState::new(cfg.clone());
     let app = build_router(state);
@@ -142,5 +177,10 @@ async fn main() {
             std::process::exit(1);
         });
     tracing::info!("cti-radar listening on {}", addr);
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }

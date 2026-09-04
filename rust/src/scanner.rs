@@ -1974,7 +1974,7 @@ pub async fn generate_org(
             None => "failed",
         };
         // Stage B: judgment-only grading of existing deterministic findings
-        let _grade = ai_grade_org(&slug).await;
+        let _grade = ai_grade_org(&slug, None).await;
     }
 
     json!({
@@ -3305,9 +3305,9 @@ fn is_corr_source(f: &Value) -> bool {
 }
 
 /// Stage-B AI grading (judgment-only, clamp ±1 step from stored baseline).
-pub async fn ai_grade_org(slug: &str) -> Value {
-    // Resolve effective profile; skip if none configured.
-    let effective = crate::ai::resolve_profile_for_org(slug, None);
+pub async fn ai_grade_org(slug: &str, profile_name: Option<String>) -> Value {
+    // Resolve effective profile (explicit override > org > default); skip if none.
+    let effective = crate::ai::effective_ready_profile(slug, profile_name.as_deref());
     if effective.is_none() {
         cc::append_history(
             slug,

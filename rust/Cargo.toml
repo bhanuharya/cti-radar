@@ -14,7 +14,7 @@ path = "src/main.rs"
 axum = { version = "0.8", features = ["json", "query", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["set-header", "trace", "cors"] }
+tower-http = { version = "0.6", features = ["set-header", "trace", "cors", "fs"] }
 futures = "0.3"
 async-trait = "0.1"
 

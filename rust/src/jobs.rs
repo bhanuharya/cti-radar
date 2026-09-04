@@ -5,6 +5,7 @@
 //! so status polling works.
 
 use crate::config::Config;
+use crate::error::{AppError, AppResult};
 use once_cell::sync::OnceCell;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -22,10 +23,16 @@ fn cfg() -> &'static Config {
     CFG.get().expect("jobs::init must be called first")
 }
 
+/// Global cap on concurrent active jobs (mirrors Python `_MAX_ACTIVE_JOBS`).
+pub fn max_active_jobs() -> usize {
+    cfg().max_active_jobs
+}
+
 #[derive(Clone, Debug)]
 pub struct Job {
     pub id: String,
     pub started: f64,
+    pub finished: Option<f64>,
     pub kind: String,
     pub status: String,
     pub stage: String,
@@ -61,6 +68,7 @@ fn job_key(slug: &str, kind: &str) -> String {
 /// - any *running* job for this org blocks new mutations (per-org serialization)
 /// - global active-job cap bounds total concurrency
 pub fn try_acquire_job(slug: &str, kind: &str) -> (bool, Option<String>) {
+    prune_jobs();
     let key = job_key(slug, kind);
     let prefix = format!("{}:", slug);
     let mut table = jobs().lock().unwrap();
@@ -87,6 +95,7 @@ pub fn try_acquire_job(slug: &str, kind: &str) -> (bool, Option<String>) {
     let entry = Job {
         id: jid.clone(),
         started: now_f64(),
+        finished: None,
         kind: kind.to_string(),
         status: "running".to_string(),
         stage: "queued".to_string(),
@@ -96,6 +105,24 @@ pub fn try_acquire_job(slug: &str, kind: &str) -> (bool, Option<String>) {
     };
     table.entries.insert(key, entry);
     (true, Some(jid))
+}
+
+/// Keep only scalar result fields (str/int/float/bool/null), mirroring
+/// Python `_release_job` result filtering.
+fn scalar_result(result: Value) -> Value {
+    match result {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(_, v)| {
+                    matches!(
+                        v,
+                        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null
+                    )
+                })
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 pub fn release_job(
@@ -115,9 +142,12 @@ pub fn release_job(
                 "done".to_string()
             };
             j.error = error;
-            j.result = result;
+            j.result = result.map(scalar_result);
+            j.finished = Some(now_f64());
         }
     }
+    drop(table);
+    prune_jobs();
 }
 
 pub fn job_update(slug: &str, kind: &str, jid: &str, fields: Map<String, Value>) {
@@ -165,40 +195,51 @@ pub fn get_job(slug: &str, kind: &str, job_id: &str) -> Option<Job> {
 pub fn prune_jobs() {
     let now = now_f64();
     let mut table = jobs().lock().unwrap();
-    table
-        .entries
-        .retain(|_, j| j.status == "running" || (now - j.started) < (JOB_TTL_SECS as f64));
+    table.entries.retain(|_, j| {
+        if j.status == "running" {
+            return true;
+        }
+        // age from completion (mirrors Python `_prune_jobs` on `finished`)
+        let end = j.finished.unwrap_or(j.started);
+        now - end < (JOB_TTL_SECS as f64)
+    });
 }
 
 /// Serialize a job into the API status payload shape.
-pub fn job_status(slug: &str, kind: &str, job_id: &str, running: bool) -> Value {
+/// Unknown job ids -> 404 (mirrors Python `_job_status`).
+pub fn job_status(slug: &str, kind: &str, job_id: &str) -> AppResult<Value> {
     match get_job(slug, kind, job_id) {
         Some(j) => {
-            let status = if j.status == "running" {
-                "running"
+            // only non-None keys are emitted (mirrors Python `_job_status`)
+            let end = if j.status == "running" {
+                now_f64()
             } else {
-                j.status.as_str()
+                j.finished.unwrap_or_else(now_f64)
             };
-            json!({
-                "slug": slug,
-                "kind": kind,
-                "job_id": j.id,
-                "status": status,
-                "stage": j.stage,
-                "progress": j.progress,
-                "error": j.error,
-                "result": j.result,
-            })
+            let mut m = Map::new();
+            m.insert("status".into(), json!(j.status));
+            m.insert("job_id".into(), json!(j.id));
+            m.insert("stage".into(), json!(j.stage));
+            m.insert("progress".into(), json!(j.progress));
+            if let Some(e) = j.error {
+                m.insert("error".into(), json!(e));
+            }
+            m.insert("started".into(), json!(j.started));
+            if let Some(f) = j.finished {
+                m.insert("finished".into(), json!(f));
+            }
+            if let Some(r) = j.result {
+                m.insert("result".into(), r);
+            }
+            let elapsed = ((end - j.started).max(0.0) * 10.0).round() / 10.0;
+            m.insert("elapsed".into(), json!(elapsed));
+            Ok(Value::Object(m))
         }
-        None => {
-            // unknown job id -> report running state so polling stays stable
-            json!({
-                "slug": slug,
-                "kind": kind,
-                "job_id": job_id,
-                "status": if running { "running" } else { "unknown" },
-            })
-        }
+        None => Err(AppError::UnknownJob {
+            slug: slug.to_string(),
+            kind: kind.to_string(),
+            job_id: job_id.to_string(),
+        }),
     }
 }
 
