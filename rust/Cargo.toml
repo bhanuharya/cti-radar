@@ -12,11 +12,10 @@ path = "src/main.rs"
 [dependencies]
 # async runtime + web
 axum = { version = "0.8", features = ["json", "query", "multipart"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["set-header", "trace", "cors", "fs"] }
 futures = "0.3"
-async-trait = "0.1"
 
 # http client (scanner + AI providers) — rustls, no openssl dep
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli", "deflate"] }

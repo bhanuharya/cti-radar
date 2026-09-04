@@ -11,9 +11,19 @@ import sys
 import statistics
 
 
+def parse_secs(tok):
+    """Parse GNU time elapsed formats: '0:00.22', '1:02.5', plain seconds,
+    or CPU percent like '23%' (returned as a plain number)."""
+    tok = tok.strip().rstrip("%")
+    if ":" in tok:
+        mins, secs = tok.split(":", 1)
+        return float(mins) * 60.0 + float(secs)
+    return float(tok)
+
+
 def load(path):
     with open(path) as f:
-        return [float(x) for x in f.read().split() if x.strip()]
+        return [parse_secs(x) for x in f.read().split() if x.strip()]
 
 
 def median(v):
