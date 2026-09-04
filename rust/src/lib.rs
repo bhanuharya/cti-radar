@@ -11,6 +11,7 @@ pub mod handlers;
 pub mod handlers_mut;
 pub mod jobs;
 pub mod logs;
+pub mod net;
 pub mod openhack;
 pub mod openhack_handlers;
 pub mod report;

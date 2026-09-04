@@ -83,7 +83,7 @@ pub async fn api_org_register(
     }
     // validate ai_profile before any filesystem mutation
     let ai_profile = body.ai_profile.unwrap_or_default().trim().to_string();
-    let (profiles, _) = crate::ai::load_profiles();
+    let (profiles, _) = crate::ai::load_profiles().await;
     if !ai_profile.is_empty() && !profiles.contains_key(&ai_profile) {
         return Err(invalid_profile_error(&profiles));
     }
@@ -106,17 +106,17 @@ pub async fn api_org_register(
             "baseline": format!("data/orgs/{}/baseline.txt", slug),
         }),
     );
-    save_registry_map(&registry, &state)?;
+    save_registry_map(&registry, &state).await?;
     cc::reload_registry();
 
     // filesystem creation after successful registry commit (best-effort;
     // atomic writers create 0700 dirs / 0600 files)
     let org_dir = state.cfg.org_dir(&slug);
-    let _ = cc::atomic_write_text(&org_dir.join("baseline.txt"), "");
-    let _ = cc::atomic_write_json(&org_dir.join("findings.json"), &json!({"findings": []}));
+    let _ = cc::atomic_write_text(&org_dir.join("baseline.txt"), "").await;
+    let _ = cc::atomic_write_json(&org_dir.join("findings.json"), &json!({"findings": []})).await;
     cc::invalidate_org_cache(&slug);
     if !ai_profile.is_empty() {
-        crate::ai::set_org_profile(&slug, &ai_profile);
+        crate::ai::set_org_profile(&slug, &ai_profile).await;
     }
     crate::logs::log_event(
         "info",
@@ -128,7 +128,7 @@ pub async fn api_org_register(
             valid_domains.len()
         ),
         None,
-    );
+    ).await;
     Ok(Json(json!({
         "slug": slug,
         "name": name,
@@ -163,9 +163,10 @@ pub fn load_registry_map() -> AppResult<Map<String, Value>> {
     }
 }
 
-fn save_registry_map(registry: &Map<String, Value>, state: &AppState) -> AppResult<()> {
+async fn save_registry_map(registry: &Map<String, Value>, state: &AppState) -> AppResult<()> {
     let path = state.cfg.orgs_json();
     crate::correlation::atomic_write_json(&path, &Value::Object(registry.clone()))
+        .await
         .map_err(AppError::from)
 }
 
@@ -212,7 +213,7 @@ pub async fn api_org_scan(
     };
     // resolve ai_profile: request override > org's stored preference > default
     let ai_profile_req = body.ai_profile.clone().unwrap_or_default().trim().to_string();
-    let (profiles, _) = crate::ai::load_profiles();
+    let (profiles, _) = crate::ai::load_profiles().await;
     if !ai_profile_req.is_empty() && !profiles.contains_key(&ai_profile_req) {
         return Err(invalid_profile_error(&profiles));
     }
@@ -223,7 +224,7 @@ pub async fn api_org_scan(
     } else {
         Some(ai_profile_req.clone())
     };
-    let effective = crate::ai::effective_ready_profile(&slug, req_opt.as_deref());
+    let effective = crate::ai::effective_ready_profile(&slug, req_opt.as_deref()).await;
     let _ = org;
     let (ok, jid) = crate::jobs::try_acquire_job(&slug, "scan");
     if !ok {
@@ -237,7 +238,7 @@ pub async fn api_org_scan(
             &slug,
             "AI mode requested but no ready profile — falling back to deterministic scan",
             Some(&jid),
-        );
+        ).await;
     }
     crate::logs::log_event(
         "info",
@@ -249,7 +250,7 @@ pub async fn api_org_scan(
             effective.as_deref().unwrap_or("auto")
         ),
         Some(&jid),
-    );
+    ).await;
     // pass the resolved-or-requested profile through (mirrors Python
     // `ai_profile=effective_profile or ai_profile_req`)
     let pass_profile = effective.clone().or(req_opt);
@@ -273,10 +274,10 @@ pub async fn api_org_scan(
                 &slug2,
                 &format!("scan failed: {}", err),
                 Some(&jid2),
-            );
+            ).await;
         } else {
             crate::jobs::release_job(&slug2, "scan", &jid2, None, Some(result));
-            crate::logs::log_event("info", "scan", &slug2, "scan completed", Some(&jid2));
+            crate::logs::log_event("info", "scan", &slug2, "scan completed", Some(&jid2)).await;
         }
     });
     Ok(Json(json!({
@@ -308,7 +309,7 @@ pub async fn api_org_recheck(
         return Err(job_busy_error(&slug, "recheck", jid));
     }
     let jid = jid.unwrap();
-    crate::logs::log_event("info", "recheck", &slug, "recheck queued", Some(&jid));
+    crate::logs::log_event("info", "recheck", &slug, "recheck queued", Some(&jid)).await;
     let (slug2, jid2) = (slug.clone(), jid.clone());
     tokio::spawn(async move {
         let changed = crate::scanner::recheck_findings(&slug2, 200).await;
@@ -325,7 +326,7 @@ pub async fn api_org_recheck(
             &slug2,
             &format!("recheck completed ({} change(s))", changed),
             Some(&jid2),
-        );
+        ).await;
     });
     Ok(Json(json!({"queued": true, "slug": slug, "job_id": jid})))
 }
@@ -341,7 +342,7 @@ pub async fn api_org_correlate(
         return Err(job_busy_error(&slug, "correlate", jid));
     }
     let jid = jid.unwrap();
-    crate::logs::log_event("info", "correlate", &slug, "correlation queued", Some(&jid));
+    crate::logs::log_event("info", "correlate", &slug, "correlation queued", Some(&jid)).await;
     let (slug2, jid2) = (slug.clone(), jid.clone());
     tokio::spawn(async move {
         let org = cc::org_get(&slug2).unwrap_or_else(|| json!({"slug": slug2.clone()}));
@@ -365,7 +366,7 @@ pub async fn api_org_correlate(
                 &slug2,
                 &format!("correlation failed: {}", err),
                 Some(&jid2),
-            );
+            ).await;
         } else {
             crate::jobs::release_job(&slug2, "correlate", &jid2, None, Some(result));
             crate::logs::log_event(
@@ -374,7 +375,7 @@ pub async fn api_org_correlate(
                 &slug2,
                 "correlation completed",
                 Some(&jid2),
-            );
+            ).await;
         }
     });
     Ok(Json(json!({"queued": true, "job_id": jid})))
@@ -446,7 +447,7 @@ pub async fn api_status_change(
     let findings_path = cc::org_findings_path(&slug)
         .ok_or_else(|| AppError::Internal(format!("bad findings path for org: {}", slug)))?;
     let payload = json!({"meta": cc::load_meta(&slug), "findings": fs});
-    cc::atomic_write_json(&findings_path, &payload).map_err(AppError::from)?;
+    cc::atomic_write_json(&findings_path, &payload).await.map_err(AppError::from)?;
     cc::invalidate_org_cache(&slug);
     cc::append_history(
         &slug,
@@ -457,14 +458,15 @@ pub async fn api_status_change(
             "summary": {"subdomains": 0, "found": fs.len(), "new": 0, "resolved": 0, "changed": 1},
             "note": format!("{}: {} -> {}", id, old, status),
         }),
-    );
+    )
+    .await;
     crate::logs::log_event(
         "info",
         "status",
         &slug,
         &format!("finding {} status -> {}", id, status),
         None,
-    );
+    ).await;
     match cc::find_finding(&slug, &id) {
         Some(updated) => Ok(Json(
             json!({"org": slug, "finding": cc::normalize_finding(&updated, &slug, None)}),
@@ -491,7 +493,7 @@ pub async fn api_org_ai_grade(
         .trim()
         .to_string();
     if !ai_profile_req.is_empty() {
-        let (profiles, _) = crate::ai::load_profiles();
+        let (profiles, _) = crate::ai::load_profiles().await;
         if !profiles.contains_key(&ai_profile_req) {
             return Err(invalid_profile_error(&profiles));
         }
@@ -510,7 +512,7 @@ pub async fn api_org_ai_grade(
             if ai_profile_req.is_empty() { "auto" } else { &ai_profile_req }
         ),
         Some(&jid),
-    );
+    ).await;
     let profile_opt = if ai_profile_req.is_empty() {
         None
     } else {
@@ -528,7 +530,7 @@ pub async fn api_org_ai_grade(
                 Some("AI grading failed (provider or persistence error)".to_string()),
                 None,
             );
-            crate::logs::log_event("error", "ai_grade", &slug2, "AI grading failed", Some(&jid2));
+            crate::logs::log_event("error", "ai_grade", &slug2, "AI grading failed", Some(&jid2)).await;
         } else {
             crate::jobs::release_job(&slug2, "grade", &jid2, None, None);
             crate::logs::log_event(
@@ -540,7 +542,7 @@ pub async fn api_org_ai_grade(
                     result.get("result").and_then(|v| v.as_str()).unwrap_or("done")
                 ),
                 Some(&jid2),
-            );
+            ).await;
         }
     });
     Ok(Json(json!({"queued": true, "slug": slug, "job_id": jid})))
@@ -622,7 +624,7 @@ pub async fn api_finding_comment(
     let findings_path = cc::org_findings_path(&slug)
         .ok_or_else(|| AppError::Internal(format!("bad findings path for org: {}", slug)))?;
     let payload = json!({"meta": cc::load_meta(&slug), "findings": fs});
-    cc::atomic_write_json(&findings_path, &payload).map_err(AppError::from)?;
+    cc::atomic_write_json(&findings_path, &payload).await.map_err(AppError::from)?;
     cc::invalidate_org_cache(&slug);
     let note_short: String = note.chars().take(120).collect();
     cc::append_history(
@@ -634,14 +636,15 @@ pub async fn api_finding_comment(
             "summary": {"found": fs.len()},
             "note": format!("comment on {}: {}", id, note_short),
         }),
-    );
+    )
+    .await;
     crate::logs::log_event(
         "info",
         "comment",
         &slug,
         &format!("finding {} commented (analyst feedback)", id),
         None,
-    );
+    ).await;
     match cc::find_finding(&slug, &id) {
         Some(updated) => Ok(Json(
             json!({"org": slug, "finding": cc::normalize_finding(&updated, &slug, None)}),
@@ -717,7 +720,7 @@ pub async fn api_org_domains(
                 .collect(),
         ),
     );
-    save_registry_map(&registry, &state)?;
+    save_registry_map(&registry, &state).await?;
     cc::reload_registry();
     crate::logs::log_event(
         "info",
@@ -733,7 +736,7 @@ pub async fn api_org_domains(
             }
         ),
         None,
-    );
+    ).await;
     Ok(Json(json!({"slug": slug, "domains": new_domains})))
 }
 
@@ -751,13 +754,13 @@ pub async fn api_set_ai_profile(
     require_org(&slug, &headers)?;
     // empty string clears the preference (mirrors Python)
     let desired = body.ai_profile.unwrap_or_default().trim().to_string();
-    let (profiles, _) = crate::ai::load_profiles();
+    let (profiles, _) = crate::ai::load_profiles().await;
     if !desired.is_empty() && !profiles.contains_key(&desired) {
         return Err(invalid_profile_error(&profiles));
     }
     // persist to the ignored runtime file (atomic, does not dirty orgs.json)
-    crate::ai::set_org_profile(&slug, &desired);
-    let effective = crate::ai::resolve_profile_for_org(&slug, None);
+    crate::ai::set_org_profile(&slug, &desired).await;
+    let effective = crate::ai::resolve_profile_for_org(&slug, None).await;
     Ok(Json(json!({
         "slug": slug,
         "ai_profile": if desired.is_empty() { Value::Null } else { Value::String(desired) },

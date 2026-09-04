@@ -7,9 +7,9 @@ use axum::http::header;
 use axum::http::HeaderMap;
 use base64::Engine;
 use once_cell::sync::OnceCell;
+use parking_lot::RwLock;
 use rand::RngCore;
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
@@ -62,7 +62,7 @@ pub fn login_limit(ip: &str) -> (bool, u64) {
     let window = env_u64("CTI_LOGIN_FAIL_WINDOW", 300).max(1);
     let retry = env_u64("CTI_LOGIN_RETRY_AFTER", 60).max(1);
 
-    let mut fails = login_fails().write().unwrap();
+    let mut fails = login_fails().write();
     // prune stale entries
     let keys: Vec<String> = fails.keys().cloned().collect();
     for key in keys {
@@ -89,7 +89,7 @@ pub fn login_limit(ip: &str) -> (bool, u64) {
 pub fn record_login_failure(ip: &str) {
     let now = now();
     let window = env_u64("CTI_LOGIN_FAIL_WINDOW", 300).max(1);
-    let mut fails = login_fails().write().unwrap();
+    let mut fails = login_fails().write();
     let vals: Vec<u64> = fails
         .get(ip)
         .cloned()
@@ -112,7 +112,7 @@ pub fn record_login_failure(ip: &str) {
 }
 
 pub fn reset_login_failures(ip: &str) {
-    let mut fails = login_fails().write().unwrap();
+    let mut fails = login_fails().write();
     fails.remove(ip);
 }
 
@@ -133,7 +133,7 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
 /// Mirrors Python `api_logout` (`_SESSIONS.pop(sid, None)`).
 pub fn invalidate_session(headers: &HeaderMap) {
     if let Some(sid) = cookie_token(headers) {
-        sessions().write().unwrap().remove(&sid);
+        sessions().write().remove(&sid);
     }
 }
 
@@ -141,12 +141,12 @@ pub fn invalidate_session(headers: &HeaderMap) {
 pub fn auth_ok(headers: &HeaderMap) -> bool {
     // (1) session cookie
     if let Some(sid) = cookie_token(headers) {
-        let exp = sessions().read().unwrap().get(&sid).copied();
+        let exp = sessions().read().get(&sid).copied();
         if let Some(exp) = exp {
             if now() <= exp {
                 return true;
             }
-            sessions().write().unwrap().remove(&sid);
+            sessions().write().remove(&sid);
         }
     }
     // (2) static API token (constant-time compare)
@@ -197,7 +197,7 @@ pub fn login_ok(headers: &HeaderMap) -> Option<String> {
     rand::thread_rng().fill_bytes(&mut buf);
     let sid = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
     let exp = now() + SESSION_TTL;
-    sessions().write().unwrap().insert(sid.clone(), exp);
+    sessions().write().insert(sid.clone(), exp);
     Some(sid)
 }
 

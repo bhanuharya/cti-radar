@@ -53,7 +53,7 @@ fn now_iso() -> String {
 
 /// Append an event to the in-memory ring and the persisted JSONL log.
 /// Failures are swallowed (logging must never break a request).
-pub fn log_event(level: &str, kind: &str, slug: &str, message: &str, job_id: Option<&str>) {
+pub async fn log_event(level: &str, kind: &str, slug: &str, message: &str, job_id: Option<&str>) {
     let ev = json!({
         "ts": now_iso(),
         "level": level,
@@ -71,15 +71,17 @@ pub fn log_event(level: &str, kind: &str, slug: &str, message: &str, job_id: Opt
     }
     if let Some(path) = LOG_FILE.get() {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            let _ = tokio::fs::create_dir_all(parent).await;
         }
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+        use tokio::io::AsyncWriteExt;
+        if let Ok(mut f) = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
+            .await
         {
-            let _ = writeln!(f, "{}", serde_json::to_string(&ev).unwrap_or_default());
+            let line = serde_json::to_string(&ev).unwrap_or_default() + "\n";
+            let _ = f.write_all(line.as_bytes()).await;
         }
     }
 }
@@ -87,7 +89,7 @@ pub fn log_event(level: &str, kind: &str, slug: &str, message: &str, job_id: Opt
 /// Read the ring: last `limit` entries, optional org filter, newest-first.
 /// Returns (events_newest_first, total_in_window). Mirrors Python
 /// `api_admin_logs`: `{"logs": logs[::-1], "total": len(logs)}`.
-pub fn read_logs(org: Option<&str>, limit: usize) -> (Vec<Value>, usize) {
+pub async fn read_logs(org: Option<&str>, limit: usize) -> (Vec<Value>, usize) {
     let lim = limit.clamp(1, 1000);
     let ring = logs().lock();
     let len = ring.len();
@@ -113,20 +115,20 @@ pub fn read_logs(org: Option<&str>, limit: usize) -> (Vec<Value>, usize) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_log_ring_newest_first_and_filter() {
+    #[tokio::test]
+    async fn test_log_ring_newest_first_and_filter() {
         let logs = logs();
         logs.lock().clear();
-        log_event("info", "scan", "a", "one", None);
-        log_event("info", "scan", "b", "two", None);
-        log_event("info", "scan", "a", "three", None);
-        let (all, total) = read_logs(None, 200);
+        log_event("info", "scan", "a", "one", None).await;
+        log_event("info", "scan", "b", "two", None).await;
+        log_event("info", "scan", "a", "three", None).await;
+        let (all, total) = read_logs(None, 200).await;
         assert_eq!(total, 3);
         assert_eq!(all[0].get("message").and_then(|v| v.as_str()), Some("three"));
-        let (fa, ta) = read_logs(Some("a"), 200);
+        let (fa, ta) = read_logs(Some("a"), 200).await;
         assert_eq!(ta, 2);
         assert_eq!(fa[0].get("message").and_then(|v| v.as_str()), Some("three"));
-        let (lim, _) = read_logs(None, 2);
+        let (lim, _) = read_logs(None, 2).await;
         assert_eq!(lim.len(), 2);
         logs.lock().clear();
     }

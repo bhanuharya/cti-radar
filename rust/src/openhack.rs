@@ -3,10 +3,10 @@
 //! explicit absolute CTI_OPENHACK_BIN (disposable-container wrapper) + exact
 //! target allowlist + time-bounded ROE. Never falls back to a PATH lookup.
 
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Mutex;
 
 /// Return the explicit absolute assessment executable, or None.
 pub fn openhack_bin() -> Option<String> {
@@ -118,9 +118,9 @@ static CACHE: Mutex<Option<ModelsCache>> = Mutex::new(None);
 
 /// Live model catalog from the OpenHack inference service (cached 10 min).
 /// On failure, falls back to a single default entry so the UI always works.
-pub fn list_models(force: bool) -> Value {
+pub async fn list_models(force: bool) -> Value {
     {
-        let guard = CACHE.lock().unwrap();
+        let guard = CACHE.lock();
         if !force {
             if let Some(c) = guard.as_ref() {
                 if c.data.is_some() && c.at.elapsed().map(|d| d.as_secs() < 600).unwrap_or(false) {
@@ -129,8 +129,8 @@ pub fn list_models(force: bool) -> Value {
             }
         }
     }
-    let result = list_models_live();
-    let mut guard = CACHE.lock().unwrap();
+    let result = list_models_live().await;
+    let mut guard = CACHE.lock();
     *guard = Some(ModelsCache {
         at: std::time::SystemTime::now(),
         data: Some(result.clone()),
@@ -138,31 +138,148 @@ pub fn list_models(force: bool) -> Value {
     result
 }
 
-fn list_models_live() -> Value {
+/// Preferred model when neither the request nor the org pins one
+/// (`CTI_OHACK_MODEL`, default `ox-alpha` — parity with Python).
+pub fn preferred_model() -> String {
+    let m = std::env::var("CTI_OHACK_MODEL").unwrap_or_default();
+    let m = m.trim();
+    if m.is_empty() {
+        "ox-alpha".to_string()
+    } else {
+        m.to_string()
+    }
+}
+
+/// Scratch dir for assessment runs (`CTI_OPENHACK_SCANS_DIR` or
+/// `~/.openhack/scans` — parity with Python).
+pub fn scans_dir() -> String {
+    let d = std::env::var("CTI_OPENHACK_SCANS_DIR").unwrap_or_default();
+    let d = d.trim();
+    if !d.is_empty() {
+        return d.to_string();
+    }
+    std::env::var("HOME")
+        .map(|h| format!("{}/.openhack/scans", h.trim_end_matches('/')))
+        .unwrap_or_else(|_| ".openhack/scans".to_string())
+}
+
+/// Quick-pass wall-clock budget in seconds (`CTI_OHACK_QUICK_BUDGET`,
+/// default 480, clamped 300-1200 — parity with Python).
+pub fn quick_budget() -> u64 {
+    std::env::var("CTI_OHACK_QUICK_BUDGET")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .map(|f| f as u64)
+        .unwrap_or(480)
+        .clamp(300, 1200)
+}
+
+fn model_fallback() -> Value {
+    json!({"models": [{"id": "default", "label": "default"}], "default": "default"})
+}
+
+/// Normalize a raw catalog into `{models, default, preferred}`: cap 60,
+/// truncate id/label, pin the preferred model first (parity with Python
+/// `list_models` post-processing).
+fn normalize_models(d: Value, preferred: &str) -> Value {
+    let default = d
+        .get("default")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut models: Vec<Value> = d
+        .get("models")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .take(60)
+        .filter_map(|m| {
+            let id = m.get("id").and_then(|v| v.as_str())?;
+            if id.is_empty() {
+                return None;
+            }
+            let label = m
+                .get("label")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(id);
+            Some(json!({
+                "id": id.chars().take(64).collect::<String>(),
+                "label": label.chars().take(80).collect::<String>(),
+            }))
+        })
+        .collect();
+    if models.is_empty() && !default.is_empty() {
+        models.push(json!({"id": default, "label": format!("{} (configured default)", default)}));
+    }
+    if !preferred.is_empty()
+        && !models
+            .iter()
+            .any(|m| m.get("id").and_then(|v| v.as_str()) == Some(preferred))
+    {
+        models.insert(
+            0,
+            json!({"id": preferred, "label": format!("{} \u{2014} unreleased GLM (recommended)", preferred)}),
+        );
+    }
+    models.sort_by_key(|m| {
+        if m.get("id").and_then(|v| v.as_str()) == Some(preferred) {
+            0
+        } else {
+            1
+        }
+    });
+    json!({"models": models, "default": default, "preferred": preferred})
+}
+
+async fn list_models_live() -> Value {
     // Shell out to the OpenHack Python inference service (disposable wrapper).
     let bin = match openhack_bin() {
         Some(b) => b,
-        None => {
-            return json!({"models": [{"id": "default", "label": "default"}], "default": "default"})
-        }
+        None => return model_fallback(),
     };
-    let child = std::process::Command::new(&bin)
+    let mut child = match tokio::process::Command::new(&bin)
         .arg("--list-models")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn();
-    let child = match child {
+        .spawn()
+    {
         Ok(c) => c,
-        Err(_) => {
-            return json!({"models": [{"id": "default", "label": "default"}], "default": "default"})
+        Err(_) => return model_fallback(),
+    };
+    // take the piped stdout first; `wait()` borrows the child so a timeout
+    // can still kill it (unlike `wait_with_output`, which moves it)
+    let stdout = child.stdout.take();
+    // bounded wait (20s): never hang a worker on a stuck helper
+    let exited = match tokio::time::timeout(std::time::Duration::from_secs(20), child.wait()).await
+    {
+        Ok(Ok(s)) => Some(s),
+        _ => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            None
         }
     };
-    let output = child.wait_with_output().ok();
-    match output.and_then(|o| String::from_utf8(o.stdout).ok()) {
-        Some(txt) => {
-            serde_json::from_str(&txt).unwrap_or_else(|_| json!({"models": [], "default": ""}))
-        }
-        None => json!({"models": [{"id": "default", "label": "default"}], "default": "default"}),
+    // the child has exited (or was killed): drain whatever it wrote
+    let mut buf = Vec::new();
+    if let Some(mut so) = stdout {
+        use tokio::io::AsyncReadExt;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), so.read_to_end(&mut buf))
+            .await;
+    }
+    match exited {
+        Some(s) if s.success() => match String::from_utf8(buf) {
+            Ok(txt) => {
+                // the binary may print logs: the catalog is the last line
+                let last = txt.lines().last().unwrap_or("").trim();
+                let d: Value =
+                    serde_json::from_str(last).unwrap_or_else(|_| json!({"models": [], "default": ""}));
+                normalize_models(d, &preferred_model())
+            }
+            Err(_) => model_fallback(),
+        },
+        _ => model_fallback(),
     }
 }
 

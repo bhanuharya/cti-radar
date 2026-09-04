@@ -7,9 +7,9 @@
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use once_cell::sync::OnceCell;
+use parking_lot::Mutex;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -71,7 +71,7 @@ pub fn try_acquire_job(slug: &str, kind: &str) -> (bool, Option<String>) {
     prune_jobs();
     let key = job_key(slug, kind);
     let prefix = format!("{}:", slug);
-    let mut table = jobs().lock().unwrap();
+    let mut table = jobs().lock();
 
     for (k, v) in table.entries.iter() {
         if k.starts_with(&prefix) && v.status == "running" {
@@ -133,7 +133,7 @@ pub fn release_job(
     result: Option<Value>,
 ) {
     let key = job_key(slug, kind);
-    let mut table = jobs().lock().unwrap();
+    let mut table = jobs().lock();
     if let Some(j) = table.entries.get_mut(&key) {
         if j.id == jid {
             j.status = if error.is_some() {
@@ -152,7 +152,7 @@ pub fn release_job(
 
 pub fn job_update(slug: &str, kind: &str, jid: &str, fields: Map<String, Value>) {
     let key = job_key(slug, kind);
-    let mut table = jobs().lock().unwrap();
+    let mut table = jobs().lock();
     if let Some(j) = table.entries.get_mut(&key) {
         if j.id != jid {
             return;
@@ -177,7 +177,7 @@ pub fn job_progress(slug: &str, kind: &str, jid: &str, stage: &str, message: &st
 
 pub fn is_job_running(slug: &str, kind: &str) -> bool {
     let key = job_key(slug, kind);
-    let table = jobs().lock().unwrap();
+    let table = jobs().lock();
     table
         .entries
         .get(&key)
@@ -187,14 +187,14 @@ pub fn is_job_running(slug: &str, kind: &str) -> bool {
 
 pub fn get_job(slug: &str, kind: &str, job_id: &str) -> Option<Job> {
     let key = job_key(slug, kind);
-    let table = jobs().lock().unwrap();
+    let table = jobs().lock();
     table.entries.get(&key).filter(|j| j.id == job_id).cloned()
 }
 
 /// Prune completed jobs older than the TTL.
 pub fn prune_jobs() {
     let now = now_f64();
-    let mut table = jobs().lock().unwrap();
+    let mut table = jobs().lock();
     table.entries.retain(|_, j| {
         if j.status == "running" {
             return true;
@@ -258,12 +258,12 @@ mod tests {
     }
 
     fn reset() {
-        *jobs().lock().unwrap() = JobTable::default();
+        *jobs().lock() = JobTable::default();
     }
 
     #[test]
     fn test_acquire_and_serialize() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock();
         init(test_cfg());
         reset();
         let (ok1, id1) = try_acquire_job("orgA", "scan");
@@ -280,7 +280,7 @@ mod tests {
 
     #[test]
     fn test_global_cap() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock();
         init(test_cfg());
         reset();
         let (ok1, id1) = try_acquire_job("a", "scan");

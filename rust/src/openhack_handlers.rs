@@ -69,7 +69,7 @@ pub async fn api_openhack_config(
         .unwrap_or("")
         .to_string();
     let path = cc::cfg_path_orgs_json();
-    cc::atomic_write_json(&path, &Value::Object(registry)).map_err(AppError::from)?;
+    cc::atomic_write_json(&path, &Value::Object(registry)).await.map_err(AppError::from)?;
     cc::reload_registry();
 
     crate::logs::log_event(
@@ -82,7 +82,7 @@ pub async fn api_openhack_config(
             if written_model.is_empty() { "default" } else { &written_model }
         ),
         None,
-    );
+    ).await;
     Ok(Json(
         json!({"slug": slug, "openhack_enabled": written_enabled, "openhack_model": written_model}),
     ))
@@ -156,7 +156,7 @@ pub async fn api_openhack_scan(
         &slug,
         &format!("openHack {} queued ({} domain(s))", mode, domains.len()),
         Some(&jid),
-    );
+    ).await;
 
     let (slug2, jid2, domains2, mode2) =
         (slug.clone(), jid.clone(), domains, mode.clone());
@@ -175,7 +175,7 @@ pub async fn api_openhack_scan(
                         mode2, added, graded
                     ),
                     Some(&jid2),
-                );
+                ).await;
             }
             None => {
                 crate::jobs::release_job(
@@ -191,7 +191,7 @@ pub async fn api_openhack_scan(
                     &slug2,
                     "openHack failed",
                     Some(&jid2),
-                );
+                ).await;
             }
         }
     });

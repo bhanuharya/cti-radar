@@ -161,7 +161,11 @@ pub async fn api_findings(
     let org = q.org.unwrap_or_else(|| DEFAULT_ORG.to_string());
     require_org(&org, &headers)?;
     let (fs, _) = cc::load_data(&org);
-    let mut out = cc::normalize_all_light(&fs, &org);
+    // rayon normalization runs on the blocking pool so tokio workers stay
+    // free for I/O while a large finding set is crunched
+    let mut out = tokio::task::spawn_blocking(move || cc::normalize_all_light(&fs, &org))
+        .await
+        .map_err(|_| AppError::Internal("normalization failed".into()))?;
     out = cc::sort_findings(out, q.sort.as_deref());
     // status filter
     if let Some(status) = q.status.as_deref() {
@@ -184,7 +188,7 @@ pub async fn api_dashboard(
 ) -> AppResult<Json<Value>> {
     let org = q.org.unwrap_or_else(|| DEFAULT_ORG.to_string());
     require_org(&org, &headers)?;
-    build_dashboard_payload(&org, q.sort.as_deref(), q.status.as_deref())
+    build_dashboard_payload(&org, q.sort.as_deref(), q.status.as_deref()).await
 }
 
 pub async fn api_org_dashboard(
@@ -194,17 +198,22 @@ pub async fn api_org_dashboard(
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
     require_org(&slug, &headers)?;
-    build_dashboard_payload(&slug, q.sort.as_deref(), q.status.as_deref())
+    build_dashboard_payload(&slug, q.sort.as_deref(), q.status.as_deref()).await
 }
 
-fn build_dashboard_payload(
+async fn build_dashboard_payload(
     org: &str,
     sort: Option<&str>,
     status: Option<&str>,
 ) -> AppResult<Json<Value>> {
     use serde_json::Map;
     let (fs, baseline) = cc::load_data(org);
-    let mut norm = cc::normalize_all_light(&fs, org);
+    let org_owned = org.to_string();
+    let fs_for_norm = fs.clone();
+    let mut norm =
+        tokio::task::spawn_blocking(move || cc::normalize_all_light(&fs_for_norm, &org_owned))
+            .await
+            .map_err(|_| AppError::Internal("normalization failed".into()))?;
     norm = cc::sort_findings(norm, sort);
     if let Some(status) = status {
         if status != "all" {
@@ -325,7 +334,7 @@ pub async fn api_admin_logs(
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
     crate::auth::require_auth(&headers)?;
-    let (logs, total) = crate::logs::read_logs(q.org.as_deref(), q.limit.unwrap_or(200));
+    let (logs, total) = crate::logs::read_logs(q.org.as_deref(), q.limit.unwrap_or(200)).await;
     Ok(Json(json!({"logs": logs, "total": total})))
 }
 
@@ -334,7 +343,7 @@ pub async fn api_ai_capabilities(
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
     crate::auth::require_auth(&headers)?;
-    Ok(Json(crate::ai::get_capabilities()))
+    Ok(Json(crate::ai::get_capabilities().await))
 }
 
 pub async fn api_get_ai_profile(
@@ -344,17 +353,17 @@ pub async fn api_get_ai_profile(
 ) -> AppResult<Json<Value>> {
     let org = require_org(&slug, &headers)?;
     // stored preference: runtime file first, legacy orgs.json ai_profile fallback
-    let stored = crate::ai::get_org_profile(&slug).or_else(|| {
+    let stored = crate::ai::get_org_profile(&slug).await.or_else(|| {
         org.get("ai_profile")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-    let effective = crate::ai::resolve_profile_for_org(&slug, None);
+    let effective = crate::ai::resolve_profile_for_org(&slug, None).await;
     Ok(Json(json!({
         "slug": slug,
         "ai_profile": stored,
         "effective": effective,
-        "capabilities": crate::ai::get_capabilities(),
+        "capabilities": crate::ai::get_capabilities().await,
     })))
 }
 
@@ -363,7 +372,12 @@ pub async fn api_openhack_models(
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
     crate::auth::require_auth(&headers)?;
-    Ok(Json(crate::openhack::list_models(false)))
+    if crate::openhack::openhack_bin().is_none() {
+        return Err(AppError::ServiceUnavailable(
+            "openhack binary not available".into(),
+        ));
+    }
+    Ok(Json(crate::openhack::list_models(false).await))
 }
 
 pub async fn api_report_pdf(
@@ -380,6 +394,14 @@ pub async fn api_report_pdf(
         None => return AppError::OrgNotFound(slug.clone()).into_response(),
     };
     let (fs, _) = cc::load_data(&slug);
+    // 413: too many findings for PDF (mirrors Python `_MAX_PDF_FINDINGS`)
+    if fs.len() > 500 {
+        return (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error": "too many findings for PDF", "max": 500, "count": fs.len()})),
+        )
+            .into_response();
+    }
     let domains: Vec<String> = org
         .get("domains")
         .and_then(|d| d.as_array())
@@ -401,22 +423,71 @@ pub async fn api_report_pdf(
         })
         .collect();
     let html = crate::report::build_report_html(&slug, &org, &nfs, &domains);
-
-    if let Some(chromium) = state.cfg.chromium_path.as_deref() {
-        if let Some(pdf) = crate::report::render_pdf(&slug, &html, chromium).await {
-            return ([(axum::http::header::CONTENT_TYPE, "application/pdf")], pdf).into_response();
+    // 413: report too large (mirrors Python `_MAX_PDF_HTML_SIZE` = 5 MiB)
+    if html.len() > 5 * 1024 * 1024 {
+        return (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error": "report too large", "max": 5 * 1024 * 1024})),
+        )
+            .into_response();
+    }
+    let chromium = match state.cfg.chromium_path.as_deref() {
+        Some(c) => c,
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Chromium not found; set CTI_CHROMIUM_PATH"})),
+            )
+                .into_response()
+        }
+    };
+    let _permit = match crate::report::try_acquire_pdf_slot() {
+        Some(p) => p,
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "PDF generation busy, try again"})),
+            )
+                .into_response()
+        }
+    };
+    match crate::report::render_pdf(&slug, &html, chromium).await {
+        crate::report::PdfOutcome::Pdf(pdf) => {
+            let mut resp =
+                (axum::http::StatusCode::OK, pdf).into_response();
+            let h = resp.headers_mut();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/pdf".parse().unwrap(),
+            );
+            h.insert(
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}-report.pdf\"", slug)
+                    .parse()
+                    .unwrap(),
+            );
+            resp
+        }
+        crate::report::PdfOutcome::TooLarge => (
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error": "PDF too large"})),
+        )
+            .into_response(),
+        // render failure -> printable HTML download (mirrors Python)
+        crate::report::PdfOutcome::Failed => {
+            let mut resp = (axum::http::StatusCode::OK, html).into_response();
+            let h = resp.headers_mut();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                "text/html; charset=utf-8".parse().unwrap(),
+            );
+            h.insert(
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}-report.html\"", slug)
+                    .parse()
+                    .unwrap(),
+            );
+            resp
         }
     }
-    // fallback: printable HTML download
-    (
-        [
-            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (
-                axum::http::header::CONTENT_DISPOSITION,
-                "attachment; filename=report.html",
-            ),
-        ],
-        html,
-    )
-        .into_response()
 }
