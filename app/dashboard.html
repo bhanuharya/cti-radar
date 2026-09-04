@@ -552,7 +552,7 @@ button:disabled{opacity:.45;cursor:wait;}
   <div class="login-card">
     <div class="login-brand"><div class="brandmark">R</div><h2>CTI <span class="accent">Radar</span></h2></div>
     <p class="login-sub">Sign in to manage workspaces, scans &amp; status</p>
-    <input id="login-user" type="text" autocomplete="username" placeholder="Username" value="cti_admin">
+    <input id="login-user" type="text" autocomplete="username" placeholder="Username" value="admin">
     <input id="login-pass" type="password" autocomplete="current-password" placeholder="Password">
     <div id="login-msg" class="stmsg"></div>
     <button id="login-btn" class="btn primary" type="button">Sign in</button>
@@ -642,12 +642,25 @@ button:disabled{opacity:.45;cursor:wait;}
         <button class="btn" id="ws-correlate" type="button">Correlate</button>
       </div>
       <div class="bgroup">
+        <span class="bcap">vulnerability lookup</span>
+        <select class="orgsel" id="vulnengine" aria-label="Vulnerability lookup engine" title="Passive reads existing fingerprints only; Nuclei is active and requires all server-side authorization gates">
+          <option value="passive" selected>Passive</option>
+          <option value="nuclei">Nuclei (active / gated)</option>
+        </select>
+        <select class="orgsel" id="vulnseverity" aria-label="Nuclei severity filter">
+          <option value="critical,high,medium" selected>Critical · High · Medium</option>
+          <option value="high,medium">High · Medium</option>
+          <option value="low,info">Low · Info</option>
+        </select>
+        <button class="btn" id="ws-vuln-scan" type="button" title="Passive uses stored fingerprints only. Nuclei never runs unless the server-side active authorization gate passes.">Vuln lookup</button>
+      </div>
+      <div class="bgroup">
         <span class="bcap">ai · openhack</span>
         <button class="btn" id="ws-grade" type="button" title="Re-grade existing OPEN findings (severity/impact) with the AI profile">AI grade</button>
         <button class="btn" id="ws-ohack-quick" type="button" title="OpenHack quick-pass (~8 min): verify OPEN findings, grade severity (verified full range / unverified ±1), enrich evidence">OpenHack quick</button>
         <button class="btn" id="ws-ohack-deep" type="button" title="OpenHack deep run: full agentic assessment of org domains (long-running)">OpenHack deep</button>
-        <select class="orgsel" id="ohmodel" aria-label="OpenHack model" title="Model used by OpenHack runs — ox-alpha is the recommended unreleased GLM channel">
-          <option value="ox-alpha">ox-alpha (recommended)</option>
+        <select class="orgsel" id="ohmodel" aria-label="OpenHack model" title="Model used by OpenHack runs — GLM 5.3 Flash is the verified catalog default">
+          <option value="glm-5.3-flash">GLM 5.3 Flash (recommended)</option>
         </select>
       </div>
       <div class="bgroup bgroup-wide">
@@ -977,7 +990,7 @@ function init() {
   stampAsOf();
   // running-job indicator: any in-flight job-status poll lights the nav dot
   const _origFetch = window.fetch.bind(window);
-  const _pollRe = /\/api\/orgs\/[^/]+\/(scan|recheck|correlate|ai-grade|openhack-scan)\/[A-Za-z0-9_.\-]+$/;
+  const _pollRe = /\/api\/orgs\/[^/]+\/(scan|recheck|correlate|ai-grade|openhack-scan|vuln-scan)\/[A-Za-z0-9_.\-]+$/;
   window.fetch = function(input, init) {
     try {
       const url = typeof input === 'string' ? input : (input && input.url) || '';
@@ -1168,6 +1181,7 @@ function init() {
     removeDomainChip(x.dataset.domain);
   });
   $('ws-scan').addEventListener('click', scanSelected);
+  $('ws-vuln-scan').addEventListener('click', vulnScanSelected);
   $('ws-recheck').addEventListener('click', recheckSelected);
   $('ws-correlate').addEventListener('click', correlateSelected);
   $('ws-grade').addEventListener('click', gradeSelected);
@@ -1439,6 +1453,58 @@ function scanSelected() {
   }).catch(() => setWsMsg('Scan failed (network error)', true));
 }
 
+function vulnScanSelected() {
+  const slug = currentOrg;
+  const engine = $('vulnengine').value === 'nuclei' ? 'nuclei' : 'passive';
+  const severity = String($('vulnseverity').value || '').split(',').filter(Boolean);
+  if (!slug) return;
+  const label = engine === 'nuclei' ? 'Nuclei active lookup (gated)' : 'Passive vulnerability lookup';
+  setWsMsg(label + ' on ' + slug + '…');
+  showJob('<div class="jhead">' + esc(label) + ' — ' + esc(slug) + '…</div><div>submitting job…</div>');
+  fetch('/api/orgs/' + encodeURIComponent(slug) + '/vuln-scan', {
+    method: 'POST', headers: authHeaders(), body: JSON.stringify({ engine, severity, refresh: false })
+  }).then((r) => r.json().then((body) => ({ ok: r.ok, body }))).then(({ ok, body }) => {
+    if (!ok) {
+      hideJob();
+      setWsMsg(label + ' denied/failed: ' + (body.error || 'error'), true);
+      loadLogs();
+      return;
+    }
+    pollVulnScan(slug, body.job_id, engine);
+  }).catch(() => {
+    hideJob();
+    setWsMsg(label + ' failed (network error)', true);
+    loadLogs();
+  });
+}
+
+function pollVulnScan(slug, jobId, engine, n) {
+  n = n || 0;
+  if (n >= 300) {
+    showJob(jobProgressHtml('Vulnerability lookup still running', { status: 'running', stage: 'timeout', progress: 'refresh later for job status' }));
+    return;
+  }
+  fetch('/api/orgs/' + encodeURIComponent(slug) + '/vuln-scan/' + encodeURIComponent(jobId))
+    .then((r) => r.json()).then((d) => {
+      if (d.status === 'done' || d.status === 'failed') {
+        if (d.status === 'done') {
+          showJob(jobProgressHtml((engine === 'nuclei' ? 'Nuclei' : 'Passive') + ' vulnerability lookup complete', d));
+          setWsMsg('Vulnerability lookup completed for ' + slug);
+        } else {
+          showJob(jobProgressHtml('Vulnerability lookup failed', d));
+          setWsMsg('Vulnerability lookup failed: ' + (d.error || 'error'), true);
+        }
+        refreshAll(); loadHistory(); loadLogs();
+      } else {
+        showJob(jobProgressHtml((engine === 'nuclei' ? 'Nuclei active' : 'Passive') + ' vulnerability lookup', d));
+        setTimeout(() => pollVulnScan(slug, jobId, engine, n + 1), 1500);
+      }
+    }).catch(() => {
+      showJob(jobProgressHtml('Vulnerability lookup status error', { status: 'failed', error: 'network error' }));
+      loadLogs();
+    });
+}
+
 function recheckSelected() {
   setWsMsg('Rechecking ' + currentOrg + ' (probe each finding\'s port)…');
   fetch('/api/orgs/' + encodeURIComponent(currentOrg) + '/recheck', {
@@ -1683,10 +1749,10 @@ function pollOhack(slug, jobId, mode, n) {
 function loadOhModels() {
   fetch('/api/openhack/models').then(r => r.json()).then(d => {
     if (!d || !d.models) return;
-    const pref = d.preferred || 'ox-alpha';
+    const pref = d.preferred || 'glm-5.3-flash';
     const models = d.models.slice();
     if (!models.some(m => m.id === pref))
-      models.unshift({ id: pref, label: pref + ' — unreleased GLM (recommended)' });
+      models.unshift({ id: pref, label: pref + ' — verified catalog default (recommended)' });
     const sel = $('ohmodel');
     const pinned = sel.dataset.orgModel || '';
     // default choice = org pin, else the preferred runnable model

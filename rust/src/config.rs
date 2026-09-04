@@ -148,7 +148,7 @@ impl Config {
             openhack_model: {
                 let m = env_str("CTI_OHACK_MODEL");
                 if m.trim().is_empty() {
-                    "ox-alpha".to_string()
+                    "glm-5.3-flash".to_string()
                 } else {
                     m.trim().to_string()
                 }

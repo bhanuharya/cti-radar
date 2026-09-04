@@ -36,6 +36,7 @@ sha2 = "0.10"
 subtle = "2"          # constant-time comparison (API token auth)
 base64 = "0.22"
 rand = "0.8"
+libc = "0.2"          # process-group termination for bounded active Nuclei runs
 
 # concurrency
 parking_lot = "0.12"

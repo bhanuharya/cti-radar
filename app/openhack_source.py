@@ -157,10 +157,9 @@ def _spawn_argv(objective, scratch_dir, model=None):
     return [_venv_python(), "-c", _RUN_SHIM, objective, scratch_dir, str(model)]
 
 
-# Preferred model when neither the request nor the org pins one. The hosted
-# catalog's nominal default may be a model the account cannot run; ox-alpha
-# is the proven-working unreleased GLM channel.
-OHACK_PREFERRED_MODEL = os.environ.get("CTI_OHACK_MODEL", "ox-alpha")
+# Preferred model when neither the request nor the org pins one. GLM 5.3 Flash
+# is verified in the live OpenHack inference catalog.
+OHACK_PREFERRED_MODEL = os.environ.get("CTI_OHACK_MODEL", "glm-5.3-flash")
 
 
 def quick_budget():

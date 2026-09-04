@@ -416,6 +416,7 @@ dependencies = [
  "futures",
  "hickory-resolver",
  "http-body-util",
+ "libc",
  "once_cell",
  "parking_lot",
  "rand 0.8.8",

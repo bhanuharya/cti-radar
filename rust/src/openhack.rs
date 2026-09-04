@@ -138,16 +138,22 @@ pub async fn list_models(force: bool) -> Value {
     result
 }
 
-/// Preferred model when neither the request nor the org pins one
-/// (`CTI_OHACK_MODEL`, default `ox-alpha` — parity with Python).
-pub fn preferred_model() -> String {
-    let m = std::env::var("CTI_OHACK_MODEL").unwrap_or_default();
-    let m = m.trim();
+/// Resolve the configured model or the verified OpenHack catalog default.
+/// Kept pure so the fallback is deterministic under test.
+fn preferred_model_from(configured: Option<&str>) -> String {
+    let m = configured.unwrap_or("").trim();
     if m.is_empty() {
-        "ox-alpha".to_string()
+        "glm-5.3-flash".to_string()
     } else {
         m.to_string()
     }
+}
+
+/// Preferred model when neither the request nor the org pins one
+/// (`CTI_OHACK_MODEL`, default `glm-5.3-flash` — parity with Python).
+pub fn preferred_model() -> String {
+    let configured = std::env::var("CTI_OHACK_MODEL").ok();
+    preferred_model_from(configured.as_deref())
 }
 
 /// Scratch dir for assessment runs (`CTI_OPENHACK_SCANS_DIR` or
@@ -300,5 +306,10 @@ mod tests {
         assert!(!is_valid_domain("not a domain"));
         assert!(!is_valid_domain("*.example.com"));
         assert!(!is_valid_domain("192.168.1.1"));
+    }
+
+    #[test]
+    fn preferred_model_uses_glm_flash_when_unset() {
+        assert_eq!(preferred_model_from(None), "glm-5.3-flash");
     }
 }

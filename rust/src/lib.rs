@@ -16,6 +16,8 @@ pub mod openhack;
 pub mod openhack_handlers;
 pub mod report;
 pub mod scanner;
+pub mod vuln_handlers;
+pub mod vuln_scan;
 
 use axum::extract::Request;
 use axum::http::HeaderValue;
@@ -83,6 +85,7 @@ pub fn build_router(state: AppState) -> Router {
     use handlers as h;
     use handlers_mut as hm;
     use openhack_handlers as oh;
+    use vuln_handlers as vh;
 
     Router::new()
         // dashboard + static
@@ -113,6 +116,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/orgs", get(h::api_orgs))
         .route("/api/admin/logs", get(h::api_admin_logs))
         .route("/api/ai/capabilities", get(h::api_ai_capabilities))
+        .route("/api/vuln/engines", get(vh::api_vuln_engines))
         .route("/api/openhack/models", get(h::api_openhack_models))
         .route("/api/orgs/{slug}/ai_profile", get(h::api_get_ai_profile))
         .route("/api/findings/{id}", get(h::api_finding_detail))
@@ -124,6 +128,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/orgs/register", post(hm::api_org_register))
         .route("/api/orgs/{slug}/scan", post(hm::api_org_scan))
         .route("/api/orgs/{slug}/scan/{job_id}", get(hm::api_scan_status))
+        .route("/api/orgs/{slug}/vuln-scan", post(vh::api_org_vuln_scan))
+        .route(
+            "/api/orgs/{slug}/vuln-scan/{job_id}",
+            get(vh::api_vuln_scan_status),
+        )
         .route("/api/orgs/{slug}/recheck", post(hm::api_org_recheck))
         .route(
             "/api/orgs/{slug}/recheck/{job_id}",

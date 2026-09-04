@@ -80,6 +80,9 @@ fn setup() -> AppState {
         std::env::set_var("CTI_SCAN_TOKEN", TOKEN);
         std::env::set_var("CTI_DATA_DIR", &dir);
         std::env::set_var("CTI_AI_CONFIG_FILE", dir.join("no-ai-config.json"));
+        // The test contract is no configured AI profile. Do not inherit a
+        // developer's optional Cline compatibility credential from the host.
+        std::env::remove_var("HERMES_CUSTOM_API_CLINE_BOT_API_KEY");
         let cfg = cti_radar::config::Config::load();
         cti_radar::correlation::init(cfg.clone());
         cti_radar::auth::init(cfg.clone());
@@ -405,7 +408,7 @@ async fn test_openhack_models_no_binary() {
 async fn test_openhack_config_shape() {
     let (s, v) = post(
         "/api/orgs/lifeorg/openhack-config",
-        json!({"enabled": true, "model": "ox-alpha"}),
+        json!({"enabled": true, "model": "glm-5.3-flash"}),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
@@ -432,6 +435,12 @@ async fn test_static_and_security_headers() {
     let req = Request::builder().uri("/static/vis-network.min.js").body(Body::empty()).unwrap();
     let resp = app().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+    let resp = app().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 2 * 1024 * 1024).await.unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(html.contains("value=\"glm-5.3-flash\""));
+    assert!(!html.contains("ox-alpha"));
 }
 
 #[tokio::test]
