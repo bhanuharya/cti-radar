@@ -425,6 +425,10 @@ async fn test_static_and_security_headers() {
     let h = resp.headers();
     assert_eq!(h.get("x-content-type-options").and_then(|v| v.to_str().ok()), Some("nosniff"));
     assert_eq!(h.get("x-frame-options").and_then(|v| v.to_str().ok()), Some("DENY"));
+    // dashboard must be served as HTML (mirrors Python HTMLResponse),
+    // otherwise browsers render it as plain text
+    let ct = h.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+    assert!(ct.starts_with("text/html"), "got {}", ct);
     let req = Request::builder().uri("/static/vis-network.min.js").body(Body::empty()).unwrap();
     let resp = app().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

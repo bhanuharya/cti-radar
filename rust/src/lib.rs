@@ -91,7 +91,7 @@ pub fn build_router(state: AppState) -> Router {
             get(|| async {
                 (
                     [(axum::http::header::CACHE_CONTROL, "no-cache")],
-                    DASHBOARD_HTML,
+                    axum::response::Html(DASHBOARD_HTML),
                 )
             }),
         )
