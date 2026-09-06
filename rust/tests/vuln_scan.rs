@@ -123,7 +123,7 @@ fn nuclei_jsonl_filters_scope_caps_severity_and_builds_safe_argv() {
         json!({"template-id": "safe", "matched-at": "https://127.0.0.1/x", "info": {"name": "raw ip"}}).to_string(),
         "not-json".into(),
     ].join("\n");
-    let findings = parse_jsonl(&lines, "acme", &["example.com".into()]);
+    let findings = parse_jsonl(&lines, "acme", &["example.com".into()]).expect("bounded input");
     assert_eq!(findings.len(), 1);
     let finding = &findings[0];
     assert_eq!(finding["severity"], "HIGH");
@@ -168,7 +168,39 @@ fn nuclei_parser_caps_processed_events_not_only_valid_findings() {
     );
     assert!(
         cti_radar::vuln_scan::parse_jsonl(&lines.join("\n"), "acme", &["example.com".into()])
+            .expect("bounded input")
             .is_empty()
+    );
+}
+
+#[test]
+fn nuclei_parser_rejects_oversized_output_with_error() {
+    use cti_radar::vuln_scan::{parse_jsonl, MAX_OUTPUT_BYTES};
+    let oversized = "x".repeat(MAX_OUTPUT_BYTES + 1);
+    assert_eq!(
+        parse_jsonl(&oversized, "acme", &["example.com".into()]).unwrap_err(),
+        "nuclei output exceeded 10MiB limit"
+    );
+}
+
+#[test]
+fn nuclei_runner_target_honors_only_common_web_ports() {
+    use cti_radar::vuln_scan::canonical_runner_target;
+    // 8080 is an allowlisted web port and is kept.
+    assert_eq!(
+        canonical_runner_target(
+            "app.example.com",
+            &json!({"url": "http://app.example.com:8080/"})
+        ),
+        "http://app.example.com:8080"
+    );
+    // A fingerprint pointing at 22 (SSH) must not aim active probes there.
+    assert_eq!(
+        canonical_runner_target(
+            "app.example.com",
+            &json!({"url": "https://app.example.com:22/"})
+        ),
+        "https://app.example.com"
     );
 }
 

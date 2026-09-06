@@ -28,9 +28,12 @@ pub struct VulnScanBody {
 pub async fn api_vuln_engines(headers: HeaderMap) -> AppResult<Json<Value>> {
     crate::auth::require_auth(&headers)?;
     let gate = vuln_scan::active_gate_from_env();
+    // Status reports a generic reason only — gate specifics (ROE expiry,
+    // domain scope shape) would disclose authorization state to any session.
+    // The specific denial is still returned when a nuclei job is attempted.
     let (nuclei_available, nuclei_reason) =
-        if let Some(error) = vuln_scan::active_gate_setup_error(&gate, chrono::Utc::now()) {
-            (false, error)
+        if vuln_scan::active_gate_setup_error(&gate, chrono::Utc::now()).is_some() {
+            (false, "active engine disabled by configuration".to_string())
         } else {
             match vuln_scan::nuclei_runtime_from_env() {
                 Ok(_) => (
@@ -38,7 +41,10 @@ pub async fn api_vuln_engines(headers: HeaderMap) -> AppResult<Json<Value>> {
                     "authorized runtime configured; organization scope is checked per request"
                         .to_string(),
                 ),
-                Err(error) => (false, error),
+                Err(_) => (
+                    false,
+                    "active engine disabled: runner runtime not configured".to_string(),
+                ),
             }
         };
     Ok(Json(json!({

@@ -358,7 +358,11 @@ fn host_in_registered_scope(host: &str, domains: &[String]) -> bool {
 }
 
 /// Stored fingerprint URLs are evidence only. The active runner target is
-/// always rebuilt from the already-approved hostname.
+/// always rebuilt from the already-approved hostname. Ports other than the
+/// scheme default are honored only when they are common web ports, so a
+/// poisoned fingerprint cannot aim active probes at non-HTTP services.
+pub const RUNNER_WEB_PORTS: [u16; 6] = [80, 443, 8000, 8080, 8443, 8888];
+
 pub fn canonical_runner_target(host: &str, snippet: &Value) -> String {
     let host = host.trim().trim_end_matches('.').to_lowercase();
     let mut scheme = "https";
@@ -383,7 +387,7 @@ pub fn canonical_runner_target(host: &str, snippet: &Value) -> String {
                 };
                 let default_port = if scheme == "https" { 443 } else { 80 };
                 if let Some(candidate) = url.port() {
-                    if candidate != default_port {
+                    if candidate != default_port && RUNNER_WEB_PORTS.contains(&candidate) {
                         port = Some(candidate);
                     }
                 }
@@ -613,10 +617,10 @@ pub fn map_event(slug: &str, event: &Value, domains: &[String]) -> Option<Value>
 }
 
 /// Bounded in-memory JSONL parser. Oversized output is rejected as degraded
-/// input rather than partially trusted.
-pub fn parse_jsonl(contents: &str, slug: &str, domains: &[String]) -> Vec<Value> {
+/// input with an error rather than silently parsed as "no matches".
+pub fn parse_jsonl(contents: &str, slug: &str, domains: &[String]) -> Result<Vec<Value>, String> {
     if contents.len() > MAX_OUTPUT_BYTES {
-        return Vec::new();
+        return Err("nuclei output exceeded 10MiB limit".to_string());
     }
     let mut findings = Vec::new();
     let mut events_seen = 0usize;
@@ -637,7 +641,7 @@ pub fn parse_jsonl(contents: &str, slug: &str, domains: &[String]) -> Vec<Value>
             findings.push(finding);
         }
     }
-    findings
+    Ok(findings)
 }
 
 fn effective_exclude_tags(config: &NucleiConfig) -> Vec<String> {
@@ -787,6 +791,21 @@ fn terminate_child_group(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// Bounded first 8 KiB of the captured runner stderr, for job error detail.
+fn bounded_stderr(path: &std::path::Path) -> String {
+    use std::io::Read;
+    let mut buffer = Vec::new();
+    if let Ok(mut file) = std::fs::File::open(path) {
+        let _ = file.take(8192).read_to_end(&mut buffer);
+    }
+    let text = String::from_utf8_lossy(&buffer);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!(": {}", trimmed.chars().take(2000).collect::<String>())
+}
+
 /// Run a pre-authorized local Nuclei binary. This function contains no target
 /// discovery; callers must pass canonical, registered-domain URLs only.
 pub fn run_nuclei_blocking(
@@ -802,13 +821,20 @@ pub fn run_nuclei_blocking(
     let result = (|| {
         let targets_file = work_dir.join("targets.txt");
         let output_file = work_dir.join("out.jsonl");
+        let stderr_file = work_dir.join("stderr.log");
         write_private_targets(&targets_file, targets)?;
         let argv = build_argv(config, &targets_file, &output_file, severity, tags);
+        let stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&stderr_file)
+            .map_err(|_| "cannot stage nuclei stderr".to_string())?;
         let mut command = std::process::Command::new(&argv[0]);
         command.args(&argv[1..]);
         command.stdin(std::process::Stdio::null());
         command.stdout(std::process::Stdio::null());
-        command.stderr(std::process::Stdio::null());
+        command.stderr(stderr);
         // Keep explicitly resolved executable/template paths but do not allow
         // ambient proxy variables to redirect active traffic.
         command.env_clear();
@@ -855,7 +881,11 @@ pub fn run_nuclei_blocking(
         // Accept that code only when it produced bounded JSONL; every other
         // non-zero exit remains a job failure.
         if !status.success() && status.code() != Some(1) {
-            return Err(format!("nuclei exited {}", status.code().unwrap_or(-1)));
+            return Err(format!(
+                "nuclei exited {}{}",
+                status.code().unwrap_or(-1),
+                bounded_stderr(&stderr_file)
+            ));
         }
         let metadata = output_file
             .metadata()
@@ -864,7 +894,7 @@ pub fn run_nuclei_blocking(
             return Err("nuclei output exceeded 10MiB limit".to_string());
         }
         let output = std::fs::read_to_string(&output_file)
-            .map_err(|_| "nuclei output unreadable".to_string())?;
+            .map_err(|_| format!("nuclei output unreadable{}", bounded_stderr(&stderr_file)))?;
         Ok(output)
     })();
     let _ = std::fs::remove_dir_all(&work_dir);
@@ -1238,7 +1268,7 @@ pub async fn run_active_nuclei_lookup(
     })
     .await
     .map_err(|_| "nuclei runner task failed".to_string())??;
-    let candidates = parse_jsonl(&output, slug, &domains);
+    let candidates = parse_jsonl(&output, slug, &domains)?;
     let _guard = crate::correlation::org_write_lock(slug).await;
     let (path, mut doc) = load_findings_document(slug).await?;
     let existing = doc
