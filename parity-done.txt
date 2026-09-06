@@ -1,0 +1,13 @@
+Slice-1 parity fix complete.
+
+Changed files:
+- rust/src/error.rs: added Forbidden(403), ServiceUnavailable(503); TooManyRequests(u64)->TooManyRequests(String) with TOO_MANY_REQUESTS JSON body; new UnknownJob{slug,kind,job_id}->404 with {error:"unknown job",job_id,slug,kind}; new Busy{error,slug,job_id}->409 (org owns running job) / 429 (global cap) with {error,slug,job_id}. Conflict/409 kept for register/domain conflicts.
+- rust/src/jobs.rs: job_status() now returns AppResult<Value>, unknown job id -> 404 (was 200 {status:unknown}); dropped dead `running` param; added max_active_jobs() accessor.
+- rust/src/handlers.rs: GET /api/orgs -> {"orgs":[...]}; GET /api/findings -> {"findings_total":n,"findings":[...]}; dashboard full envelope {org,summary,graph,fleet,ips,findings:{findings_total,findings},history,scan_info} with fleet/ips/history/scan_info now populated (scan_info null when meta has no date); GET /api/findings/{id} -> {"org", "finding"}.
+- rust/src/handlers_mut.rs: busy cap now 429 via job_busy_error() helper (per-org running stays 409); scan body Option<Json<ScanBody>> (empty/missing body proceeds, ScanBody derives Default); no unwrap() on external-input paths (findings f.as_object_mut(), org_findings_path -> Internal error).
+- rust/src/openhack_handlers.rs: gates now 403 (not opted-in, authorization denied) / 503 (binary missing) in Python order; busy cap -> 429; body Option<Json<OpenhackScanBody>> + invalid model id -> 400; response adds "mode".
+- rust/src/main.rs: /static/* served via ServeDir("../app/static"); Cargo.toml tower-http added "fs" feature.
+
+Test tail:
+running 23 tests
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s

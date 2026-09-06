@@ -810,7 +810,7 @@ def api_org_openhack_scan(slug: str, body: OpenhackScanBody = None,
         return JSONResponse({"error": "invalid model id"}, status_code=400)
     model = (model
              or (cc.org_get(slug) or {}).get("openhack_model")
-             or oh.OHACK_PREFERRED_MODEL)   # ox-alpha: proven runnable default
+             or oh.OHACK_PREFERRED_MODEL)   # verified OpenHack GLM default
     org = cc.org_get(slug)
     if org is None:
         return _org_not_found(slug)
@@ -923,6 +923,125 @@ def api_set_ai_profile(slug: str, body: AiProfileBody, req: Request):
     ai_providers.set_org_profile(slug, desired)
     effective = ai_providers.resolve_profile_for_org(slug)
     return {"slug": slug, "ai_profile": desired or None, "effective": effective}
+
+
+# --------------------------------------------------------------------------
+# AI model config (generic, no presets) — additive file management
+# --------------------------------------------------------------------------
+class AiProviderBody(BaseModel):
+    name: str = ""
+    provider: str = ""
+    base_url: str = ""
+    model: str = ""
+    api_key_env: str = ""
+    timeout: int = 90
+    max_hosts: int = 10
+    max_tokens: int = 1024
+    options: dict = {}
+    cap_retry: bool = True
+
+
+class AiDefaultBody(BaseModel):
+    profile: str = ""
+
+
+class AiTestBody(BaseModel):
+    profile: str = ""
+
+
+def _ai_profile_payload(body: AiProviderBody) -> dict:
+    raw = {
+        "provider": (body.provider or "").strip(),
+        "base_url": (body.base_url or "").strip(),
+        "model": (body.model or "").strip(),
+        "api_key_env": (body.api_key_env or "").strip(),
+        "timeout": body.timeout if body.timeout is not None else 90,
+        "max_hosts": body.max_hosts if body.max_hosts is not None else 10,
+        "max_tokens": body.max_tokens if body.max_tokens is not None else 1024,
+        "options": body.options if isinstance(body.options, dict) else {},
+        "cap_retry": bool(body.cap_retry) if body.cap_retry is not None else True,
+    }
+    # drop empty api_key_env so ollama/local profiles stay keyless
+    if not raw["api_key_env"]:
+        raw.pop("api_key_env", None)
+    return raw
+
+
+@app.get("/api/ai/profiles")
+def api_ai_profiles(req: Request = None):
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return ai_providers.get_profiles_for_edit()
+
+
+@app.post("/api/ai/profiles")
+def api_ai_profiles_create(body: AiProviderBody, req: Request = None):
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    name = (body.name or "").strip().lower()
+    if not name:
+        return JSONResponse({"error": "name is required (^[a-z0-9-]{1,32}$)"}, status_code=400)
+    ok, info = ai_providers.save_profile(name, _ai_profile_payload(body))
+    if not ok:
+        return JSONResponse({"error": str(info)}, status_code=400)
+    _log_event("info", "system", "-", f"ai profile saved ({name})")
+    return {"ok": True, "profile": name, "detail": info,
+            "profiles": ai_providers.get_profiles_for_edit()}
+
+
+@app.put("/api/ai/profiles/{name}")
+def api_ai_profiles_update(name: str, body: AiProviderBody, req: Request = None):
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    slug_name = (name or "").strip().lower()
+    body_name = (body.name or "").strip().lower()
+    # allow empty body.name (path wins) but reject renames via mismatch
+    if body_name and body_name != slug_name:
+        return JSONResponse({"error": "name mismatch between path and body"}, status_code=400)
+    ok, info = ai_providers.save_profile(slug_name, _ai_profile_payload(body))
+    if not ok:
+        return JSONResponse({"error": str(info)}, status_code=400)
+    _log_event("info", "system", "-", f"ai profile updated ({slug_name})")
+    return {"ok": True, "profile": slug_name, "detail": info,
+            "profiles": ai_providers.get_profiles_for_edit()}
+
+
+@app.delete("/api/ai/profiles/{name}")
+def api_ai_profiles_delete(name: str, req: Request = None):
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    ok, info = ai_providers.delete_profile(name)
+    if not ok:
+        return JSONResponse({"error": str(info)}, status_code=400)
+    _log_event("info", "system", "-", f"ai profile deleted ({name})")
+    return {"ok": True, "detail": info,
+            "profiles": ai_providers.get_profiles_for_edit()}
+
+
+@app.post("/api/ai/default")
+def api_ai_default(body: AiDefaultBody, req: Request = None):
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    profile = (body.profile or "").strip().lower()
+    if not profile:
+        return JSONResponse({"error": "profile is required"}, status_code=400)
+    ok, info = ai_providers.set_default_profile(profile)
+    if not ok:
+        return JSONResponse({"error": str(info)}, status_code=400)
+    _log_event("info", "system", "-", f"ai default profile set ({profile})")
+    return {"ok": True, "detail": info,
+            "profiles": ai_providers.get_profiles_for_edit()}
+
+
+@app.post("/api/ai/test")
+def api_ai_test(body: AiTestBody = None, req: Request = None):
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    profile = str(getattr(body, "profile", "") or "").strip() if body else ""
+    ok, info = ai_providers.test_profile(profile or None)
+    if not ok:
+        return JSONResponse({"ok": False, "detail": info}, status_code=502)
+    return {"ok": True, "detail": info}
 
 
 # --------------------------------------------------------------------------
@@ -1324,6 +1443,125 @@ def api_scan_status(slug: str, job_id: str, req: Request = None):
         return err
     running = _is_job_running(slug, "scan")
     return _job_status(slug, "scan", job_id, running)
+
+
+# --------------------------------------------------------------------------
+# host-based vuln lookup (passive default, active gated)
+# --------------------------------------------------------------------------
+class VulnScanBody(BaseModel):
+    targets: list = []
+    checks: list = []
+    refresh: bool = True
+    include_nvd: bool = False
+    active: bool = False
+    engine: str = "passive"
+    nuclei_severity: list = []
+    nuclei_tags: list = []
+
+
+@app.get("/api/vuln/engines")
+def api_vuln_engines(req: Request = None):
+    """Availability + defaults for vuln engines (passive always on)."""
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    import nuclei_scan as _nuc
+    return {"passive": {"available": True, "checks": ["cve", "version", "headers", "tls", "login"]},
+            "nuclei": _nuc.engine_status()}
+
+
+@app.post("/api/orgs/{slug}/vuln-scan")
+def api_org_vuln_scan(slug: str, body: VulnScanBody = None, req: Request = None):
+    """Host-scoped vuln lookup over stored fingerprints (passive by default).
+
+    targets: subset of org hosts (default: all fingerprinted, max 20).
+    checks: subset of cve|version|headers|tls|login (default cve,version,headers,tls).
+    refresh: re-fingerprint requested hosts missing data (same traffic as a scan).
+    include_nvd: enrich CVE matches via cached NVD (fail-open, capped).
+    active: light banner re-check on findings' own IP/port — gated by
+      CTI_VULN_ACTIVE=1, CTI_VULN_ISOLATED=1, CTI_VULN_ALLOWED_DOMAINS (exact),
+      CTI_VULN_ROE_EXPIRES (unexpired). Denied fail-closed with 403 + no network.
+    engine: passive (default) or nuclei (template probes; requires the same
+      active gate + nuclei binary/templates). nuclei_severity/tags optionally
+      narrow the template set (validated server-side, dos/fuzz always excluded).
+    """
+    if not _auth_ok(req):
+        return JSONResponse({"error": "unauthorized: missing or bad credentials (username/password)"},
+                            status_code=401)
+    if not _valid_slug(slug):
+        return JSONResponse({"error": "invalid slug"}, status_code=400)
+    org = cc.org_get(slug)
+    if org is None:
+        return _org_not_found(slug)
+    targets = [str(t or "").strip() for t in (getattr(body, "targets", []) or []) if str(t or "").strip()][:20]
+    checks = [str(c or "").strip().lower() for c in (getattr(body, "checks", []) or [])][:10]
+    refresh = bool(getattr(body, "refresh", True)) if body else True
+    include_nvd = bool(getattr(body, "include_nvd", False)) if body else False
+    active = bool(getattr(body, "active", False)) if body else False
+    engine = str(getattr(body, "engine", "passive") or "passive").strip().lower() if body else "passive"
+    if engine not in ("passive", "nuclei"):
+        return JSONResponse({"error": "invalid engine (passive|nuclei)"}, status_code=400)
+    nuclei_severity = [str(s or "").strip().lower() for s in (getattr(body, "nuclei_severity", []) or [])][:6]
+    nuclei_tags = [str(t or "").strip().lower() for t in (getattr(body, "nuclei_tags", []) or [])][:20]
+    if active or engine == "nuclei":
+        import vuln_scan as _vs
+        gate = _vs._vuln_active_authorization_error(dict(org, slug=slug))
+        if gate:
+            return JSONResponse({"error": "active assessment denied: " + gate}, status_code=403)
+    if engine == "nuclei":
+        import nuclei_scan as _nuc
+        _sev, _tags, _err = _nuc.normalize_options(nuclei_severity or None, nuclei_tags or None)
+        if _err:
+            return JSONResponse({"error": _err}, status_code=400)
+        _st = _nuc.engine_status()
+        if not _st["available"]:
+            return JSONResponse({"error": "nuclei engine unavailable: " + _st["reason"]},
+                                status_code=503)
+    ok, jid = _try_acquire_job(slug, "vuln")
+    if not ok:
+        return _job_busy_response(slug, "vuln", jid)
+    _log_event("info", "vuln", slug,
+               f"vuln lookup queued ({len(targets) or 'all'} target(s), engine={engine}, active={int(active)})",
+               job_id=jid)
+
+    def _on_progress(stage, message):
+        _job_progress(slug, "vuln", jid, stage, message)
+
+    def _vuln_wrap():
+        try:
+            import vuln_scan as _vs
+            result = _vs.vuln_scan_org(slug, targets=targets or None,
+                                       checks=checks or None, refresh=refresh,
+                                       include_nvd=include_nvd, active=active,
+                                       engine=engine,
+                                       nuclei_severity=nuclei_severity or None,
+                                       nuclei_tags=nuclei_tags or None,
+                                       on_progress=_on_progress)
+            err = _structured_job_failure(result)
+            if err or result.get("error"):
+                msg = result.get("error") or err
+                _release_job(slug, "vuln", jid, error=msg, result=result)
+                _log_event("error", "vuln", slug, f"vuln lookup failed: {msg}", job_id=jid)
+            else:
+                _release_job(slug, "vuln", jid, result=result)
+                _log_event("info", "vuln", slug,
+                           f"vuln lookup completed ({result.get('new_findings', 0)} new)", job_id=jid)
+        except Exception as e:
+            _release_job(slug, "vuln", jid, error=e)
+            _log_event("error", "vuln", slug, f"vuln lookup failed: {e}", job_id=jid)
+
+    _executor.submit(_vuln_wrap)
+    return {"queued": True, "slug": slug, "job_id": jid, "targets": targets,
+            "checks": checks or ["cve", "version", "headers", "tls"],
+            "engine": engine, "active": active}
+
+
+@app.get("/api/orgs/{slug}/vuln-scan/{job_id}")
+def api_vuln_status(slug: str, job_id: str, req: Request = None):
+    err, _ = _require_org(slug, req)
+    if err:
+        return err
+    running = _is_job_running(slug, "vuln")
+    return _job_status(slug, "vuln", job_id, running)
 
 
 class GradeBody(BaseModel):

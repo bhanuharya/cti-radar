@@ -16,7 +16,9 @@ visualize its findings — no hardcoding to one company.
 > footprint. Scanning is **passive / non-intrusive by default** (certificate
 > transparency — crt.name / crt.sh / certspotter / hackertarget — plus DNS
 > resolution, HTTP header probe, a TCP connect scan of common service ports, and
-> InternetDB enrichment). Use it only on infrastructure you own or are explicitly
+> InternetDB enrichment). Active probing (Nuclei templates, OpenHack) is
+> deny-by-default and additionally gated behind `CTI_VULN_*` / `CTI_OPENHACK_*`
+> authorization. Use it only on infrastructure you own or are explicitly
 > authorized to test.
 
 ---
@@ -32,6 +34,16 @@ visualize its findings — no hardcoding to one company.
 - **OpenHack active assessment (separate from passive CTI scans)** — the
   `/openhack-scan` endpoint is fail-closed behind a server-level operator gate,
   exact target allowlist, and time-bounded ROE.
+- **Model config without JSON** — dashboard **models** section (add/edit/test/
+  delete, generic fields), single-profile `CTI_AI_*` env, or
+  `python -m app.ai_setup --wizard`. All additive: existing profiles and the
+  default are preserved; keys stay in server env. The AI scan option names its
+  exact blocker (e.g. which key env is missing) instead of failing silently.
+- **Host vuln lookup** — `Vuln scan` (org-wide) or `vuln: this host` reuses stored
+  fingerprints: offline CVE map + version/header/TLS/login audit, passive by
+  default. Optional **Nuclei engine** (`engine: nuclei`, fail-closed behind the
+  `CTI_VULN_*` gate) runs community templates over in-scope URLs; findings are
+  `NUCLEI-MATCHED`, capped at HIGH, `dos`/`fuzz` always excluded.
 - **Passive service discovery** — for each resolved host/IP the scanner performs a
   TCP connect scan of common service ports (ssh, rdp, mysql, …), surfacing exposed
   services without payloads or banner grabbing.
@@ -68,7 +80,8 @@ visualize its findings — no hardcoding to one company.
   concurrency-limited, PII-masked.
 - **Filter & sort** — by severity, recency, status, and a findings view tab
   (All / Detected / Correlated).
-- **Bounded jobs** — scan, recheck, and correlation jobs are serialized per org.
+- **Bounded jobs** — scan, recheck, correlation, vuln lookup, AI grade, and
+  OpenHack jobs are serialized per org.
   Terminal states (done/failed) are retained so status polling works reliably.
 - **Responsive + mobile** — dark theme works on phones; graph is touch-friendly.
 
@@ -78,7 +91,8 @@ visualize its findings — no hardcoding to one company.
 app/
   main.py              FastAPI server + all /api endpoints + PDF render
   ai_providers.py      AI provider abstraction (ollama + openai-compatible),
-                       per-org profiles, SSRF validation
+                       per-org profiles, SSRF validation, generic CRUD helpers
+  ai_setup.py          CLI wizard for model config (`--list/--wizard/--check/--test`)
   cve_match.py         offline version->CVE matching + optional NVD enrichment
   cve_data.json        vendored high-impact CVE map (deterministic, offline)
   cti_correlation.py   core engine: registry, normalization, correlation,
@@ -87,6 +101,8 @@ app/
                        HTTP fingerprint, TCP service-port probe, banner
                        versions, TLS certs, InternetDB, baseline diff),
                        AI triage, recheck
+  vuln_scan.py         host-based vuln lookup (passive CVE/config audit, gated active)
+  nuclei_scan.py       Nuclei template provider (gated active engine for vuln-scan)
   dashboard.html       single-file frontend (graph, cards, modal, workspace, history)
   static/
     vis-network.min.js vendored graph library (no CDN dependency)
@@ -113,12 +129,12 @@ requirements.txt
 - **Optional — headless Chromium** for PDF export
   (`~/.cache/ms-playwright/chromium-1208/chrome-linux64/chrome` style path).
   If absent, the report falls back to a printable HTML download.
-- **Optional — AI-assisted scanning:** configure one or more AI provider profiles
-  (local Ollama, OpenCode, OpenRouter, vLLM, or any OpenAI-compatible endpoint)
-  in `~/.config/cti-radar/ai_config.json` and set `CTI_AI_CONFIG_FILE` to that path
-  (see `data/ai_config.example.json`). Alternatively set
-  `OPENCODE_GO_B_API_KEY` for legacy single-key quick-start. Without AI config,
-  `mode=ai` scans safely fall back to deterministic `fast`.
+- **Optional — AI-assisted scanning:** add one or more AI provider profiles via
+  the dashboard **models** section, via `CTI_AI_*` env vars, or via
+  `python -m app.ai_setup --wizard` (local Ollama, or any OpenAI-compatible
+  endpoint; see `data/ai_config.example.json` for the file shape).
+  Secrets are referenced by env-var name only, never stored in config.
+  Without AI config, `mode=ai` scans safely fall back to deterministic `fast`.
   See [How AI-assisted scanning works](#how-ai-assisted-scanning-works-modeai).
 
 ## Setup
@@ -180,9 +196,12 @@ org and scan it.
 - **Frontend dependencies are vendored:** vis-network is shipped locally in
   `app/static/` — no external CDN requests. The Content-Security-Policy does
   not trust any third-party script origins.
-- **Non-intrusive scanning:** certificate transparency (crt.name / crt.sh / certspotter / hackertarget) + DNS + HTTP
+- **Non-intrusive scanning by default:** certificate transparency (crt.name / crt.sh / certspotter / hackertarget) + DNS + HTTP
   reachability/header probe + service banner capture + TCP connect scan of common service ports +
   passive InternetDB only. No payloads, no brute-force, no exploitation.
+  Active probing exists only behind explicit fail-closed gates: the Nuclei
+  vuln-scan engine (`CTI_VULN_*`) and OpenHack (`CTI_OPENHACK_*`) — both deny
+  by default and require written authorization scope.
 
 ### Scanner + provider SSRF protections
 
@@ -232,9 +251,13 @@ FastAPI (main.py) — all routes auth-gated
    ├─ GET  /api/orgs/{slug}/scan/{job_id}    (job status polling)
    ├─ GET  /api/orgs/{slug}/correlate/{job_id}
    ├─ GET  /api/orgs/{slug}/recheck/{job_id}
+   ├─ GET  /api/orgs/{slug}/vuln-scan/{job_id} (host vuln lookup status)
+   ├─ GET  /api/vuln/engines                   (passive/nuclei availability)
+   ├─ GET  /api/ai/profiles · /api/ai/capabilities (model config + readiness)
    ├─ POST /api/login · /api/logout          (session management)
    └─ POST (auth-gated) /api/orgs/register · /{slug}/scan · /{slug}/recheck ·
-                 /{slug}/correlate · /{slug}/findings/{id}/status
+                 /{slug}/correlate · /{slug}/vuln-scan · /{slug}/ai-grade ·
+                 /{slug}/findings/{id}/status · /ai/profiles · /ai/default · /ai/test
           │
           ▼
    scanner.py   passive enum → DNS+IP pinning → fingerprints → (optional AI) →
@@ -316,9 +339,15 @@ the scan and never blocks it:
 
 ### Provider configuration
 
-Create `~/.config/cti-radar/ai_config.json` (copy from
-`data/ai_config.example.json`) and set
-`CTI_AI_CONFIG_FILE=$HOME/.config/cti-radar/ai_config.json`:
+Easiest (no JSON hand-edit): dashboard **models** section (add/edit/test/delete,
+generic fields only) or single-profile env (`CTI_AI_PROFILE_NAME/PROVIDER/
+BASE_URL/MODEL/API_KEY_ENV`, optional `CTI_AI_API_KEY` value mapped in memory)
+or `python -m app.ai_setup --wizard`. All three merge additively — existing
+profiles and the default are preserved; keys stay in server env, never on disk.
+If the AI option looks disabled, the hint under it now names the reason
+(e.g. which key env is missing — export it and restart).
+
+File shape (`CTI_AI_CONFIG_FILE`, default `data/ai_config.json`):
 
 ```json
 {
@@ -355,6 +384,34 @@ The split is deliberately clean: **deterministic capture is the source of truth,
 $0, and self-healing; the LLM is an optional interpretive pass that adds
 vulnerability-context findings on top.**
 
+## Vuln lookup (host-based, passive by default)
+
+`Vuln scan` (org-wide, next to Correlate) or `vuln: this host` on any finding
+reuses stored fingerprints — no re-enumeration, no exploits:
+
+* `cve` — offline `cve_data.json` version→CVE match (`CORRELATED`, capped HIGH);
+* `version` / `headers` / `tls` / `login` — config audit from captured data
+  (version disclosure LOW, missing HSTS/CSP framing LOW/MEDIUM, expired cert MEDIUM).
+* Targets must belong to the org (stored hosts or subdomains of registered
+  domains); out-of-scope is rejected before any network. Missing host data is
+  refreshed with the same single HTTP/TLS round trip a scan uses. Genuinely new
+  findings persist deduplicated (`source: vuln-scan`); a report is always returned.
+* API: `POST /api/orgs/{slug}/vuln-scan {targets?,checks?,refresh?,include_nvd?,active?,engine?,nuclei_severity?,nuclei_tags?}`
+  + `GET .../vuln-scan/{job_id}`, `GET /api/vuln/engines`. `include_nvd` enriches via cached NVD (fail-open).
+* `active:true` (light banner re-check on the finding's own IP/port only) is
+  fail-closed unless ALL hold: `CTI_VULN_ACTIVE=1`, `CTI_VULN_ISOLATED=1`,
+  exact `CTI_VULN_ALLOWED_DOMAINS`, unexpired `CTI_VULN_ROE_EXPIRES`.
+* **Nuclei engine** (`engine: nuclei` in API, `nuclei (gated)` in the dashboard):
+  runs community templates over in-scope URLs *in addition to* the passive
+  checks. Requires the same `CTI_VULN_*` gate plus `CTI_NUCLEI_BIN` (or nuclei
+  on PATH) and `CTI_NUCLEI_TEMPLATES`. Safe defaults: severity
+  `critical,high,medium`, `dos/fuzz/intrusive` excluded (`dos/fuzz` can never
+  be re-enabled), interactsh OAST disabled, no raw request/response stored,
+  rate-limited (20/s), 300s budget, 10MB/500-event output caps. Findings are
+  `source: nuclei`, `NUCLEI-MATCHED`, severity capped at HIGH, identity
+  `nuclei|host|template|path`, validated CVE IDs only. Tune via
+  `CTI_NUCLEI_SEVERITY/TAGS/EXCLUDE_TAGS/RATE_LIMIT/TIMEOUT` (see `.env.example`).
+
 ## OpenHack active-assessment authorization
 
 OpenHack is an **active external assessment**, not the passive CTI scanner. Use it
@@ -385,18 +442,21 @@ cd cti-dashboard
 python -m pytest tests/ -v
 ```
 
-198 tests covering: tenant authentication, unknown org rejection, graph XSS
+ 218 tests covering: tenant authentication, unknown org rejection, graph XSS
 prevention, PDF PII masking, job state retention, provider URL SSRF validation,
 session cookie security, CSP enforcement, registration limits, the
 cheap-model AI triage flow (pre-filter, compact prompt, classifier parsing,
 template expansion, and self-repair retry), AI grading with exposure
-verification (`still_open` read of the latest probe data), probe-evidence
-refresh on existing findings, deterministic login-portal / version-disclosure
+verification (`still_open` read of the latest probe data), generic AI model
+config (validation reasons, additive merge-save, env-single override, default
+handling), probe-evidence refresh on existing findings, deterministic login-portal / version-disclosure
 findings, the Wayback/OTX enum sources + wildcard-DNS filtering, the offline
 version→CVE map (comparator edges, alias normalization, banner-derived
 versions, no-correlation-amplification) + optional NVD enrichment
-(cache, fail-open), security-header findings, baseline-diff new-exposure
-sequencing, resolver-pool + InternetDB-cache behavior, and evidence-based AI
+(cache, fail-open), security-header findings, host vuln lookup (scope rejection,
+dedup-on-rescan, active gate fail-closed) + Nuclei provider (JSONL mapping,
+out-of-scope/IP drops, severity cap, forced tag excludes, argv safety),
+baseline-diff new-exposure sequencing, resolver-pool + InternetDB-cache behavior, and evidence-based AI
 prompt enrichment (CVE candidates, missing-header signals, sanitizer
 neutralization).
 

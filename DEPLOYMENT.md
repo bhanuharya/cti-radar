@@ -73,6 +73,25 @@ Changing the bind address means editing `CTI_HOST`/`CTI_PORT` in
 `server.env` and restarting — the unit itself never hard-codes them.
 Validate your edited unit with `systemd-analyze verify` before enabling.
 
+## Nuclei template engine (optional)
+
+The passive scanner needs nothing beyond the base install. The Nuclei engine
+(`engine: nuclei` in vuln-scan) additionally needs, on the same host:
+
+1. The `nuclei` binary on `PATH` (or `CTI_NUCLEI_BIN=/absolute/path` in
+   `server.env`), plus a templates checkout (`CTI_NUCLEI_TEMPLATES`, default
+   `~/nuclei-templates`). Both only need to be *readable* — the hardened unit
+   above already allows that (`ProtectHome=read-only`); no unit change needed.
+   Nuclei's temp artifacts live under private `/tmp` (`PrivateTmp=true`), and
+   per-run output is capped (10 MiB / 500 events) and deleted after parsing.
+2. The `CTI_VULN_*` gate in `server.env` (active/isolated flags, exact allowed
+   domains, unexpired ROE) — without it every nuclei request is 403 with zero
+   subprocess spawned. Tune with `CTI_NUCLEI_SEVERITY/TAGS/EXCLUDE_TAGS/
+   RATE_LIMIT/TIMEOUT` (see `.env.example`).
+3. Template updates are manual and operator-run (never automatic):
+   `nuclei -update-templates`. Restart is not required after updating
+   templates; it is required after changing any `CTI_*` env value.
+
 Enable persistence across reboots (user services stop at logout otherwise):
 
 ```bash
