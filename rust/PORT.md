@@ -29,6 +29,8 @@ CVE map (`app/cve_data.json`) are REUSED AS-IS — only the backend is ported.
 | app/scanner.py (4151) | src/scanner/*.rs | passive scan: 6 enum sources, DNS+pin, HTTP fingerprint, TCP banner, TLS certs, InternetDB, findings synthesis, reconcile, recheck, AI triage/grading, correlate |
 | app/ai_providers.py (831) | src/ai.rs | multi-profile AI (ollama + openai-compatible), SSRF validation, JSON-fence stripping |
 | app/openhack_source.py (788) | src/openhack.rs | fail-closed active-assessment wrapper |
+| app/vuln_scan.py | src/vuln_scan.rs | host vuln lookup (passive CVE/config audit, gated active; Hermes egress-scope fixes ported) |
+| app/nuclei_scan.py | src/nuclei.rs | Nuclei template provider (gated active engine) |
 | app/dashboard.html | (served as asset) | NO rewrite |
 | app/static/* | (served as asset) | NO rewrite |
 | app/cve_data.json | (embedded/served) | NO rewrite |
@@ -44,13 +46,17 @@ CVE map (`app/cve_data.json`) are REUSED AS-IS — only the backend is ported.
 - GET  /api/admin/logs
 - GET  /api/orgs/{slug}/history
 - GET  /api/orgs/{slug}/scan/{job_id}, /recheck/{job_id}, /correlate/{job_id},
-       /ai-grade/{job_id}, /openhack-scan/{job_id}
+       /ai-grade/{job_id}, /openhack-scan/{job_id}, /vuln-scan/{job_id}
+- GET  /api/vuln/engines  (passive/nuclei availability, no secrets)
 - POST /api/orgs/register  (name, domains, slug)
 - POST /api/orgs/{slug}/domains  (domains, action add|remove|set)
 - POST /api/orgs/{slug}/scan  (mode fast|ai, ai_profile)
 - POST /api/orgs/{slug}/recheck
 - POST /api/orgs/{slug}/correlate
 - POST /api/orgs/{slug}/ai-grade  (ai_profile)
+- POST /api/orgs/{slug}/vuln-scan  (targets, checks, refresh, include_nvd,
+       active, engine passive|nuclei, nuclei_severity, nuclei_tags;
+       active/nuclei fail closed with 403 unless all four CTI_VULN_* gates pass)
 - POST /api/orgs/{slug}/findings/{id}/status  (status, note)
 - POST /api/orgs/{slug}/findings/{id}/comment  (note, by)
 - POST /api/orgs/{slug}/openhack-config, /openhack-scan

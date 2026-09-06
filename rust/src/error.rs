@@ -15,6 +15,8 @@ pub enum AppError {
     OrgNotFound(String),
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("conflict: {0}")]
@@ -38,6 +40,7 @@ impl IntoResponse for AppError {
                 (StatusCode::NOT_FOUND, format!("org not found: {}", slug))
             }
             AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
+            AppError::Forbidden(m) => (StatusCode::FORBIDDEN, m.clone()),
             AppError::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
             AppError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             AppError::TooManyRequests(_) => (

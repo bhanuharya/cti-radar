@@ -10,10 +10,13 @@ pub mod error;
 pub mod handlers;
 pub mod handlers_mut;
 pub mod jobs;
+pub mod nuclei;
 pub mod openhack;
 pub mod openhack_handlers;
 pub mod report;
 pub mod scanner;
+pub mod vuln_handlers;
+pub mod vuln_scan;
 
 use std::sync::Arc;
 

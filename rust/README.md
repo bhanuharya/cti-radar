@@ -34,6 +34,9 @@ rust/
     scanner.rs         passive recon: enum/DNS/HTTP/TCP/TLS/InternetDB + findings
     ai.rs              AI providers (ollama + openai-compatible), SSRF-validated
     openhack.rs        active-assessment wrapper (fail-closed)
+    vuln_scan.rs       host vuln lookup (passive CVE/config audit, gated active)
+    nuclei.rs          Nuclei template provider (gated active engine)
+    vuln_handlers.rs   vuln-scan + engines HTTP handlers
     report.rs          PDF (Chromium) + HTML fallback
     handlers.rs        read endpoints
     handlers_mut.rs    mutation endpoints (register/scan/status/...)

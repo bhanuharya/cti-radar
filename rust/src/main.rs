@@ -36,6 +36,7 @@ fn build_router(state: AppState) -> Router {
     use cti_radar::handlers as h;
     use cti_radar::handlers_mut as hm;
     use cti_radar::openhack_handlers as oh;
+    use cti_radar::vuln_handlers as vh;
 
     Router::new()
         // dashboard + static
@@ -100,6 +101,12 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/orgs/{slug}/openhack-scan/{job_id}",
             get(oh::api_openhack_status),
+        )
+        .route("/api/vuln/engines", get(vh::api_vuln_engines))
+        .route("/api/orgs/{slug}/vuln-scan", post(vh::api_org_vuln_scan))
+        .route(
+            "/api/orgs/{slug}/vuln-scan/{job_id}",
+            get(vh::api_vuln_status),
         )
         .route(
             "/api/orgs/{slug}/findings/{id}/status",
