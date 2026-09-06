@@ -640,6 +640,11 @@ button:disabled{opacity:.45;cursor:wait;}
         <button class="btn primary" id="ws-scan" type="button" title="Full passive scan of the selected org (enum + DNS + fingerprint + ports + TLS)">Scan (full)</button>
         <button class="btn" id="ws-recheck" type="button">Recheck ports</button>
         <button class="btn" id="ws-correlate" type="button">Correlate</button>
+        <button class="btn" id="ws-vuln" type="button" title="Host vuln lookup: CVE map + version/headers/TLS from fingerprints (passive, no exploits)">Vuln scan</button>
+        <select class="orgsel" id="vulnengine" aria-label="Vuln engine" title="passive: offline map + config audit (safe) · nuclei: template probes (active, gated)">
+          <option value="passive" selected>passive</option>
+          <option value="nuclei">nuclei (gated)</option>
+        </select>
       </div>
       <div class="bgroup">
         <span class="bcap">ai · openhack</span>
@@ -654,6 +659,34 @@ button:disabled{opacity:.45;cursor:wait;}
         <span class="bcap">export</span>
         <button class="btn" id="ws-pdf" type="button">PDF report</button>
       </div>
+    </div>
+  </div>
+  <div class="wsgrid" id="models-block">
+    <div class="wsfield ws-wide">
+      <label>models — add / edit (generic, existing profiles untouched unless you save)</label>
+      <div class="wsdomrow">
+        <input id="md-name" autocomplete="off" spellcheck="false" placeholder="name (a-z 0-9 -)" style="max-width:160px">
+        <select id="md-provider" aria-label="Provider" style="max-width:170px">
+          <option value="openai-compatible" selected>openai-compatible</option>
+          <option value="ollama">ollama</option>
+        </select>
+        <input id="md-base-url" autocomplete="off" spellcheck="false" placeholder="base_url https://… (http only for 127.0.0.1)">
+        <input id="md-model" autocomplete="off" spellcheck="false" placeholder="model">
+        <input id="md-key-env" autocomplete="off" spellcheck="false" placeholder="api_key_env (optional, e.g. MY_API_KEY)" style="max-width:220px">
+      </div>
+      <div class="wsdomrow" style="margin-top:6px">
+        <input id="md-timeout" type="number" min="10" max="300" value="90" title="timeout secs (10-300)" style="max-width:110px;flex:0 1 110px" placeholder="timeout">
+        <input id="md-max-hosts" type="number" min="1" max="50" value="10" title="max_hosts (1-50)" style="max-width:110px;flex:0 1 110px" placeholder="max_hosts">
+        <input id="md-max-tokens" type="number" min="64" max="8192" value="1024" title="max_tokens (64-8192)" style="max-width:120px;flex:0 1 120px" placeholder="max_tokens">
+        <button class="btn primary" id="md-save" type="button" title="Add or update this profile (merge only)">Save</button>
+        <button class="btn" id="md-test" type="button" title="Smoke-test the profile with a tiny prompt">Test</button>
+        <button class="btn" id="md-default" type="button" title="Set this profile as default">Set default</button>
+        <button class="btn" id="md-delete" type="button" title="Delete this profile">Delete</button>
+        <button class="btn ghost" id="md-clear" type="button">Clear</button>
+      </div>
+      <small style="color:var(--dim);font-size:10px;">Keys stay in server env (never typed here beyond the env name). Saving merges one profile — others and the default are preserved. Click a chip to load it into the form.</small>
+      <div class="domchips" id="md-list" aria-label="Configured models"></div>
+      <small id="md-msg" style="color:var(--dim);font-size:10px;"></small>
     </div>
   </div>
     <div class="wsmsg" id="wsmsg"></div>
@@ -1061,6 +1094,13 @@ function init() {
   $('findings').addEventListener('click', (e) => {
     const card = e.target.closest('.fcard');
     if (!card || !card.dataset.id) return;
+    const vulnBtn = e.target.closest('[data-vuln-target]');
+    if (vulnBtn && vulnBtn.dataset.vulnTarget) {
+      e.preventDefault();
+      e.stopPropagation();
+      vulnScanOrg([vulnBtn.dataset.vulnTarget]);
+      return;
+    }
     if (e.target.closest('.fview')) {
       e.preventDefault();
       e.stopPropagation();
@@ -1170,6 +1210,7 @@ function init() {
   $('ws-scan').addEventListener('click', scanSelected);
   $('ws-recheck').addEventListener('click', recheckSelected);
   $('ws-correlate').addEventListener('click', correlateSelected);
+  $('ws-vuln').addEventListener('click', () => vulnScanOrg(null));
   $('ws-grade').addEventListener('click', gradeSelected);
   $('ws-ohack-quick').addEventListener('click', () => openhackScan('quick'));
   $('ws-ohack-deep').addEventListener('click', () => openhackScan('deep'));
@@ -1184,6 +1225,16 @@ function init() {
   $('login-btn').addEventListener('click', doLogin);
   $('logout-btn').addEventListener('click', doLogout);
   $('scanmode').addEventListener('change', updateAiHint);
+  $('md-save').addEventListener('click', saveModelForm);
+  $('md-test').addEventListener('click', testModelForm);
+  $('md-default').addEventListener('click', defaultModelForm);
+  $('md-delete').addEventListener('click', deleteModelForm);
+  $('md-clear').addEventListener('click', clearModelForm);
+  $('md-list').addEventListener('click', (e) => {
+    const x = e.target.closest('[data-model]');
+    if (!x || !x.dataset.model) return;
+    loadModelIntoForm(x.dataset.model);
+  });
   $('aiprofile').addEventListener('change', () => {
     updateAiHint();
     // persist per-org preference (auth-gated)
@@ -1278,7 +1329,19 @@ let aiProfiles = [];
 let aiDefault = null;
 
 function loadAiProfiles() {
-  fetch('/api/ai/capabilities').then(r=>r.json()).then(d=>{
+  // Prefer the rich edit view (base_url + reasons); fall back to capabilities.
+  fetch('/api/ai/profiles').then(r=>r.json()).then(d=>{
+    if (!d || !Array.isArray(d.profiles)) throw new Error('bad profiles');
+    renderAiProfiles(d);
+  }).catch(()=>{
+    fetch('/api/ai/capabilities').then(r=>r.json()).then(d=>{
+      renderAiProfiles(d);
+    }).catch(()=>{
+      $('aihint').textContent = 'AI profiles unavailable (network error — refresh to retry)';
+    });
+  });
+}
+function renderAiProfiles(d) {
     aiProfiles = (d && d.profiles) || [];
     aiDefault = d.default_profile || null;
     const sel = $('aiprofile');
@@ -1287,23 +1350,32 @@ function loadAiProfiles() {
     const opts = aiProfiles.map(p=>{
       const ready = p.ready ? '' : ' (not ready)';
       const def = p.default ? ' — default' : '';
-      return '<option value="'+esc(p.name)+'">'+esc(p.name)+' · '+esc(p.provider)+' · '+esc(p.model)+ready+def+'</option>';
+      const reason = (!p.ready && p.reason) ? ' — '+p.reason : '';
+      return '<option value="'+esc(p.name)+'" title="'+esc(p.reason||'')+'">'+esc(p.name)+' · '+esc(p.provider)+' · '+esc(p.model)+ready+def+'</option>';
     }).join('');
     sel.innerHTML = autoOpt + opts;
+    if (d && d.env_override) {
+      $('aihint').textContent = 'AI managed via CTI_AI_CONFIG env — file edits disabled until unset';
+    }
     updateAiHint();
-    // disable AI mode if no ready profiles
+    // disable AI mode if no ready profiles, with an explicit reason
     const hasReady = aiProfiles.some(p=>p.ready);
     const scanMode = $('scanmode');
     const aiOpt = scanMode.querySelector('option[value="ai"]');
     if (aiOpt) {
       aiOpt.disabled = !hasReady;
+      aiOpt.title = hasReady ? 'AI-assisted scan' : aiDisabledReason();
       if (!hasReady && scanMode.value === 'ai') scanMode.value = 'fast';
     }
+    renderModelChips();
     // also refresh org-specific effective hint
     if (currentOrg) fetchAiProfileForOrg(currentOrg);
-  }).catch(()=>{
-    $('aihint').textContent = 'AI profiles unavailable';
-  });
+}
+function aiDisabledReason() {
+  if (!aiProfiles.length) return 'No AI profiles configured — add one below';
+  const reasons = aiProfiles.map(p=>p.reason).filter(Boolean);
+  if (reasons.length) return reasons[0];
+  return 'No ready AI profile (missing key?)';
 }
 function updateAiHint() {
   const sel = $('aiprofile');
@@ -1311,9 +1383,11 @@ function updateAiHint() {
   const chosen = sel.value || aiDefault;
   const prof = aiProfiles.find(p=>p.name===chosen);
   const hint = $('aihint');
-  if (mode !== 'ai') { hint.textContent = prof ? 'AI: '+prof.name+' · '+prof.model : 'AI disabled (Fast mode)'; return; }
-  if (!prof) { hint.textContent = 'AI: no profile — AI scan will fail'; hint.style.color='var(--red)'; return; }
-  if (!prof.ready) { hint.textContent = 'AI: '+prof.name+' not ready (missing key)'; hint.style.color='var(--red)'; return; }
+  if (hint.dataset.envLock) return;
+  if (mode !== 'ai') { hint.style.color='var(--dim)'; hint.textContent = prof ? 'AI: '+prof.name+' · '+prof.model : 'AI disabled (Fast mode)'; return; }
+  if (!aiProfiles.length) { hint.textContent = 'AI: no profiles — add one in models below'; hint.style.color='var(--red)'; return; }
+  if (!prof) { hint.textContent = 'AI: no profile selected — pick one or set a default'; hint.style.color='var(--red)'; return; }
+  if (!prof.ready) { hint.textContent = 'AI: '+prof.name+' not ready — '+(prof.reason||'missing key (export + restart)'); hint.style.color='var(--red)'; return; }
   hint.style.color='var(--dim)';
   hint.textContent = 'AI: '+prof.name+' · '+prof.provider+' · '+prof.model;
 }
@@ -1336,6 +1410,101 @@ function fetchAiProfileForOrg(slug) {
     $('aiprofile').value = d.ai_profile || "";
     updateAiHint();
   }).catch(()=>{ if (seq === _aiProfileReq) updateAiHint(); });
+}
+
+/* ---------- generic model config (no presets) ---------- */
+function setMdMsg(msg, isErr) {
+  const el = $('md-msg');
+  if (!el) return;
+  el.textContent = msg || '';
+  el.style.color = isErr ? 'var(--red)' : 'var(--dim)';
+}
+function modelFormData() {
+  return {
+    name: ($('md-name').value || '').trim().toLowerCase(),
+    provider: $('md-provider').value,
+    base_url: ($('md-base-url').value || '').trim(),
+    model: ($('md-model').value || '').trim(),
+    api_key_env: ($('md-key-env').value || '').trim(),
+    timeout: parseInt($('md-timeout').value || '90', 10),
+    max_hosts: parseInt($('md-max-hosts').value || '10', 10),
+    max_tokens: parseInt($('md-max-tokens').value || '1024', 10),
+  };
+}
+function renderModelChips() {
+  const box = $('md-list');
+  if (!box) return;
+  if (!aiProfiles.length) { box.innerHTML = '<small style="color:var(--dim)">no models yet</small>'; return; }
+  box.innerHTML = aiProfiles.map(p=>{
+    const st = p.ready ? 'ok' : 'not ready';
+    const def = p.default ? ' · default' : '';
+    return '<button class="chip" data-model="'+esc(p.name)+'" type="button" title="'+esc(p.reason||p.base_url||'')+'">'
+      + esc(p.name) + ' · ' + esc(p.model) + ' (' + esc(st) + def + ')</button>';
+  }).join('');
+}
+function loadModelIntoForm(name) {
+  const p = aiProfiles.find(x=>x.name===name);
+  if (!p) return;
+  $('md-name').value = p.name;
+  if (p.provider) $('md-provider').value = p.provider;
+  $('md-base-url').value = p.base_url || '';
+  $('md-model').value = p.model || '';
+  $('md-key-env').value = p.api_key_env || '';
+  if (p.timeout) $('md-timeout').value = p.timeout;
+  if (p.max_hosts) $('md-max-hosts').value = p.max_hosts;
+  if (p.max_tokens) $('md-max-tokens').value = p.max_tokens;
+  setMdMsg('Loaded ' + p.name + ' — Save to update, Test to verify.');
+}
+function clearModelForm() {
+  ['md-name','md-base-url','md-model','md-key-env'].forEach(id=>{ $(id).value=''; });
+  $('md-provider').value = 'openai-compatible';
+  $('md-timeout').value = 90; $('md-max-hosts').value = 10; $('md-max-tokens').value = 1024;
+  setMdMsg('');
+}
+function refreshAiProfiles() { loadAiProfiles(); }
+function saveModelForm() {
+  const d = modelFormData();
+  if (!d.name) return setMdMsg('name is required (a-z 0-9 -)', true);
+  if (!SLUG_RE.test(d.name)) return setMdMsg('invalid name (^[a-z0-9-]{1,32}$)', true);
+  setMdMsg('Saving ' + d.name + '…');
+  fetch('/api/ai/profiles', { method: 'POST', headers: authHeaders(), body: JSON.stringify(d) })
+    .then(r=>r.json().then(b=>({ok:r.ok,b}))).then(({ok,b})=>{
+      if (!ok) return setMdMsg('Save failed: ' + ((b&&b.error)||'error'), true);
+      setMdMsg('Saved ' + d.name + ' (others preserved).');
+      if (b && b.profiles) renderAiProfiles(b.profiles); else refreshAiProfiles();
+    }).catch(()=>setMdMsg('Save failed (network error)', true));
+}
+function testModelForm() {
+  const d = modelFormData();
+  const target = d.name || aiDefault || '';
+  setMdMsg('Testing ' + (target||'(default)') + '…');
+  fetch('/api/ai/test', { method: 'POST', headers: authHeaders(), body: JSON.stringify({profile: target}) })
+    .then(r=>r.json().then(b=>({ok:r.ok,b}))).then(({ok,b})=>{
+      if (!ok) return setMdMsg('Test failed: ' + ((b&&b.detail&&b.detail.error)||(b&&b.error)||'error'), true);
+      setMdMsg('Test ok: ' + target + ' responded.');
+    }).catch(()=>setMdMsg('Test failed (network error)', true));
+}
+function defaultModelForm() {
+  const d = modelFormData();
+  if (!d.name) return setMdMsg('enter a name to set default', true);
+  fetch('/api/ai/default', { method: 'POST', headers: authHeaders(), body: JSON.stringify({profile: d.name}) })
+    .then(r=>r.json().then(b=>({ok:r.ok,b}))).then(({ok,b})=>{
+      if (!ok) return setMdMsg('Set default failed: ' + ((b&&b.error)||'error'), true);
+      setMdMsg('Default set to ' + d.name + '.');
+      if (b && b.profiles) renderAiProfiles(b.profiles); else refreshAiProfiles();
+    }).catch(()=>setMdMsg('Set default failed (network error)', true));
+}
+function deleteModelForm() {
+  const d = modelFormData();
+  if (!d.name) return setMdMsg('enter a name to delete', true);
+  if (!confirm('Delete model ' + d.name + '?')) return;
+  fetch('/api/ai/profiles/' + encodeURIComponent(d.name), { method: 'DELETE', headers: authHeaders() })
+    .then(r=>r.json().then(b=>({ok:r.ok,b}))).then(({ok,b})=>{
+      if (!ok) return setMdMsg('Delete failed: ' + ((b&&b.error)||'error'), true);
+      setMdMsg('Deleted ' + d.name + '.');
+      clearModelForm();
+      if (b && b.profiles) renderAiProfiles(b.profiles); else refreshAiProfiles();
+    }).catch(()=>setMdMsg('Delete failed (network error)', true));
 }
 
 /* ---------- dedicated new-org creation (header "+ New org" button) ---------- */
@@ -1417,6 +1586,14 @@ function removeDomainChip(domain) {
 function scanSelected() {
   const mode = $('scanmode').value === 'ai' ? 'ai' : 'fast';
   const ai_profile = $('aiprofile').value || '';
+  if (mode === 'ai') {
+    // explicit UI-side guard (backend still falls back safely for cron/headless)
+    const chosen = ai_profile || aiDefault;
+    const prof = aiProfiles.find(p=>p.name===chosen);
+    if (!aiProfiles.length) { setWsMsg('AI scan blocked: no models configured — add one in models below', true); return; }
+    if (!prof) { setWsMsg('AI scan blocked: pick a model or set a default', true); return; }
+    if (!prof.ready) { setWsMsg('AI scan blocked: ' + prof.name + ' not ready — ' + (prof.reason || 'missing key (export + restart)'), true); return; }
+  }
   setWsMsg('Scanning ' + currentOrg + ' (' + mode + (ai_profile ? ', ' + ai_profile : '') + ')…');
   const payload = ai_profile ? { mode, ai_profile } : { mode };
   fetch('/api/orgs/' + encodeURIComponent(currentOrg) + '/scan', {
@@ -1476,6 +1653,95 @@ function correlateSelected() {
     hideJob();
     loadLogs();
   });
+}
+
+let vulnPollTimer = null;
+let vulnEngines = { passive: { available: true }, nuclei: { available: false, reason: '' } };
+function loadVulnEngines() {
+  fetch('/api/vuln/engines').then(r=>r.json()).then(d=>{
+    if (!d) return;
+    if (d.passive) vulnEngines.passive = d.passive;
+    if (d.nuclei) {
+      vulnEngines.nuclei = d.nuclei;
+      const sel = $('vulnengine');
+      const opt = sel && sel.querySelector('option[value="nuclei"]');
+      if (opt) {
+        opt.title = d.nuclei.available ? 'nuclei template probes (active, gated by CTI_VULN_*)'
+                                       : ('nuclei unavailable: ' + (d.nuclei.reason || 'unknown'));
+        if (!d.nuclei.available && sel.value === 'nuclei') sel.value = 'passive';
+      }
+    }
+  }).catch(()=>{});
+}
+function vulnScanOrg(targets) {
+  const slug = currentOrg;
+  if (!slug) return setWsMsg('Select a workspace first', true);
+  const scope = (targets && targets.length) ? targets : null;
+  const engine = ($('vulnengine') && $('vulnengine').value === 'nuclei') ? 'nuclei' : 'passive';
+  if (engine === 'nuclei' && !vulnEngines.nuclei.available) {
+    return setWsMsg('Nuclei unavailable: ' + (vulnEngines.nuclei.reason || 'binary/templates missing'), true);
+  }
+  setWsMsg('Vuln lookup ' + slug + (scope ? ' (' + scope.join(', ') + ')' : ' (all hosts)') + ' [' + engine + ']…');
+  showJob('<div class="jhead">Vuln lookup ' + esc(slug) + ' [' + esc(engine) + ']…</div><div>submitting job…</div>');
+  const payload = { engine };
+  if (scope) payload.targets = scope;
+  fetch('/api/orgs/' + encodeURIComponent(slug) + '/vuln-scan', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(payload)
+  }).then((r) => r.json().then((body) => ({ ok: r.ok, body }))).then(({ ok, body }) => {
+    if (!ok) {
+      setWsMsg('Vuln lookup failed: ' + (body.error || 'error'), true);
+      hideJob();
+      loadLogs();
+      return;
+    }
+    pollVuln(slug, body.job_id);
+  }).catch(() => {
+    setWsMsg('Vuln lookup failed (network error)', true);
+    hideJob();
+    loadLogs();
+  });
+}
+function pollVuln(slug, jobId, n) {
+  clearTimeout(vulnPollTimer);
+  n = n || 0;
+  if (n > 300) {
+    showJob(jobProgressHtml('Vuln lookup still running', { status: 'running', stage: 'timeout', progress: 'polling stopped — refresh to see result' }));
+    loadLogs();
+    return;
+  }
+  fetch('/api/orgs/' + encodeURIComponent(slug) + '/vuln-scan/' + encodeURIComponent(jobId))
+    .then((r) => r.json()).then((d) => {
+      if (d.status === 'done' || d.status === 'failed') {
+        if (d.status === 'done') {
+          const r = (d && d.result) ? d.result : null;
+          const summary = r ? [
+            (r.targets ? esc(String(r.targets.length)) + ' host(s)' : ''),
+            (r.engine ? esc(String(r.engine)) : ''),
+            (r.new_findings !== undefined ? '<b>' + esc(String(r.new_findings)) + ' new</b>' : ''),
+            (r.nuclei && r.nuclei.matched ? 'nuclei ' + esc(String(r.nuclei.matched)) + ' matched' : ''),
+            (r.refreshed && r.refreshed.length ? 'refreshed ' + esc(String(r.refreshed.length)) : ''),
+          ].filter(Boolean).join(' · ') : '';
+          showJob('<div class="jhead jok">Vuln lookup complete</div>' +
+                  (summary ? '<div>' + summary + '</div>' : '') +
+                  (d.progress ? '<div>' + esc(d.progress) + '</div>' : '') +
+                  (d.elapsed !== undefined ? '<div>elapsed: ' + esc(String(d.elapsed)) + 's</div>' : ''));
+          setWsMsg('Vuln lookup completed for ' + slug +
+                   (r && r.new_findings ? ' — ' + r.new_findings + ' new finding(s)' : ' — no new findings'));
+        } else {
+          showJob(jobProgressHtml('Vuln lookup failed', d));
+          setWsMsg('Vuln lookup failed: ' + (d.error || 'error'), true);
+        }
+        refreshAll(); loadHistory(); loadLogs();
+      } else {
+        showJob(jobProgressHtml('Vuln lookup (passive)', d));
+        vulnPollTimer = setTimeout(() => pollVuln(slug, jobId, n + 1), 1500);
+      }
+    }).catch(() => {
+      showJob(jobProgressHtml('Vuln lookup status error', { status: 'failed', error: 'network error' }));
+      loadLogs();
+    });
 }
 
 function jobProgressHtml(title, d) {
@@ -1853,6 +2119,7 @@ function loadOrgs(preferSlug, done) {
     refreshAll();
     hideLogin();         // authenticated: restore session on reload
     loadAiProfiles();
+    loadVulnEngines();
     loadOhModels();
     syncOhModelForOrg(currentOrg);
     loadLogs();
@@ -2271,6 +2538,7 @@ function findingCard(f) {
       (f.category ? '<div class="fcat">' + esc(f.category) + '</div>' : '') +
       cveHtml +
       (meta.length ? '<div class="fmeta">' + meta.join('') + '</div>' : '') +
+      (target ? '<div style="margin-top:6px"><button class="btn ghost" data-vuln-target="' + esc(target) + '" type="button" title="Vuln lookup for this host (CVE + config audit, passive)">vuln: this host</button></div>' : '') +
     '</div>' +
   '</div>';
 }
