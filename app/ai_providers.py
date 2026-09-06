@@ -257,6 +257,27 @@ def load_profiles() -> Tuple[Dict[str, dict], Optional[str]]:
     # validate default
     if default not in norm:
         default = next(iter(norm), None) if norm else None
+    # generic single-profile env override (additive, file wins on clash)
+    try:
+        env_name, env_raw = _env_single_raw()
+        if env_name and env_raw and env_name not in norm:
+            ok_e, _reason_e, fd_e = validate_profile_fields(env_name, env_raw)
+            if ok_e and fd_e:
+                norm[env_name] = {
+                    "provider": fd_e["provider"],
+                    "base_url": fd_e["base_url"],
+                    "model": fd_e["model"],
+                    "api_key_env": fd_e.get("api_key_env"),
+                    "timeout": fd_e["timeout"],
+                    "max_hosts": fd_e["max_hosts"],
+                    "max_tokens": fd_e["max_tokens"],
+                    "cap_retry": fd_e.get("cap_retry", True),
+                    "options": fd_e.get("options", {}),
+                }
+                if default not in norm:
+                    default = env_name
+    except Exception:
+        pass
     return norm, default
 
 # ---------------------------------------------------------------------------
@@ -742,9 +763,12 @@ def get_capabilities() -> dict:
     for name, p in profiles.items():
         # readiness: openai-compatible requires api_key_env present if set
         ready = True
+        reason = ""
         if p["provider"] == "openai-compatible" and p["api_key_env"]:
             if not os.environ.get(p["api_key_env"], "").strip():
                 ready = False
+                reason = (f"missing key ({p['api_key_env']} not set in server env — "
+                          "export it and restart the server)")
         caps.append({
             "name": name,
             "provider": p["provider"],
@@ -752,6 +776,7 @@ def get_capabilities() -> dict:
             "timeout": p["timeout"],
             "max_hosts": p["max_hosts"],
             "ready": ready,
+            "reason": reason,
             "default": name == default,
         })
     return {"default_profile": default, "profiles": caps, "prompt_version": PROMPT_VERSION}
@@ -827,6 +852,350 @@ def set_org_profile(slug: str, profile: str) -> None:
 def get_org_profile(slug: str) -> Optional[str]:
     return _load_org_profile_map().get(slug)
 
+
 def is_ai_configured() -> bool:
     profiles, _ = load_profiles()
     return bool(profiles)
+
+
+# ---------------------------------------------------------------------------
+# generic model config (no presets) — validation + additive file management
+# ---------------------------------------------------------------------------
+_PROFILE_NAME_RE = re.compile(r"^[a-z0-9-]{1,32}$")
+
+
+def config_write_path() -> str:
+    return os.environ.get("CTI_AI_CONFIG_FILE", DEFAULT_CONFIG_PATH)
+
+
+def config_source() -> str:
+    env_json = os.environ.get("CTI_AI_CONFIG", "").strip()
+    if env_json:
+        try:
+            d = json.loads(env_json)
+            if isinstance(d, dict) and d.get("profiles"):
+                return "env-json"
+        except Exception:
+            pass
+    cfg_path = config_write_path()
+    if os.path.exists(cfg_path):
+        return "file"
+    # compat fallback active?
+    try:
+        if os.environ.get("HERMES_CUSTOM_API_CLINE_BOT_API_KEY", "").strip():
+            return "compat-env"
+    except Exception:
+        pass
+    if _env_single_raw()[0]:
+        return "env-single"
+    return "none"
+
+
+def _env_single_raw():
+    """Generic single-profile override via CTI_AI_* env (no presets).
+
+    Returns (name, raw_dict) or (None, None) when not configured.
+    CTI_AI_API_KEY (value) is mapped into the named env at load time
+    (memory only, never written to disk) so readiness works.
+    """
+    try:
+        base_url = (os.environ.get("CTI_AI_BASE_URL", "") or "").strip().rstrip("/")
+        model = (os.environ.get("CTI_AI_MODEL", "") or "").strip()
+        if not base_url or not model:
+            return None, None
+        name = (os.environ.get("CTI_AI_PROFILE_NAME", "") or "").strip().lower() or "env"
+        if not _PROFILE_NAME_RE.match(name):
+            return None, None
+        provider = (os.environ.get("CTI_AI_PROVIDER", "") or "openai-compatible").strip().lower()
+        api_key_env = (os.environ.get("CTI_AI_API_KEY_ENV", "") or "").strip() or None
+        key_value = (os.environ.get("CTI_AI_API_KEY", "") or "").strip()
+        if key_value and not api_key_env:
+            api_key_env = "CTI_AI_API_KEY"
+        if key_value and api_key_env and not os.environ.get(api_key_env, "").strip():
+            try:
+                os.environ[api_key_env] = key_value
+            except Exception:
+                pass
+        raw = {
+            "provider": provider,
+            "base_url": base_url,
+            "model": model,
+            "api_key_env": api_key_env,
+            "timeout": os.environ.get("CTI_AI_TIMEOUT", 90),
+            "max_hosts": os.environ.get("CTI_AI_MAX_HOSTS", 10),
+            "max_tokens": os.environ.get("CTI_AI_MAX_TOKENS", 1024),
+        }
+        return name, raw
+    except Exception:
+        return None, None
+
+
+def validate_profile_fields(name, raw):
+    """Validate generic fields. Returns (ok, reason, file_dict_or_None).
+
+    file_dict is the normalized shape safe to persist (no secrets).
+    """
+    try:
+        n = str(name or "").strip().lower()
+        if not _PROFILE_NAME_RE.match(n):
+            return False, "invalid name (^[a-z0-9-]{1,32}$)", None
+        if not isinstance(raw, dict):
+            return False, "profile must be an object", None
+        provider = str(raw.get("provider", "")).strip().lower()
+        if provider not in VALID_PROVIDERS:
+            return False, "invalid provider (ollama|openai-compatible)", None
+        base_url = str(raw.get("base_url") or raw.get("endpoint") or "").strip().rstrip("/")
+        model = str(raw.get("model", "")).strip()
+        if not base_url or not model:
+            return False, "base_url and model are required", None
+        if len(model) > 200 or len(base_url) > 500:
+            return False, "base_url/model too long", None
+        api_key_env_raw = str(raw.get("api_key_env", "") or "").strip() or None
+        if api_key_env_raw and not _ALLOWED_API_KEY_RE.match(api_key_env_raw):
+            return False, "invalid api_key_env (must look like *_API_KEY)", None
+        if not _validate_base_url(base_url, provider, api_key_env_raw):
+            return False, ("invalid base_url (https required for remote, "
+                            "no private IPs/credentials/redirects)"), None
+        try:
+            timeout = int(raw.get("timeout", 90) or 90)
+        except Exception:
+            return False, "invalid timeout (10-300)", None
+        timeout = max(10, min(timeout, 300))
+        try:
+            max_hosts = int(raw.get("max_hosts", 10) or 10)
+        except Exception:
+            return False, "invalid max_hosts (1-50)", None
+        max_hosts = max(1, min(max_hosts, 50))
+        try:
+            max_tokens = int(raw.get("max_tokens", 1024) or 1024)
+        except Exception:
+            return False, "invalid max_tokens (64-8192)", None
+        max_tokens = max(64, min(max_tokens, 8192))
+        options = raw.get("options")
+        if options is None:
+            options = {}
+        if not isinstance(options, dict):
+            return False, "options must be an object", None
+        if len(options) > 20:
+            return False, "options too large (max 20 keys)", None
+        # stringify/cap option values to avoid oversized configs
+        clean_opts = {}
+        for k, v in list(options.items())[:20]:
+            kk = str(k)[:40]
+            if isinstance(v, (int, float, bool)):
+                clean_opts[kk] = v
+            else:
+                clean_opts[kk] = str(v)[:200]
+        try:
+            np_ = int(raw.get("num_predict", 0) or 0)
+            if np_:
+                clean_opts["num_predict"] = max(64, min(np_, 8192))
+        except Exception:
+            pass
+        fd = {
+            "provider": provider,
+            "base_url": base_url,
+            "model": model,
+            "timeout": timeout,
+            "max_hosts": max_hosts,
+            "max_tokens": max_tokens,
+            "cap_retry": bool(raw.get("cap_retry", True)),
+            "options": clean_opts,
+        }
+        if api_key_env_raw:
+            fd["api_key_env"] = api_key_env_raw
+        return True, "", fd
+    except Exception as e:
+        return False, f"invalid profile: {type(e).__name__}", None
+
+
+def _read_file_config() -> dict:
+    path = config_write_path()
+    try:
+        if os.path.exists(path):
+            with open(path) as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def _write_file_config(data: dict) -> str:
+    path = config_write_path()
+    dirn = os.path.dirname(path) or "."
+    os.makedirs(dirn, exist_ok=True)
+    # backup existing file (best-effort, timestamped)
+    try:
+        if os.path.exists(path):
+            ts = time.strftime("%Y%m%d%H%M%S")
+            backup = f"{path}.bak-{ts}"
+            try:
+                with open(path, "rb") as src, open(backup, "wb") as dst:
+                    dst.write(src.read())
+                try:
+                    os.chmod(backup, 0o600)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=dirn, prefix=".ai_config.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        try:
+            os.chmod(tmp, 0o600)
+        except Exception:
+            pass
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+    return path
+
+
+def _env_json_override_active() -> bool:
+    env_json = os.environ.get("CTI_AI_CONFIG", "").strip()
+    if not env_json:
+        return False
+    try:
+        d = json.loads(env_json)
+        return isinstance(d, dict) and bool(d.get("profiles"))
+    except Exception:
+        return False
+
+
+def save_profile(name, fields):
+    """Additive merge of one profile into the file config. Returns (ok, info)."""
+    if _env_json_override_active():
+        return False, "CTI_AI_CONFIG env override is active — unset it to manage file profiles"
+    ok, reason, fd = validate_profile_fields(name, fields if isinstance(fields, dict) else {})
+    if not ok:
+        return False, reason
+    n = str(name or "").strip().lower()
+    data = _read_file_config()
+    profiles = data.get("profiles")
+    if not isinstance(profiles, dict):
+        profiles = {}
+    profiles[n] = fd
+    data["profiles"] = profiles
+    default = data.get("default_profile")
+    if default not in profiles:
+        # preserve existing valid default; otherwise default to the saved profile
+        # only when there was no valid default before (never steal default)
+        if not default:
+            data["default_profile"] = n
+    try:
+        _write_file_config(data)
+    except Exception as e:
+        return False, f"write failed: {type(e).__name__}: {e}"
+    return True, fd
+
+
+def delete_profile(name):
+    if _env_json_override_active():
+        return False, "CTI_AI_CONFIG env override is active — unset it to manage file profiles"
+    n = str(name or "").strip().lower()
+    if not _PROFILE_NAME_RE.match(n):
+        return False, "invalid name"
+    data = _read_file_config()
+    profiles = data.get("profiles")
+    if not isinstance(profiles, dict) or n not in profiles:
+        return False, "unknown profile"
+    if len(profiles) <= 1:
+        return False, "cannot delete the last profile (edit it instead)"
+    del profiles[n]
+    data["profiles"] = profiles
+    if data.get("default_profile") == n:
+        data["default_profile"] = next(iter(profiles), None)
+    try:
+        _write_file_config(data)
+    except Exception as e:
+        return False, f"write failed: {type(e).__name__}: {e}"
+    return True, {"deleted": n, "default_profile": data.get("default_profile")}
+
+
+def set_default_profile(name):
+    if _env_json_override_active():
+        return False, "CTI_AI_CONFIG env override is active — unset it to manage file profiles"
+    n = str(name or "").strip().lower()
+    data = _read_file_config()
+    profiles = data.get("profiles") or {}
+    if n not in profiles:
+        # also accept merged view (e.g. env-single) for default selection?
+        # default is persisted to file, so it must exist in the file.
+        return False, "unknown profile"
+    data["default_profile"] = n
+    try:
+        _write_file_config(data)
+    except Exception as e:
+        return False, f"write failed: {type(e).__name__}: {e}"
+    return True, {"default_profile": n}
+
+
+def get_profiles_for_edit() -> dict:
+    """Authenticated edit view: includes base_url/api_key_env names (no values)."""
+    profiles, default = load_profiles()
+    out = []
+    for pname, p in profiles.items():
+        ready = True
+        reason = ""
+        if p["provider"] == "openai-compatible" and p.get("api_key_env"):
+            if not os.environ.get(p["api_key_env"], "").strip():
+                ready = False
+                reason = f"missing key ({p['api_key_env']} not set in server env — export + restart)"
+        out.append({
+            "name": pname,
+            "provider": p["provider"],
+            "model": p["model"],
+            "base_url": p.get("base_url", ""),
+            "api_key_env": p.get("api_key_env"),
+            "timeout": p.get("timeout", 90),
+            "max_hosts": p.get("max_hosts", 10),
+            "max_tokens": p.get("max_tokens", 1024),
+            "ready": ready,
+            "reason": reason,
+            "default": pname == default,
+        })
+    out.sort(key=lambda x: x["name"])
+    src = config_source()
+    env_override = _env_json_override_active()
+    return {"default_profile": default, "profiles": out,
+            "source": src, "env_override": env_override,
+            "write_path": config_write_path() if not env_override else "",
+            "prompt_version": PROMPT_VERSION}
+
+
+def test_profile(name=None):
+    """Smoke-test a profile with a tiny structured prompt. Returns (ok, info)."""
+    profiles, default = load_profiles()
+    target = (str(name or "").strip() or default)
+    if not target or target not in profiles:
+        return False, {"error": "unknown profile", "allowed": sorted(profiles.keys())}
+    prompt = 'Reply with exactly this JSON and nothing else: {"findings":[]}'
+    try:
+        content, prov = call_ai(prompt, profile_name=target)
+    except Exception as e:
+        return False, {"profile": target, "error": f"{type(e).__name__}: {e}"}
+    if content:
+        info = dict(prov or {})
+        info["profile"] = target
+        info["ok"] = True
+        return True, info
+    info = dict(prov or {})
+    info["profile"] = target
+    info["ok"] = False
+    if not info.get("error"):
+        info["error"] = "no content (check model/cap/timeout, see server logs)"
+    return False, info
