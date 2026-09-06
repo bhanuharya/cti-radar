@@ -12,11 +12,10 @@ path = "src/main.rs"
 [dependencies]
 # async runtime + web
 axum = { version = "0.8", features = ["json", "query", "multipart"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["set-header", "trace", "cors"] }
+tower-http = { version = "0.6", features = ["set-header", "trace", "cors", "fs"] }
 futures = "0.3"
-async-trait = "0.1"
 
 # http client (scanner + AI providers) — rustls, no openssl dep
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli", "deflate"] }
@@ -37,6 +36,7 @@ sha2 = "0.10"
 subtle = "2"          # constant-time comparison (API token auth)
 base64 = "0.22"
 rand = "0.8"
+libc = "0.2"          # process-group termination for bounded active Nuclei runs
 
 # concurrency
 parking_lot = "0.12"
@@ -49,12 +49,11 @@ fancy-regex = "0.13"   # look-around support for PII-masking patterns (regex cra
 url = "2"
 
 # dns resolution + pinning (SSRF protection)
-hickory-resolver = "0.24"
+hickory-resolver = "0.26"
 
 # TLS cert inspection (expired/self-signed findings)
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
 webpki-roots = "0.26"
 x509-parser = "0.16"   # X.509 cert parsing (notAfter / issuer / SAN / self-signed)
 

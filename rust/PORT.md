@@ -62,7 +62,9 @@ CVE map (`app/cve_data.json`) are REUSED AS-IS — only the backend is ported.
 - POST /api/orgs/{slug}/openhack-config, /openhack-scan
 - GET  /api/openhack/models, /api/ai/capabilities, /api/orgs/{slug}/ai_profile
 - POST /api/orgs/{slug}/ai_profile
-- GET  /api/orgs/{slug}/report.pdf  (Chromium HTML->PDF, HTML fallback)
+- GET  /api/orgs/{slug}/report.pdf  (Chromium HTML->PDF with 45s timeout;
+  413 on oversize, 503 when Chromium missing/busy, HTML download on render
+  failure — mirrors Python exactly)
 - GET  /  (dashboard.html) and /static/*
 
 ## Data types (serde)

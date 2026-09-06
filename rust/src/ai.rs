@@ -2,6 +2,7 @@
 //! Port of `ai_providers.py`. Fail-open: any provider/parse failure returns
 //! None, never blocks the deterministic scan.
 
+use futures::FutureExt;
 use once_cell::sync::OnceCell;
 use regex::Regex;
 use serde_json::{json, Value};
@@ -10,68 +11,131 @@ use std::net::IpAddr;
 
 const VALID_PROVIDERS: [&str; 2] = ["ollama", "openai-compatible"];
 
+/// Prompt template version advertised via `get_capabilities` (parity with Python).
+pub const PROMPT_VERSION: &str = "cti-v1";
+
+fn data_root() -> String {
+    std::env::var("CTI_DATA_DIR")
+        .map(|d| d.trim_end_matches('/').to_string())
+        .unwrap_or_else(|_| "data".to_string())
+}
+
+fn org_profiles_path() -> String {
+    format!("{}/ai_org_profiles.json", data_root())
+}
+
+async fn load_org_profile_map() -> HashMap<String, String> {
+    let path = org_profiles_path();
+    tokio::fs::read_to_string(&path)
+        .await
+        .ok()
+        .and_then(|txt| serde_json::from_str::<Value>(&txt).ok())
+        .and_then(|v| v.as_object().cloned())
+        .map(|o| {
+            o.into_iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Preferred per-org profile from the ignored runtime file (parity with Python
+/// `get_org_profile`). Returns None when unset.
+pub async fn get_org_profile(slug: &str) -> Option<String> {
+    load_org_profile_map()
+        .await
+        .get(slug)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Persist a per-org profile preference to the ignored runtime file
+/// (atomic; empty clears). Parity with Python `set_org_profile`.
+pub async fn set_org_profile(slug: &str, profile: &str) {
+    let mut m = load_org_profile_map().await;
+    if profile.trim().is_empty() {
+        m.remove(slug);
+    } else {
+        m.insert(slug.to_string(), profile.trim().to_string());
+    }
+    let mut obj = serde_json::Map::new();
+    for (k, v) in m {
+        obj.insert(k, Value::String(v));
+    }
+    let _ = crate::correlation::atomic_write_json(
+        &std::path::PathBuf::from(org_profiles_path()),
+        &Value::Object(obj),
+    )
+    .await;
+}
+
 fn allowed_api_key_re() -> &'static Regex {
     static RE: OnceCell<Regex> = OnceCell::new();
     RE.get_or_init(|| Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").unwrap())
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    match host.parse::<IpAddr>() {
+    // parity with Python `_is_loopback_host` (case-insensitive)
+    let h = host.to_lowercase();
+    if h == "localhost" {
+        return true;
+    }
+    match h.parse::<IpAddr>() {
         Ok(ip) => ip.is_loopback(),
-        Err(_) => host == "localhost",
-    }
-}
-
-fn is_global_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            !(v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || is_cgnat(*v4))
-        }
-        IpAddr::V6(v6) => {
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || is_ipv6_private(*v6)
-                || is_ipv6_link_local(*v6))
-        }
-    }
-}
-
-fn is_cgnat(v4: std::net::Ipv4Addr) -> bool {
-    // 100.64.0.0/10 (shared address space)
-    let o = v4.octets();
-    o[0] == 100 && (64..=127).contains(&o[1])
-}
-
-fn dns_resolves_to_private(hostname: &str) -> bool {
-    // DNS rebinding guard: reject hostnames resolving to any private address.
-    use std::net::ToSocketAddrs;
-    match (hostname, 443).to_socket_addrs() {
-        Ok(addrs) => addrs.into_iter().any(|a| !is_global_ip(&a.ip())),
         Err(_) => false,
     }
 }
 
-fn is_ipv6_private(v6: std::net::Ipv6Addr) -> bool {
-    // Conservative: treat ULA (fc00::/7) as private.
-    let seg = v6.segments();
-    seg[0] & 0xfe00 == 0xfc00
+/// Global-reachability check — exact CPython `ip.is_global` semantics.
+fn is_global_ip(ip: &IpAddr) -> bool {
+    crate::net::is_global_ip(&ip.to_string())
 }
 
-fn is_ipv6_link_local(v6: std::net::Ipv6Addr) -> bool {
-    let seg = v6.segments();
-    seg[0] & 0xffc0 == 0xfe80
+/// DNS rebinding guard via the shared hickory resolver: reject hostnames
+/// resolving to any non-global address. Fail-CLOSED on resolution failure
+/// (parity with Python `_dns_resolves_to_private`).
+async fn dns_resolves_to_private(hostname: &str) -> bool {
+    match crate::scanner::dns_resolver().lookup_ip(hostname).await {
+        Ok(lookup) => {
+            let mut any = false;
+            for ip in lookup.iter() {
+                any = true;
+                if !is_global_ip(&ip) {
+                    return true;
+                }
+            }
+            // empty answer = unresolvable -> block (fail closed)
+            !any
+        }
+        Err(_) => true,
+    }
 }
 
-/// Validate an AI provider base URL (SSRF protections mirror the Python).
+/// Validate an AI provider base URL — pure syntactic checks only (no DNS).
+/// Unit-test entry point; production validation MUST use
+/// [`validate_base_url_live`], which adds the DNS-rebinding check.
 pub fn validate_base_url(base_url: &str, provider: &str, api_key_env: Option<&str>) -> bool {
+    validate_base_url_inner(base_url, provider, api_key_env, false)
+        .now_or_never()
+        .unwrap_or(false)
+}
+
+/// Full validation incl. async DNS-rebinding check via the shared hickory
+/// resolver (SSRF protections mirror the Python).
+pub async fn validate_base_url_live(
+    base_url: &str,
+    provider: &str,
+    api_key_env: Option<&str>,
+) -> bool {
+    validate_base_url_inner(base_url, provider, api_key_env, true).await
+}
+
+async fn validate_base_url_inner(
+    base_url: &str,
+    provider: &str,
+    api_key_env: Option<&str>,
+    check_dns: bool,
+) -> bool {
     let parsed = match url::Url::parse(base_url) {
         Ok(p) => p,
         Err(_) => return false,
@@ -106,7 +170,7 @@ pub fn validate_base_url(base_url: &str, provider: &str, api_key_env: Option<&st
             if host == "169.254.169.254" {
                 return false;
             }
-            if !is_loopback_host(host) && dns_resolves_to_private(host) {
+            if check_dns && !is_loopback_host(host) && dns_resolves_to_private(host).await {
                 return false;
             }
         }
@@ -121,8 +185,8 @@ pub fn validate_base_url(base_url: &str, provider: &str, api_key_env: Option<&st
 }
 
 /// Load normalized profiles -> (profiles map, default_profile name).
-pub fn load_profiles() -> (HashMap<String, Value>, Option<String>) {
-    let raw = load_raw_config();
+pub async fn load_profiles() -> (HashMap<String, Value>, Option<String>) {
+    let raw = load_raw_config().await;
     let raw = if raw.as_object().map(|o| o.is_empty()).unwrap_or(true)
         || raw
             .get("profiles")
@@ -180,7 +244,7 @@ pub fn load_profiles() -> (HashMap<String, Value>, Option<String>) {
                     continue;
                 }
             }
-            if !validate_base_url(&base_url, &provider, api_key_env.as_deref()) {
+            if !validate_base_url_live(&base_url, &provider, api_key_env.as_deref()).await {
                 continue;
             }
             let timeout = clamp(
@@ -230,7 +294,7 @@ fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
     v.max(lo).min(hi)
 }
 
-fn load_raw_config() -> Value {
+async fn load_raw_config() -> Value {
     // 1. env JSON
     if let Ok(env_json) = std::env::var("CTI_AI_CONFIG") {
         if let Ok(d) = serde_json::from_str::<Value>(&env_json) {
@@ -247,7 +311,7 @@ fn load_raw_config() -> Value {
         format!("{}/ai_config.json", data_dir.trim_end_matches('/'))
     };
     if std::path::Path::new(&cfg_path).exists() {
-        if let Ok(txt) = std::fs::read_to_string(&cfg_path) {
+        if let Ok(txt) = tokio::fs::read_to_string(&cfg_path).await {
             if let Ok(d) = serde_json::from_str::<Value>(&txt) {
                 if d.is_object() {
                     return d;
@@ -279,24 +343,98 @@ fn build_default_config() -> Value {
     })
 }
 
-pub fn is_ai_configured() -> bool {
-    let (profiles, _) = load_profiles();
-    !profiles.is_empty()
-}
-
-pub fn resolve_profile_for_org(_slug: &str, _override: Option<&str>) -> Option<String> {
-    let (profiles, default) = load_profiles();
-    if let Some(o) = _override {
+/// Resolve the effective profile for an org:
+/// override > runtime-file preference > legacy orgs.json ai_profile > default.
+/// Parity with Python `resolve_profile_for_org`.
+pub async fn resolve_profile_for_org(slug: &str, override_: Option<&str>) -> Option<String> {
+    let (profiles, default) = load_profiles().await;
+    if let Some(o) = override_ {
         if profiles.contains_key(o) {
             return Some(o.to_string());
+        }
+    }
+    if !slug.is_empty() {
+        // 1. ignored runtime file (preferred, does not dirty tracked registry)
+        if let Some(pref) = get_org_profile(slug).await {
+            if profiles.contains_key(&pref) {
+                return Some(pref);
+            }
+        }
+        // 2. legacy orgs.json ai_profile (backwards compat)
+        let reg_path = format!("{}/orgs.json", data_root());
+        if let Ok(txt) = tokio::fs::read_to_string(&reg_path).await {
+            if let Ok(reg) = serde_json::from_str::<Value>(&txt) {
+                if let Some(pref) = reg
+                    .get(slug)
+                    .and_then(|e| e.get("ai_profile"))
+                    .and_then(|v| v.as_str())
+                {
+                    let pref = pref.trim().to_string();
+                    if profiles.contains_key(&pref) {
+                        return Some(pref);
+                    }
+                }
+            }
         }
     }
     default
 }
 
+/// Effective profile that is also *ready* (an openai-compatible profile whose
+/// API key env var is missing degrades to None). Mirrors the scan-handler
+/// fallback in Python `api_org_scan`: deterministic work always proceeds.
+pub async fn effective_ready_profile(slug: &str, override_: Option<&str>) -> Option<String> {
+    let eff = resolve_profile_for_org(slug, override_).await?;
+    let (profiles, _) = load_profiles().await;
+    let p = profiles.get(&eff)?;
+    if p.get("provider").and_then(|v| v.as_str()) == Some("openai-compatible") {
+        if let Some(k) = p.get("api_key_env").and_then(|v| v.as_str()) {
+            if std::env::var(k).map(|v| v.trim().is_empty()).unwrap_or(true) {
+                return None;
+            }
+        }
+    }
+    Some(eff)
+}
+
+/// Safe public view of provider capabilities: no secrets, no base URLs.
+/// Parity with Python `get_capabilities`.
+pub async fn get_capabilities() -> Value {
+    let (profiles, default) = load_profiles().await;
+    let mut names: Vec<&String> = profiles.keys().collect();
+    names.sort();
+    let mut caps = Vec::new();
+    for name in names {
+        let p = &profiles[name];
+        let provider = p.get("provider").and_then(|v| v.as_str()).unwrap_or("");
+        let mut ready = true;
+        if provider == "openai-compatible" {
+            if let Some(k) = p.get("api_key_env").and_then(|v| v.as_str()) {
+                if std::env::var(k).map(|v| v.trim().is_empty()).unwrap_or(true) {
+                    ready = false;
+                }
+            }
+        }
+        caps.push(json!({
+            "name": name,
+            "provider": provider,
+            "model": p.get("model").cloned().unwrap_or(Value::Null),
+            "timeout": p.get("timeout").cloned().unwrap_or(Value::Null),
+            "max_hosts": p.get("max_hosts").cloned().unwrap_or(Value::Null),
+            "ready": ready,
+            "default": Some(name.as_str()) == default.as_deref(),
+        }));
+    }
+    json!({
+        "default_profile": default,
+        "profiles": caps,
+        "prompt_version": PROMPT_VERSION,
+    })
+}
+
 /// Make a chat-completion call. Returns Some(text) or None (fail-open).
 pub async fn call_ai(prompt: &str, profile_name: Option<&str>) -> Option<String> {
-    let (profiles, default) = load_profiles();
+    let (profiles, default) = load_profiles().await;
     let name = profile_name
         .map(|s| s.to_string())
         .or(default)

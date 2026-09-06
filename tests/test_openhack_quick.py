@@ -307,14 +307,14 @@ def test_models_endpoint_auth_and_payload(monkeypatch, tmp_path):
     monkeypatch.setattr(oh, "openhack_bin", lambda: "/bin/true")
     monkeypatch.setattr(oh, "list_models",
                         lambda force=False: {"models": [
-                            {"id": "ox-alpha", "label": "OX Alpha"},
-                            {"id": "zai/glm-5.2", "label": "GLM 5.2"}],
-                            "default": "ox-alpha"})
+                            {"id": "glm-5.3-flash", "label": "GLM 5.3 Flash"},
+                            {"id": "glm-5.2", "label": "GLM 5.2"}],
+                            "default": "glm-5.3-flash"})
     assert client.get("/api/openhack/models").status_code == 401
     r = client.get("/api/openhack/models", headers=H)
     d = r.json()
-    assert r.status_code == 200 and d["default"] == "ox-alpha"
-    assert {m["id"] for m in d["models"]} == {"ox-alpha", "zai/glm-5.2"}
+    assert r.status_code == 200 and d["default"] == "glm-5.3-flash"
+    assert {m["id"] for m in d["models"]} == {"glm-5.3-flash", "glm-5.2"}
 
 
 def test_config_persists_and_resets_model(monkeypatch, tmp_path):
@@ -369,7 +369,7 @@ def test_scan_endpoint_passes_org_model(monkeypatch, tmp_path):
         time.sleep(0.05)
     assert captured["model"] == "zai/glm-5.2"
 
-    # no org pin -> falls back to the preferred runnable default (ox-alpha),
+    # no org pin -> falls back to the preferred runnable default (GLM Flash),
     # NOT the hosted catalog's nominal default
     monkeypatch.setattr(m.cc, "org_get",
                         lambda s: {**(real(s) or {})} if s == "sample" else real(s))
@@ -382,4 +382,4 @@ def test_scan_endpoint_passes_org_model(monkeypatch, tmp_path):
         if st in ("done", "failed"):
             break
         time.sleep(0.05)
-    assert captured["model"] == "ox-alpha", captured
+    assert captured["model"] == "glm-5.3-flash", captured

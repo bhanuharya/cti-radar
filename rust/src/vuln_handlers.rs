@@ -1,171 +1,201 @@
-//! Vuln-scan HTTP handlers — host-based lookup (passive default, active gated).
-//! Port of the `/vuln-scan` endpoints in main.py.
+//! Vulnerability lookup HTTP handlers.
 
 use crate::error::{AppError, AppResult};
 use crate::handlers::require_org;
-use crate::vuln_scan::{self, VulnOptions};
+use crate::handlers_mut::job_busy_error;
+use crate::vuln_scan;
 use crate::AppState;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::Json;
 use serde_json::{json, Value};
-use std::sync::Arc;
 
 #[derive(serde::Deserialize, Default)]
 pub struct VulnScanBody {
-    #[serde(default)]
-    pub targets: Vec<String>,
-    #[serde(default)]
-    pub checks: Vec<String>,
-    #[serde(default = "default_true")]
-    pub refresh: bool,
-    #[serde(default)]
-    pub include_nvd: bool,
-    #[serde(default)]
-    pub active: bool,
-    #[serde(default)]
-    pub engine: String,
-    #[serde(default)]
-    pub nuclei_severity: Vec<String>,
-    #[serde(default)]
-    pub nuclei_tags: Vec<String>,
+    pub engine: Option<String>,
+    pub targets: Option<Vec<String>>,
+    pub checks: Option<Vec<String>>,
+    pub severity: Option<Vec<String>>,
+    pub tags: Option<Vec<String>>,
+    /// Python-parity aliases for the Nuclei-specific filters.
+    pub nuclei_severity: Option<Vec<String>>,
+    pub nuclei_tags: Option<Vec<String>>,
+    pub refresh: Option<bool>,
+    pub include_nvd: Option<bool>,
+    pub active: Option<bool>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-pub async fn api_vuln_engines(
-    State(_s): State<AppState>,
-    headers: HeaderMap,
-) -> AppResult<Json<Value>> {
+pub async fn api_vuln_engines(headers: HeaderMap) -> AppResult<Json<Value>> {
     crate::auth::require_auth(&headers)?;
+    let gate = vuln_scan::active_gate_from_env();
+    let (nuclei_available, nuclei_reason) =
+        if let Some(error) = vuln_scan::active_gate_setup_error(&gate, chrono::Utc::now()) {
+            (false, error)
+        } else {
+            match vuln_scan::nuclei_runtime_from_env() {
+                Ok(_) => (
+                    true,
+                    "authorized runtime configured; organization scope is checked per request"
+                        .to_string(),
+                ),
+                Err(error) => (false, error),
+            }
+        };
     Ok(Json(json!({
-        "passive": {"available": true, "checks": ["cve", "version", "headers", "tls", "login"]},
-        "nuclei": crate::nuclei::engine_status(),
+        "passive": {
+            "available": true,
+            "active": false,
+            "checks": vuln_scan::VALID_CHECKS,
+            "note": "stored-fingerprint lookup only; no fresh network activity",
+        },
+        "nuclei": {
+            "available": nuclei_available,
+            "active": true,
+            "reason": nuclei_reason,
+            "severity": vuln_scan::DEFAULT_NUCLEI_SEVERITY,
+        },
     })))
 }
 
 pub async fn api_org_vuln_scan(
-    State(_s): State<AppState>,
+    State(_state): State<AppState>,
     Path(slug): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<VulnScanBody>,
+    body: Option<Json<VulnScanBody>>,
 ) -> AppResult<Json<Value>> {
     let org = require_org(&slug, &headers)?;
-    let engine = if body.engine.trim().is_empty() {
-        "passive".to_string()
-    } else {
-        body.engine.trim().to_lowercase()
-    };
-    if engine != "passive" && engine != "nuclei" {
-        return Err(AppError::BadRequest("invalid engine (passive|nuclei)".into()));
+    let body = body.map(|value| value.0).unwrap_or_default();
+    let engine = body.engine.as_deref().unwrap_or("passive");
+    if body.severity.is_some() && body.nuclei_severity.is_some() {
+        return Err(AppError::BadRequest(
+            "provide only one of severity or nuclei_severity".to_string(),
+        ));
     }
-    // Fail-closed gate BEFORE acquiring a job or spawning anything: no
-    // subprocess, no network, when the authorization is absent.
-    if body.active || engine == "nuclei" {
-        let mut orgv = org.clone();
-        orgv["slug"] = json!(slug);
-        if let Some(gate) = vuln_scan::authorization_error(&orgv) {
+    if body.tags.is_some() && body.nuclei_tags.is_some() {
+        return Err(AppError::BadRequest(
+            "provide only one of tags or nuclei_tags".to_string(),
+        ));
+    }
+    let severity_input = body.nuclei_severity.as_deref().or(body.severity.as_deref());
+    let tags_input = body.nuclei_tags.as_deref().or(body.tags.as_deref());
+    let options = vuln_scan::normalize_request_options(engine, severity_input, tags_input)
+        .map_err(AppError::BadRequest)?;
+    let request =
+        vuln_scan::validate_passive_request(body.targets.as_deref(), body.checks.as_deref())
+            .map_err(AppError::BadRequest)?;
+    // Nuclei is active: authorization is deliberately before *any* binary or
+    // templates lookup. Scope is checked again inside the background runner.
+    if options.engine == "nuclei" {
+        let gate = vuln_scan::active_gate_from_env();
+        if let Some(error) = vuln_scan::authorization_error(&gate, &org, chrono::Utc::now()) {
             return Err(AppError::Forbidden(format!(
-                "active assessment denied: {}",
-                gate
+                "nuclei engine denied: {error}"
             )));
         }
-    }
-    if engine == "nuclei" {
-        let sev = if body.nuclei_severity.is_empty() {
-            None
+        let runtime = vuln_scan::nuclei_runtime_from_env().map_err(AppError::ServiceUnavailable)?;
+        let (_, cached) = vuln_scan::load_findings_document(&slug)
+            .await
+            .map_err(AppError::Internal)?;
+        let targets = vuln_scan::active_nuclei_targets(&org, &cached, &request.targets)
+            .map_err(AppError::BadRequest)?;
+        let severity = if severity_input.is_some_and(|values| !values.is_empty()) {
+            options.severity
         } else {
-            Some(body.nuclei_severity.as_slice())
+            runtime.severity.clone()
         };
-        let tags = if body.nuclei_tags.is_empty() {
-            None
+        let tags = if tags_input.is_some_and(|values| !values.is_empty()) {
+            options.tags
         } else {
-            Some(body.nuclei_tags.as_slice())
+            runtime.tags.clone()
         };
-        if let Err(e) = crate::nuclei::normalize_options(sev, tags) {
-            return Err(AppError::BadRequest(e));
+        let (ok, job_id) = crate::jobs::try_acquire_job(&slug, "vuln-scan");
+        if !ok {
+            return Err(job_busy_error(&slug, "vuln-scan", job_id));
         }
-        let st = crate::nuclei::engine_status();
-        if st.get("available").and_then(|v| v.as_bool()) != Some(true) {
-            let reason = st.get("reason").and_then(|v| v.as_str()).unwrap_or("unknown");
-            return Err(AppError::Internal(format!(
-                "nuclei engine unavailable: {}",
-                reason
-            )));
-        }
+        let job_id = job_id.expect("job id on successful acquisition");
+        crate::logs::log_event(
+            "info",
+            "vuln-scan",
+            &slug,
+            "Nuclei active run queued",
+            Some(&job_id),
+        )
+        .await;
+        let (slug2, job2, org2) = (slug.clone(), job_id.clone(), org.clone());
+        tokio::spawn(async move {
+            match vuln_scan::run_active_nuclei_lookup(
+                &slug2, &org2, runtime, targets, severity, tags,
+            )
+            .await
+            {
+                Ok(result) => {
+                    crate::jobs::release_job(&slug2, "vuln-scan", &job2, None, Some(result));
+                    crate::logs::log_event(
+                        "info",
+                        "vuln-scan",
+                        &slug2,
+                        "Nuclei active run completed",
+                        Some(&job2),
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    crate::jobs::release_job(&slug2, "vuln-scan", &job2, Some(error.clone()), None);
+                    crate::logs::log_event("error", "vuln-scan", &slug2, &error, Some(&job2)).await;
+                }
+            }
+        });
+        return Ok(Json(
+            json!({"queued": true, "slug": slug, "job_id": job_id, "engine": "nuclei"}),
+        ));
     }
-
-    let (ok, jid) = crate::jobs::try_acquire_job(&slug, "vuln");
+    let _ = (body.refresh, body.include_nvd, body.active);
+    let (ok, job_id) = crate::jobs::try_acquire_job(&slug, "vuln-scan");
     if !ok {
-        return Err(AppError::Conflict("vuln lookup already running".into()));
+        return Err(job_busy_error(&slug, "vuln-scan", job_id));
     }
-    let jid = jid.unwrap();
-    let targets: Vec<String> = body
-        .targets
-        .into_iter()
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .take(20)
-        .collect();
-    let checks: Vec<String> = body
-        .checks
-        .into_iter()
-        .map(|c| c.trim().to_lowercase())
-        .take(10)
-        .collect();
-    let (refresh, include_nvd, active) = (body.refresh, body.include_nvd, body.active);
-    let (nuc_sev, nuc_tags) = (body.nuclei_severity, body.nuclei_tags);
-    let resp_checks = checks.clone();
-    let resp_active = active;
-
-    let (slug2, jid2, engine2) = (slug.clone(), jid.clone(), engine.clone());
-    let (slug_pb, jid_pb) = (slug2.clone(), jid2.clone());
+    let job_id = job_id.expect("job id on successful acquisition");
+    crate::logs::log_event(
+        "info",
+        "vuln-scan",
+        &slug,
+        "passive vulnerability lookup queued",
+        Some(&job_id),
+    )
+    .await;
+    let (slug2, job2, org2) = (slug.clone(), job_id.clone(), org.clone());
     tokio::spawn(async move {
-        let opts = VulnOptions {
-            targets: if targets.is_empty() { None } else { Some(targets) },
-            checks: if checks.is_empty() { None } else { Some(checks) },
-            refresh,
-            include_nvd,
-            active,
-            engine: engine2,
-            nuclei_severity: if nuc_sev.is_empty() { None } else { Some(nuc_sev) },
-            nuclei_tags: if nuc_tags.is_empty() { None } else { Some(nuc_tags) },
-            on_progress: Some(Arc::new(move |stage: String, msg: String| {
-                crate::jobs::job_progress(&slug_pb, "vuln", &jid_pb, &stage, &msg);
-            })),
-        };
-        let result = vuln_scan::vuln_scan_org(&slug2, opts).await;
-        if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
-            // mirror structured failure: surface as a failed job with context
-            crate::jobs::release_job(
-                &slug2,
-                "vuln",
-                &jid2,
-                Some(err.to_string()),
-                Some(result),
-            );
-        } else {
-            crate::jobs::release_job(&slug2, "vuln", &jid2, None, Some(result));
+        match vuln_scan::run_passive_lookup(&slug2, &org2, request).await {
+            Ok(result) => {
+                crate::jobs::release_job(&slug2, "vuln-scan", &job2, None, Some(result));
+                crate::logs::log_event(
+                    "info",
+                    "vuln-scan",
+                    &slug2,
+                    "passive vulnerability lookup completed",
+                    Some(&job2),
+                )
+                .await;
+            }
+            Err(error) => {
+                crate::jobs::release_job(&slug2, "vuln-scan", &job2, Some(error.clone()), None);
+                crate::logs::log_event("error", "vuln-scan", &slug2, &error, Some(&job2)).await;
+            }
         }
     });
-
     Ok(Json(json!({
-        "queued": true, "slug": slug, "job_id": jid,
-        "checks": resp_checks,
-        "engine": engine, "active": resp_active,
+        "queued": true,
+        "slug": slug,
+        "job_id": job_id,
+        "engine": "passive",
     })))
 }
 
-pub async fn api_vuln_status(
-    State(_s): State<AppState>,
+pub async fn api_vuln_scan_status(
+    State(_state): State<AppState>,
     Path((slug, job_id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
     require_org(&slug, &headers)?;
-    let running = crate::jobs::is_job_running(&slug, "vuln");
-    Ok(Json(crate::jobs::job_status(
-        &slug, "vuln", &job_id, running,
-    )))
+    Ok(Json(crate::jobs::job_status(&slug, "vuln-scan", &job_id)?))
 }

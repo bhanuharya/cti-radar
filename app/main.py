@@ -810,7 +810,7 @@ def api_org_openhack_scan(slug: str, body: OpenhackScanBody = None,
         return JSONResponse({"error": "invalid model id"}, status_code=400)
     model = (model
              or (cc.org_get(slug) or {}).get("openhack_model")
-             or oh.OHACK_PREFERRED_MODEL)   # ox-alpha: proven runnable default
+             or oh.OHACK_PREFERRED_MODEL)   # verified OpenHack GLM default
     org = cc.org_get(slug)
     if org is None:
         return _org_not_found(slug)

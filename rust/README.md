@@ -70,6 +70,36 @@ Binds `127.0.0.1` by default and refuses `0.0.0.0`/`::`.
 - PII masking on every read path; SSRF/DNS-rebinding guards on scanner + AI URLs.
 - Atomic 0600/0700 writes; security headers on every response.
 - OpenHack active assessment fail-closed (active+isolated+bin+allowlist+ROE).
+- Nuclei active templates fail-closed before executable lookup or process spawn;
+  passive vuln lookup reads stored fingerprints only.
+
+## Nuclei vulnerability lookup (disabled by default)
+
+Rust exposes authenticated `GET /api/vuln/engines`, `POST
+/api/orgs/{slug}/vuln-scan`, and `GET
+/api/orgs/{slug}/vuln-scan/{job_id}`. `engine: "passive"` is local-only:
+it evaluates already stored fingerprints without new DNS, HTTP, TLS, or NVD
+requests. `engine: "nuclei"` is active and never runs unless all checks below
+pass **before** binary lookup or process creation:
+
+- `CTI_VULN_ACTIVE=1` and `CTI_VULN_ISOLATED=1`;
+- nonempty `CTI_VULN_ALLOWED_DOMAINS` containing every registered domain
+  exactly (DNS names only; no URLs, paths, ports, wildcards, or IPs); and
+- future, timezone-aware RFC3339 `CTI_VULN_ROE_EXPIRES`.
+
+`CTI_NUCLEI_BIN`, when set, must be an absolute executable; otherwise the
+runner may find `nuclei` on `PATH`. Templates must be an existing
+`CTI_NUCLEI_TEMPLATES` directory or `~/nuclei-templates`. Defaults are
+severity `critical,high,medium`, rate limit `20` (clamped `1..150`), and
+run budget `300` seconds (clamped `60..1200`). `CTI_NUCLEI_TAGS` is an optional
+strict tag allowlist (maximum 20). `dos`, `fuzz`, and `intrusive`
+templates are excluded; `dos` and `fuzz` cannot be removed. Interactsh/OAST is
+off unless `CTI_NUCLEI_INTERACTSH=1` exactly. Use only for written,
+time-bounded authorization in an isolated environment.
+
+Nuclei inputs are canonical registered hostnames (stored URLs can supply only
+a matching scheme/non-default port), output is bounded to 10 MiB/500 events,
+and temporary runner files are private and removed after each run.
 
 ## Benchmarking
 

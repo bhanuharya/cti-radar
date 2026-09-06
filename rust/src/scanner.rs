@@ -11,14 +11,52 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-pub const ENUM_NAME_CAP: usize = 500;
-pub const MAX_TOTAL_HOSTS: usize = 1000;
 pub const DNS_WORKERS: usize = 32;
 pub const HTTP_WORKERS: usize = 32;
-pub const CURL_MAX_BYTES: usize = 2_000_000;
-pub const NVD_MAX_LOOKUPS: usize = 20;
-pub const RESOLVE_AFTER_MISSES: i64 = 3;
 pub const AI_GRADE_MAX: usize = 200;
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_i64(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// Env-tunable scan caps (parity with the Python `_env_int` tunables).
+pub fn enum_name_cap() -> usize {
+    env_usize("CTI_ENUM_CAP", 500)
+}
+pub fn max_total_hosts() -> usize {
+    env_usize("CTI_MAX_HOSTS", 200)
+}
+pub fn curl_max_bytes() -> usize {
+    env_usize("CTI_CURL_MAX_BYTES", 204800)
+}
+pub fn nvd_max_lookups() -> usize {
+    env_usize("CTI_NVD_MAX_LOOKUPS", 20)
+}
+pub fn resolve_after_misses() -> i64 {
+    env_i64("CTI_RESOLVE_AFTER", 3).max(1)
+}
+/// Wildcard-DNS filtering toggle (default on; `0/false/no/off` disables).
+/// Parity with Python `WILDCARD_FILTER`.
+pub fn wildcard_filter_enabled() -> bool {
+    !matches!(
+        std::env::var("CTI_WILDCARD_FILTER")
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
 
 /// Common service ports probed by the TCP connect scan: port -> name.
 pub fn service_ports() -> &'static [(u16, &'static str)] {
@@ -106,58 +144,29 @@ pub fn is_valid_domain(d: &str) -> bool {
         .all(|p| !p.starts_with('-') && !p.ends_with('-'))
 }
 
+/// Global-reachability check — exact CPython `ip.is_global` semantics.
+/// Delegates to [`crate::net::is_global_ip`] (SSRF guard).
 pub fn is_global_ip(ip: &str) -> bool {
-    let ip = ip.trim();
-    match ip.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v4)) => {
-            !(v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || is_cgnat(v4))
-        }
-        Ok(std::net::IpAddr::V6(v6)) => {
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || is_ipv6_private(v6)
-                || is_ipv6_link_local(v6))
-        }
-        Err(_) => false,
-    }
-}
-
-fn is_cgnat(v4: std::net::Ipv4Addr) -> bool {
-    let o = v4.octets();
-    o[0] == 100 && (64..=127).contains(&o[1])
-}
-
-fn is_ipv6_private(v6: std::net::Ipv6Addr) -> bool {
-    let s = v6.segments();
-    s[0] & 0xfe00 == 0xfc00
-}
-
-fn is_ipv6_link_local(v6: std::net::Ipv6Addr) -> bool {
-    let s = v6.segments();
-    s[0] & 0xffc0 == 0xfe80
+    crate::net::is_global_ip(ip)
 }
 
 pub fn slugify(s: &str) -> String {
-    let out: String = s
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_lowercase() || c.is_ascii_digit() {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let out = out.trim_matches('-').to_string();
+    // parity with Python `_slugify`: runs of non-[a-z0-9-] collapse to one
+    // dash, trimmed, capped at 48 chars (finding-ID prefixes).
+    let mut out = String::new();
+    let mut last_dash = true; // leading trim
+    for c in s.to_lowercase().chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            out.push(c);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
     out.chars().take(48).collect()
 }
 
@@ -273,6 +282,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_pinned_client_pin_validation() {
+        // global pin -> client builds; private/loopback/unparseable -> None
+        assert!(pinned_client("example.com", "93.184.216.34", 443).is_some());
+        assert!(pinned_client("example.com", "93.184.216.34", 80).is_some());
+        assert!(pinned_client("example.com", "10.0.0.1", 443).is_none());
+        assert!(pinned_client("example.com", "127.0.0.1", 443).is_none());
+        assert!(pinned_client("example.com", "not-an-ip", 443).is_none());
+    }
+
+    // Live-network regression test for the resolve_to_addrs override:
+    // a port-0 override silently connects to IP:0 and fails everything.
+    // Run explicitly: cargo test -- --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn test_fetch_fingerprint_live() {
+        let ips = resolve("example.com").await;
+        assert!(!ips.is_empty(), "DNS must resolve example.com");
+        let (probe, snippet) = fetch_fingerprint("example.com", &ips).await;
+        assert!(probe.is_some(), "fingerprint must succeed against example.com");
+        assert!(snippet.is_some());
+    }
+
+    #[test]
     fn test_is_valid_domain() {
         assert!(is_valid_domain("example.com"));
         assert!(is_valid_domain("api.example.com"));
@@ -318,6 +350,27 @@ mod tests {
 // async network layer (tokio + shared reqwest client + hickory resolver)
 // ===========================================================================
 
+/// Shared hickory DNS resolver (system /etc/resolv.conf, tokio runtime).
+/// ONE resolver for the whole scan — cloned via Arc semantics internally
+/// (TokioResolver is Clone + Send + Sync).
+pub fn dns_resolver() -> &'static hickory_resolver::TokioResolver {
+    static RESOLVER: OnceCell<hickory_resolver::TokioResolver> = OnceCell::new();
+    RESOLVER.get_or_init(|| {
+        hickory_resolver::TokioResolver::builder_tokio()
+            .and_then(|b| b.build())
+            .unwrap_or_else(|_| {
+                hickory_resolver::TokioResolver::builder_with_config(
+                    hickory_resolver::config::ResolverConfig::udp_and_tcp(
+                        &hickory_resolver::config::CLOUDFLARE,
+                    ),
+                    Default::default(),
+                )
+                .build()
+                .expect("cloudflare resolver build failed")
+            })
+    })
+}
+
 /// Shared HTTP client (rustls, no proxy, no redirects, size-limited).
 pub fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceCell<reqwest::Client> = OnceCell::new();
@@ -342,7 +395,7 @@ pub async fn fetch_text(url: &str) -> String {
                 return String::new();
             }
             match resp.text().await {
-                Ok(body) => body.chars().take(CURL_MAX_BYTES).collect(),
+                Ok(body) => body.chars().take(curl_max_bytes()).collect(),
                 Err(_) => String::new(),
             }
         }
@@ -350,47 +403,109 @@ pub async fn fetch_text(url: &str) -> String {
     }
 }
 
-/// Resolve a hostname to A/AAAA records, filtered to global IPs only.
+/// Resolve a hostname to A/AAAA records via the shared hickory resolver.
+///
+/// Parity with Python `_resolve`: if ANY resolved address is non-global the
+/// whole host is rejected (DNS-rebinding protection) — filtering would let
+/// a mixed answer steer probing. Results are stable-sorted IPv4-first,
+/// approximating typical `getaddrinfo` order (which the Python `curl`
+/// pinning relies on when it takes the first validated IP).
 pub async fn resolve(host: &str) -> Vec<String> {
-    use tokio::net::lookup_host;
-    match lookup_host((host, 443)).await {
-        Ok(addrs) => addrs
-            .map(|a| a.ip().to_string())
-            .filter(|ip| is_global_ip(ip))
-            .collect(),
-        Err(_) => Vec::new(),
+    let mut ips: Vec<String> = match dns_resolver().lookup_ip(host).await {
+        Ok(lookup) => lookup.iter().map(|ip| ip.to_string()).collect(),
+        Err(_) => return Vec::new(),
+    };
+    ips.sort();
+    ips.dedup();
+    if ips.iter().any(|ip| !is_global_ip(ip)) {
+        return Vec::new();
     }
+    // stable IPv4-first (getaddrinfo-order approximation for pin selection)
+    ips.sort_by_key(|ip| ip.contains(':'));
+    ips
 }
 
-/// Detect wildcard DNS: a synthetic random label that still resolves means the
-/// domain has a wildcard record.
-async fn detect_wildcard(domain: &str) -> bool {
+/// Build an HTTP client pinned to a validated IP for `host` (curl
+/// `--resolve` semantics via reqwest `resolve_to_addrs`). The pin is
+/// re-validated as global immediately before use so a rebinding race cannot
+/// redirect the probe at an internal address. Returns None when the pin is
+/// unusable (caller falls back to the shared client, same fail-open posture
+/// as Python).
+///
+/// NOTE: the override port must be explicit — reqwest only substitutes
+/// port 0 with the scheme default on the `socks` feature path, which we
+/// do not enable. Passing port 0 connects to IP:0 and fails everything.
+fn pinned_client(host: &str, ip: &str, port: u16) -> Option<reqwest::Client> {
+    let addr: std::net::IpAddr = ip.parse().ok()?;
+    if !is_global_ip(&addr.to_string()) {
+        return None;
+    }
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(12))
+        .resolve_to_addrs(host, &[std::net::SocketAddr::new(addr, port)])
+        .build()
+        .ok()
+}
+
+/// Detect wildcard DNS: resolve a synthetic random label; a non-empty answer
+/// is the zone's wildcard IP set (cached per domain for the process lifetime).
+/// Empty set = no wildcard.
+async fn detect_wildcard(domain: &str) -> HashSet<String> {
+    static CACHE: OnceCell<parking_lot::Mutex<HashMap<String, HashSet<String>>>> =
+        OnceCell::new();
+    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().get(domain).cloned() {
+        return hit;
+    }
     let probe = format!("{}.{}", uuid::Uuid::new_v4().simple(), domain);
-    !resolve(&probe).await.is_empty()
+    let ips: HashSet<String> = resolve(&probe).await.into_iter().collect();
+    cache.lock().insert(domain.to_string(), ips.clone());
+    ips
 }
 
-/// Drop hosts that only echo the wildcard record.
+/// Drop hosts whose IP set exactly equals their domain's wildcard answer.
+///
+/// A real host that co-resolves with the wildcard (shares the synthetic IP
+/// but also has its own A record) survives; only pure wildcard echoes are
+/// removed. The apex domain itself is never dropped. Returns the filtered
+/// map plus the dropped count (parity with Python `_filter_wildcard_hosts`).
 pub async fn filter_wildcard_hosts(
     hosts: HashMap<String, Vec<String>>,
     domains: &[String],
-) -> HashMap<String, Vec<String>> {
-    let mut wildcard: HashSet<String> = HashSet::new();
+) -> (HashMap<String, Vec<String>>, usize) {
+    let mut wildcard_ips: HashMap<String, HashSet<String>> = HashMap::new();
     for d in domains {
-        if detect_wildcard(d).await {
-            wildcard.insert(d.clone());
+        let w = detect_wildcard(d).await;
+        if !w.is_empty() {
+            wildcard_ips.insert(d.clone(), w);
         }
     }
-    if wildcard.is_empty() {
-        return hosts;
+    if wildcard_ips.is_empty() {
+        return (hosts, 0);
     }
-    hosts
-        .into_iter()
-        .filter(|(h, _)| {
-            !wildcard
-                .iter()
-                .any(|d| h == d || h.ends_with(&format!(".{}", d)))
-        })
-        .collect()
+    let mut out = HashMap::new();
+    let mut dropped = 0usize;
+    for (h, ips) in hosts {
+        let mut hit = false;
+        for (d, w) in &wildcard_ips {
+            if h != *d
+                && h.ends_with(&format!(".{}", d))
+                && ips.iter().cloned().collect::<HashSet<_>>() == *w
+            {
+                hit = true;
+                break;
+            }
+        }
+        if hit {
+            dropped += 1;
+        } else {
+            out.insert(h, ips);
+        }
+    }
+    (out, dropped)
 }
 
 // --- enum sources ---------------------------------------------------------
@@ -564,16 +679,26 @@ pub async fn enumerate_subdomains(domains: &[String]) -> HashSet<String> {
 // --- HTTP fingerprint -----------------------------------------------------
 
 pub async fn fetch_fingerprint(host: &str, ips: &[String]) -> (Option<Value>, Option<Value>) {
-    let ip = match ips.first() {
-        Some(i) => i.clone(),
-        None => return (None, None),
-    };
-    // Probe https first, then http (like the Python curl --resolve pinning).
+    if ips.is_empty() {
+        return (None, None);
+    }
+    // Try validated IPs in order (at most 3 — bounded): the first address
+    // may be unreachable from here (e.g. no IPv6 egress) while a later one
+    // works. Python pins only the first; trying further is a strict
+    // robustness superset with identical output shapes.
+    let fallback = http_client().clone();
     let mut probe: Option<Value> = None;
     let mut snippet: Option<Value> = None;
-    for scheme in ["https", "http"] {
-        let url = format!("{}://{}", scheme, host);
-        let client = http_client();
+    'ips: for ip in ips.iter().take(3) {
+        // Pin the connection to the validated IP (anti-DNS-rebinding), with
+        // a per-scheme client so the override carries an explicit port. When
+        // no usable pin exists, fall back to the shared client (fail-open,
+        // like Python's unpinned curl path).
+        // Probe https first, then http (like the Python curl --resolve pinning).
+        for (scheme, port) in [("https", 443u16), ("http", 80u16)] {
+            let url = format!("{}://{}", scheme, host);
+            let pinned = pinned_client(host, ip, port);
+            let client = pinned.as_ref().unwrap_or(&fallback);
         let result = client.get(&url).header("Host", host).send().await;
         if let Ok(resp) = result {
             let status = resp.status();
@@ -652,8 +777,9 @@ pub async fn fetch_fingerprint(host: &str, ips: &[String]) -> (Option<Value>, Op
                 "title": title,
                 "versions": versions,
             }));
-            break;
+            break 'ips;
         }
+    }
     }
     (probe, snippet)
 }
@@ -1036,7 +1162,7 @@ fn tcp_service_finding(
 }
 
 /// Synthesize surface findings (HTTP-fingerprinted hosts + open service ports).
-pub fn synthesize_surface_findings(
+pub async fn synthesize_surface_findings(
     slug: &str,
     snippets: &HashMap<String, Value>,
     services: &HashMap<String, Value>,
@@ -1046,7 +1172,7 @@ pub fn synthesize_surface_findings(
     let mut existing_identities = HashSet::new();
     let mut existing_targets = HashSet::new();
     if let Some(fp) = cc::org_findings_path(slug) {
-        if let Ok(txt) = std::fs::read_to_string(&fp) {
+        if let Ok(txt) = tokio::fs::read_to_string(&fp).await {
             if let Ok(d) = serde_json::from_str::<Value>(&txt) {
                 if let Some(fs) = d.get("findings").and_then(|v| v.as_array()) {
                     for x in fs {
@@ -1272,8 +1398,8 @@ pub fn synthesize_surface_findings(
 
 // --- TLS / cert / login / version / cve / header findings -----------------
 
-pub fn synthesize_cert_findings(slug: &str, certs: &HashMap<String, Value>) -> Vec<Value> {
-    let existing_keys = existing_target_category_keys(slug, "tls certificate");
+pub async fn synthesize_cert_findings(slug: &str, certs: &HashMap<String, Value>) -> Vec<Value> {
+    let existing_keys = existing_target_category_keys(slug, "tls certificate").await;
     let mut out = Vec::new();
     let ts = now_ts();
     let mut seq = 0usize;
@@ -1328,8 +1454,8 @@ pub fn synthesize_cert_findings(slug: &str, certs: &HashMap<String, Value>) -> V
     out
 }
 
-pub fn synthesize_login_findings(slug: &str, snippets: &HashMap<String, Value>) -> Vec<Value> {
-    let existing_keys = existing_target_category_keys(slug, "login portal exposed");
+pub async fn synthesize_login_findings(slug: &str, snippets: &HashMap<String, Value>) -> Vec<Value> {
+    let existing_keys = existing_target_category_keys(slug, "login portal exposed").await;
     let mut out = Vec::new();
     let ts = now_ts();
     let mut seq = 0usize;
@@ -1382,8 +1508,8 @@ pub fn synthesize_login_findings(slug: &str, snippets: &HashMap<String, Value>) 
     out
 }
 
-pub fn synthesize_version_findings(slug: &str, snippets: &HashMap<String, Value>) -> Vec<Value> {
-    let existing_keys = existing_target_category_keys(slug, "software version disclosure");
+pub async fn synthesize_version_findings(slug: &str, snippets: &HashMap<String, Value>) -> Vec<Value> {
+    let existing_keys = existing_target_category_keys(slug, "software version disclosure").await;
     let mut out = Vec::new();
     let ts = now_ts();
     let mut seq = 0usize;
@@ -1434,12 +1560,12 @@ pub fn synthesize_version_findings(slug: &str, snippets: &HashMap<String, Value>
     out
 }
 
-pub fn synthesize_cve_findings(
+pub async fn synthesize_cve_findings(
     slug: &str,
     snippets: &HashMap<String, Value>,
     nvd: &HashMap<String, Value>,
 ) -> Vec<Value> {
-    let existing_keys = existing_target_category_keys(slug, "cve version match");
+    let existing_keys = existing_target_category_keys(slug, "cve version match").await;
     let mut out = Vec::new();
     let ts = now_ts();
     let mut seq = 0usize;
@@ -1509,12 +1635,12 @@ pub fn synthesize_cve_findings(
     out
 }
 
-pub fn synthesize_header_findings(slug: &str, snippets: &HashMap<String, Value>) -> Vec<Value> {
+pub async fn synthesize_header_findings(slug: &str, snippets: &HashMap<String, Value>) -> Vec<Value> {
     // Missing security headers on reachable public hosts.
     // Observational: absence in the snippet == absence on the wire.
     // HSTS/CSP only expected over HTTPS; auth-gated (401/403) or login-form
     // hosts are MEDIUM, everything else LOW. Deduped by (target, category).
-    let existing_keys = existing_target_category_keys(slug, "security headers");
+    let existing_keys = existing_target_category_keys(slug, "security headers").await;
     let ts = now_ts();
     let mut seq = 0usize;
     let mut out = Vec::new();
@@ -1648,11 +1774,11 @@ fn sec_header_label(k: &str) -> &'static str {
     }
 }
 
-fn existing_target_category_keys(slug: &str, category: &str) -> HashSet<(String, String)> {
+async fn existing_target_category_keys(slug: &str, category: &str) -> HashSet<(String, String)> {
     let mut keys = HashSet::new();
     let cat_lower = category.trim().to_lowercase();
     if let Some(fp) = cc::org_findings_path(slug) {
-        if let Ok(txt) = std::fs::read_to_string(&fp) {
+        if let Ok(txt) = tokio::fs::read_to_string(&fp).await {
             if let Ok(d) = serde_json::from_str::<Value>(&txt) {
                 if let Some(fs) = d.get("findings").and_then(|v| v.as_array()) {
                     for x in fs {
@@ -1734,10 +1860,11 @@ pub async fn generate_org(
 
     // 1. enumerate
     let mut subs = enumerate_subdomains(&domains).await;
-    if subs.len() > ENUM_NAME_CAP {
+    let enum_cap = enum_name_cap();
+    if subs.len() > enum_cap {
         let mut v: Vec<String> = subs.into_iter().collect();
         v.sort();
-        v.truncate(ENUM_NAME_CAP);
+        v.truncate(enum_cap);
         subs = v.into_iter().collect();
     }
     stage_stats.insert(
@@ -1750,7 +1877,7 @@ pub async fn generate_org(
     let mut hosts: HashMap<String, Vec<String>> = HashMap::new();
     let mut to_resolve: Vec<String> = subs.into_iter().collect();
     to_resolve.sort();
-    to_resolve.truncate(MAX_TOTAL_HOSTS);
+    to_resolve.truncate(max_total_hosts());
     let mut resolve_tasks = Vec::new();
     for h in &to_resolve {
         let h = h.clone();
@@ -1759,6 +1886,18 @@ pub async fn generate_org(
     for task in resolve_tasks {
         if let Ok((h, ips)) = task.await {
             hosts.insert(h, ips);
+        }
+    }
+    // wildcard-DNS filtering: drop names that only echo the wildcard record
+    if wildcard_filter_enabled() && !domains.is_empty() {
+        let (filtered, dropped) = filter_wildcard_hosts(hosts, &domains).await;
+        hosts = filtered;
+        if dropped > 0 {
+            tracing::info!(
+                "wildcard filter dropped {} phantom host(s) for {}",
+                dropped,
+                slug
+            );
         }
     }
     stage_stats.insert(
@@ -1833,7 +1972,23 @@ pub async fn generate_org(
         json!(t4.elapsed().as_secs_f64().round_ties_even() as i64),
     );
 
-    // 6. baseline.txt (hosts + IPs)
+    // 6. optional NVD enrichment for matched CVEs (CTI_NVD_ENRICH=1) —
+    // runs BEFORE persistence: network calls never hold a lock.
+    // Fail-open: any error leaves the deterministic result alone.
+    let t5 = Instant::now();
+    let mut nvd_extra: HashMap<String, Value> = HashMap::new();
+    if cve_match::nvd_enabled() && !snippets.is_empty() {
+        nvd_extra = cve_match::nvd_enrich_hosts(&snippets, nvd_max_lookups()).await;
+        if !nvd_extra.is_empty() {
+            tracing::info!("NVD enriched {} CVE(s) for {}", nvd_extra.len(), slug);
+        }
+    }
+    stage_stats.insert(
+        "nvd".into(),
+        json!(t5.elapsed().as_secs_f64().round_ties_even() as i64),
+    );
+
+    // 7. baseline.txt (hosts + IPs)
     let mut baseline: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
     let mut sorted_hosts: Vec<&String> = hosts.keys().collect();
@@ -1852,7 +2007,7 @@ pub async fn generate_org(
 
     // 7. persist findings.json + baseline.txt (atomic)
     let org_dir = cc::org_dir(&slug);
-    let _ = std::fs::create_dir_all(&org_dir);
+    let _ = tokio::fs::create_dir_all(&org_dir).await;
     let findings_path = org_dir.join("findings.json");
     let baseline_path = org_dir.join("baseline.txt");
 
@@ -1861,10 +2016,10 @@ pub async fn generate_org(
     let mut old_meta: Value = json!({});
     let mut old_baseline_text: String = String::new();
     if baseline_path.exists() {
-        old_baseline_text = std::fs::read_to_string(&baseline_path).unwrap_or_default();
+        old_baseline_text = tokio::fs::read_to_string(&baseline_path).await.unwrap_or_default();
     }
     if findings_path.exists() {
-        if let Ok(txt) = std::fs::read_to_string(&findings_path) {
+        if let Ok(txt) = tokio::fs::read_to_string(&findings_path).await {
             if let Ok(d) = serde_json::from_str::<Value>(&txt) {
                 existing = d
                     .get("findings")
@@ -1878,15 +2033,34 @@ pub async fn generate_org(
         }
     }
 
+    // snapshot analyst-owned fields at load: at persist time, a finding
+    // whose analyst fields changed mid-scan keeps the FILE version (analyst
+    // wins, mirroring Python's "analyst-owned statuses never auto-changed").
+    let analyst_snap: HashMap<String, Value> = existing
+        .iter()
+        .filter_map(|f| {
+            let id = f.get("id")?.as_str()?.to_string();
+            Some((
+                id,
+                json!({
+                    "status": f.get("status").cloned().unwrap_or(Value::Null),
+                    "status_history": f.get("status_history").cloned().unwrap_or(Value::Null),
+                    "feedback": f.get("feedback").cloned().unwrap_or(Value::Null),
+                    "comments": f.get("comments").cloned().unwrap_or(Value::Null),
+                }),
+            ))
+        })
+        .collect();
+
     // synthesize new findings (dedup against existing) BEFORE reconcile so
     // newly-observed surfaces get identity/lifecycle bookkeeping this pass.
     let enumerated: Vec<String> = hosts.keys().cloned().collect();
-    let mut new_findings = synthesize_surface_findings(&slug, &snippets, &services, &enumerated);
-    new_findings.extend(synthesize_cert_findings(&slug, &certs));
-    new_findings.extend(synthesize_login_findings(&slug, &snippets));
-    new_findings.extend(synthesize_version_findings(&slug, &snippets));
-    new_findings.extend(synthesize_cve_findings(&slug, &snippets, &HashMap::new()));
-    new_findings.extend(synthesize_header_findings(&slug, &snippets));
+    let mut new_findings = synthesize_surface_findings(&slug, &snippets, &services, &enumerated).await;
+    new_findings.extend(synthesize_cert_findings(&slug, &certs).await);
+    new_findings.extend(synthesize_login_findings(&slug, &snippets).await);
+    new_findings.extend(synthesize_version_findings(&slug, &snippets).await);
+    new_findings.extend(synthesize_cve_findings(&slug, &snippets, &nvd_extra).await);
+    new_findings.extend(synthesize_header_findings(&slug, &snippets).await);
 
     for f in &mut new_findings {
         let _ = cc::ensure_identity(f);
@@ -1900,7 +2074,7 @@ pub async fn generate_org(
         &services,
         &enumerated,
         &certs,
-        RESOLVE_AFTER_MISSES,
+        resolve_after_misses(),
     );
 
     // refresh probe evidence on existing findings from this scan's capture
@@ -1936,8 +2110,52 @@ pub async fn generate_org(
     });
     let merged_meta = merge_meta(old_meta, scan_meta);
 
-    let payload = json!({"meta": merged_meta, "findings": existing});
-    if let Err(e) = cc::atomic_write_json(&findings_path, &payload) {
+    // serialize with concurrent analyst mutations: re-read under the org
+    // lock and restore analyst-owned fields for findings touched mid-scan
+    // (status/history/feedback), so a parallel status/comment is not lost.
+    let _persist_guard = cc::org_write_lock(&slug).await;
+    let found_count = existing.len();
+    let mut findings_to_write = std::mem::take(&mut existing);
+    if let Ok(txt) = tokio::fs::read_to_string(&findings_path).await {
+        if let Ok(doc) = serde_json::from_str::<Value>(&txt) {
+            if let Some(current) = doc.get("findings").and_then(|v| v.as_array()) {
+                let by_id: HashMap<&str, &Value> = current
+                    .iter()
+                    .filter_map(|f| {
+                        f.get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|id| (id, f))
+                    })
+                    .collect();
+                for f in &mut findings_to_write {
+                    let Some(id) = f.get("id").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let (Some(cur), Some(snap)) = (by_id.get(id), analyst_snap.get(id)) else {
+                        continue;
+                    };
+                    let cur_a = json!({
+                        "status": cur.get("status").cloned().unwrap_or(Value::Null),
+                        "status_history": cur.get("status_history").cloned().unwrap_or(Value::Null),
+                        "feedback": cur.get("feedback").cloned().unwrap_or(Value::Null),
+                        "comments": cur.get("comments").cloned().unwrap_or(Value::Null),
+                    });
+                    // analyst touched it mid-scan -> file version wins
+                    if cur_a != *snap {
+                        if let Some(map) = f.as_object_mut() {
+                            for k in ["status", "status_history", "feedback", "comments"] {
+                                if let Some(v) = cur.get(k) {
+                                    map.insert(k.to_string(), v.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let payload = json!({"meta": merged_meta, "findings": findings_to_write});
+    if let Err(e) = cc::atomic_write_json(&findings_path, &payload).await {
         return json!({"error": format!("write failed: {}", e)});
     }
     let baseline_text = format!(
@@ -1945,7 +2163,7 @@ pub async fn generate_org(
         slug,
         now_date()
     ) + &baseline.join("\n");
-    let _ = cc::atomic_write_text(&baseline_path, &baseline_text);
+    let _ = cc::atomic_write_text(&baseline_path, &baseline_text).await;
     cc::invalidate_org_cache(&slug);
 
     // history event
@@ -1953,17 +2171,18 @@ pub async fn generate_org(
         &slug,
         json!({
             "kind": "scan", "mode": mode,
-            "summary": {"found": existing.len(), "subdomains": hosts.len(), "resolved": baseline.len(), "reachable": reached.len()},
+            "summary": {"found": found_count, "subdomains": hosts.len(), "resolved": baseline.len(), "reachable": reached.len()},
             "note": "passive surface scan"
         }),
-    );
+    ).await;
 
     // AI mode: Stage A assessment + Stage B grading (never blocks on failure)
     let mut ai = "skipped";
     if mode == "ai" {
-        let effective = ai_profile
-            .clone()
-            .or_else(|| crate::ai::resolve_profile_for_org(&slug, None));
+        let mut effective = ai_profile.clone();
+        if effective.is_none() {
+            effective = crate::ai::resolve_profile_for_org(&slug, None).await;
+        }
         ai = match crate::ai::call_ai(
             &build_ai_assess_prompt(&slug, &snippets, &services),
             effective.as_deref(),
@@ -1974,14 +2193,14 @@ pub async fn generate_org(
             None => "failed",
         };
         // Stage B: judgment-only grading of existing deterministic findings
-        let _grade = ai_grade_org(&slug).await;
+        let _grade = ai_grade_org(&slug, None).await;
     }
 
     json!({
         "slug": slug,
         "mode": mode,
         "ai": ai,
-        "ai_profile": if mode == "ai" { crate::ai::resolve_profile_for_org(&slug, ai_profile.as_deref()) } else { None },
+        "ai_profile": if mode == "ai" { crate::ai::resolve_profile_for_org(&slug, ai_profile.as_deref()).await } else { None },
         "subdomains": hosts.len(),
         "resolved": baseline.len(),
         "reachable": reached.len(),
@@ -2666,7 +2885,7 @@ pub async fn recheck_findings(slug: &str, max_probe: usize) -> usize {
     let Some(fp) = cc::org_findings_path(slug) else {
         return 0;
     };
-    let txt = match std::fs::read_to_string(&fp) {
+    let txt = match tokio::fs::read_to_string(&fp).await {
         Ok(t) => t,
         Err(_) => return 0,
     };
@@ -2732,7 +2951,14 @@ pub async fn recheck_findings(slug: &str, max_probe: usize) -> usize {
         ));
     }
 
-    // apply atomically
+    // apply atomically: re-read under the org lock and replay probe
+    // results onto fresh data so concurrent analyst mutations survive
+    let _guard = cc::org_write_lock(slug).await;
+    if let Ok(txt) = tokio::fs::read_to_string(&fp).await {
+        if let Ok(fresh) = serde_json::from_str::<Value>(&txt) {
+            doc = fresh;
+        }
+    }
     let mut changed = 0usize;
     if let Value::Object(doc_obj) = &mut doc {
         let fs2 = doc_obj
@@ -2803,7 +3029,7 @@ pub async fn recheck_findings(slug: &str, max_probe: usize) -> usize {
             );
         }
     }
-    let _ = cc::atomic_write_json(&fp, &doc);
+    let _ = cc::atomic_write_json(&fp, &doc).await;
     cc::invalidate_org_cache(slug);
     changed
 }
@@ -3260,10 +3486,12 @@ pub async fn correlate_org(org: Value) -> Value {
         })
         .collect();
 
-    // persist
+    // persist (fresh read-modify-write under the org lock so concurrent
+    // analyst mutations survive)
     if !filtered.is_empty() {
+        let _corr_guard = cc::org_write_lock(&slug).await;
         if let Some(fp) = cc::org_findings_path(&slug) {
-            if let Ok(txt) = std::fs::read_to_string(&fp) {
+            if let Ok(txt) = tokio::fs::read_to_string(&fp).await {
                 if let Ok(mut doc) = serde_json::from_str::<Value>(&txt) {
                     if let Some(existing) = doc.get("findings").and_then(|v| v.as_array()).cloned()
                     {
@@ -3272,7 +3500,7 @@ pub async fn correlate_org(org: Value) -> Value {
                         if let Value::Object(o) = &mut doc {
                             o.insert("findings".into(), Value::Array(merged));
                         }
-                        let _ = cc::atomic_write_json(&fp, &doc);
+                        let _ = cc::atomic_write_json(&fp, &doc).await;
                         cc::invalidate_org_cache(&slug);
                     }
                 }
@@ -3305,14 +3533,14 @@ fn is_corr_source(f: &Value) -> bool {
 }
 
 /// Stage-B AI grading (judgment-only, clamp ±1 step from stored baseline).
-pub async fn ai_grade_org(slug: &str) -> Value {
-    // Resolve effective profile; skip if none configured.
-    let effective = crate::ai::resolve_profile_for_org(slug, None);
+pub async fn ai_grade_org(slug: &str, profile_name: Option<String>) -> Value {
+    // Resolve effective profile (explicit override > org > default); skip if none.
+    let effective = crate::ai::effective_ready_profile(slug, profile_name.as_deref()).await;
     if effective.is_none() {
         cc::append_history(
             slug,
             json!({"kind": "ai_grade", "mode": "ai", "summary": {}, "note": "AI grading skipped (no configured profile)"}),
-        );
+        ).await;
         return json!({"result": "failed"});
     }
     let (fs, _) = cc::load_data(slug);
@@ -3353,7 +3581,7 @@ pub async fn ai_grade_org(slug: &str) -> Value {
         cc::append_history(
             slug,
             json!({"kind": "ai_grade", "mode": "ai", "summary": {}, "note": "AI grading failed/unavailable"}),
-        );
+        ).await;
         return json!({"result": "failed"});
     };
 
@@ -3363,13 +3591,16 @@ pub async fn ai_grade_org(slug: &str) -> Value {
         cc::append_history(
             slug,
             json!({"kind": "ai_grade", "mode": "ai", "summary": {}, "note": "AI grading failed/unavailable (parse error)"}),
-        );
+        ).await;
         return json!({"result": "failed"});
     };
 
     let mut applied = 0usize;
+    // hold the org lock across the fresh read-modify-write so a concurrent
+    // analyst mutation is not clobbered
+    let _grade_guard = cc::org_write_lock(slug).await;
     if let Some(fp) = cc::org_findings_path(slug) {
-        if let Ok(txt) = std::fs::read_to_string(&fp) {
+        if let Ok(txt) = tokio::fs::read_to_string(&fp).await {
             if let Ok(mut doc) = serde_json::from_str::<Value>(&txt) {
                 if let Some(fs2) = doc.get("findings").and_then(|v| v.as_array()).cloned() {
                     let mut new_fs = fs2.clone();
@@ -3409,7 +3640,7 @@ pub async fn ai_grade_org(slug: &str) -> Value {
                     if let Value::Object(o) = &mut doc {
                         o.insert("findings".into(), Value::Array(new_fs));
                     }
-                    let _ = cc::atomic_write_json(&fp, &doc);
+                    let _ = cc::atomic_write_json(&fp, &doc).await;
                     cc::invalidate_org_cache(slug);
                 }
             }
@@ -3418,7 +3649,7 @@ pub async fn ai_grade_org(slug: &str) -> Value {
     cc::append_history(
         slug,
         json!({"kind": "ai_grade", "mode": "ai", "summary": {"graded": applied}, "note": "AI grading completed"}),
-    );
+    ).await;
     json!({"result": "done", "graded": applied})
 }
 
@@ -3531,6 +3762,6 @@ pub fn read_history(slug: &str) -> Vec<Value> {
     cc::load_history(slug)
 }
 
-pub fn append_history(slug: &str, event: Value) {
-    cc::append_history(slug, event);
+pub async fn append_history(slug: &str, event: Value) {
+    cc::append_history(slug, event).await;
 }

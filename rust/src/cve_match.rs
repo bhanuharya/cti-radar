@@ -6,7 +6,7 @@ use once_cell::sync::OnceCell;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 fn suffix_re() -> &'static Regex {
     static RE: OnceCell<Regex> = OnceCell::new();
@@ -50,13 +50,13 @@ pub fn load_map() -> &'static Value {
 /// Test hook: reset the alias index.
 pub fn reset_cache() {
     if let Some(idx) = ALIAS_INDEX.get() {
-        *idx.lock().unwrap() = HashMap::new();
+        *idx.lock() = HashMap::new();
     }
 }
 
 fn aliases() -> HashMap<String, String> {
     let cell = ALIAS_INDEX.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut idx = cell.lock().unwrap();
+    let mut idx = cell.lock();
     if !idx.is_empty() {
         return idx.clone();
     }
@@ -214,7 +214,9 @@ pub fn match_cves(versions: &[Value], cap: usize) -> Vec<Value> {
             .cloned()
             .unwrap_or_default();
         for cve in cves {
-            let cve_obj = cve.as_object().unwrap();
+            let Some(cve_obj) = cve.as_object() else {
+                continue;
+            };
             let mut hit_range: Option<String> = None;
             let mut best_conf: Option<&'static str> = None;
             if let Some(ranges) = cve_obj.get("ranges").and_then(|r| r.as_array()) {
@@ -318,27 +320,22 @@ fn nvd_cache_path() -> PathBuf {
     state_dir().join("nvd_cache.json")
 }
 
-fn nvd_cache_load() -> Value {
-    match std::fs::read_to_string(nvd_cache_path()) {
+async fn nvd_cache_load() -> Value {
+    match tokio::fs::read_to_string(nvd_cache_path()).await {
         Ok(txt) => serde_json::from_str(&txt).unwrap_or_else(|_| serde_json::json!({})),
         Err(_) => serde_json::json!({}),
     }
 }
 
-fn nvd_cache_store(entry: Value) {
-    let _ = (|| -> std::io::Result<()> {
-        std::fs::create_dir_all(state_dir())?;
-        let mut cache = nvd_cache_load();
-        if let (Value::Object(a), Value::Object(b)) = (&mut cache, &entry) {
-            for (k, v) in b {
-                a.insert(k.clone(), v.clone());
-            }
+async fn nvd_cache_store(entry: Value) {
+    // atomic 0600 write (parity with the correlation writers)
+    let mut cache = nvd_cache_load().await;
+    if let (Value::Object(a), Value::Object(b)) = (&mut cache, &entry) {
+        for (k, v) in b {
+            a.insert(k.clone(), v.clone());
         }
-        let tmp = nvd_cache_path().with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_string(&cache)?)?;
-        std::fs::rename(&tmp, nvd_cache_path())?;
-        Ok(())
-    })();
+    }
+    let _ = crate::correlation::atomic_write_json(&nvd_cache_path(), &cache).await;
 }
 
 fn now_secs() -> u64 {
@@ -353,7 +350,7 @@ fn now_secs() -> u64 {
 pub async fn nvd_lookup(cve: &str, ttl: u64) -> (Option<Value>, bool) {
     let now = now_secs();
     {
-        let cache = nvd_cache_load();
+        let cache = nvd_cache_load().await;
         if let Some(hit) = cache.get(cve) {
             let ts = hit.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
             if now - ts < ttl {
@@ -399,8 +396,51 @@ pub async fn nvd_lookup(cve: &str, ttl: u64) -> (Option<Value>, bool) {
         Err(_) => None,
     };
 
-    nvd_cache_store(serde_json::json!({ cve: {"ts": now_secs(), "data": out} }));
+    nvd_cache_store(serde_json::json!({ cve: {"ts": now_secs(), "data": out} })).await;
     (out, true)
+}
+
+/// Enrich the CVEs matched across all host snippets, up to `cap` lookups.
+///
+/// Returns {cve_id: {cvss, vector, summary}}. Only network lookups count
+/// against the cap — cache hits are free. Never raises (parity with Python
+/// `nvd_enrich_hosts`).
+pub async fn nvd_enrich_hosts(
+    snippets: &std::collections::HashMap<String, Value>,
+    cap: usize,
+) -> std::collections::HashMap<String, Value> {
+    use std::collections::{HashMap, HashSet};
+    let mut out: HashMap<String, Value> = HashMap::new();
+    let mut cves: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for s in snippets.values() {
+        let versions: Vec<Value> = s
+            .get("versions")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for m in match_cves(&versions, 12) {
+            if let Some(cve) = m.get("cve").and_then(|v| v.as_str()) {
+                if seen.insert(cve.to_string()) {
+                    cves.push(cve.to_string());
+                }
+            }
+        }
+    }
+    let mut lookups = 0usize;
+    for cve in cves {
+        if lookups >= cap {
+            break;
+        }
+        let (data, network_used) = nvd_lookup(&cve, 86400).await;
+        if network_used {
+            lookups += 1;
+        }
+        if let Some(d) = data {
+            out.insert(cve, d);
+        }
+    }
+    out
 }
 
 fn parse_nvd(data: &Value) -> Option<Value> {

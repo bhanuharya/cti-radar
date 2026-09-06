@@ -1,11 +1,29 @@
 {
+  "miraeasset": {
+    "baseline": "data/orgs/miraeasset/baseline.txt",
+    "domains": [
+      "miraeasset.co.id",
+      "miraeasset.io"
+    ],
+    "findings": "data/orgs/miraeasset/findings.json",
+    "name": "miraeasset",
+    "openhack_enabled": true
+  },
+  "nhsec-co-id": {
+    "baseline": "data/orgs/nhsec-co-id/baseline.txt",
+    "domains": [
+      "nhsec.co.id"
+    ],
+    "findings": "data/orgs/nhsec-co-id/findings.json",
+    "name": "nhsec.co.id"
+  },
   "sample": {
-    "name": "Sample Org (demo)",
+    "baseline": "data/orgs/sample/baseline.txt",
     "domains": [
       "acme-corp.example",
       "acmecloud.example"
     ],
     "findings": "data/orgs/sample/findings.json",
-    "baseline": "data/orgs/sample/baseline.txt"
+    "name": "Sample Org (demo)"
   }
 }

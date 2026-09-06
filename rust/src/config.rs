@@ -38,6 +38,10 @@ pub struct Config {
     pub openhack_isolated: bool,
     pub openhack_allowed_domains: String,
     pub openhack_roe_expires: String,
+    // OpenHack runner tunables (wired into openhack.rs helpers)
+    pub openhack_model: String,
+    pub openhack_scans_dir: Option<String>,
+    pub openhack_quick_budget: u64,
 }
 
 fn env_str(name: &str) -> String {
@@ -140,6 +144,25 @@ impl Config {
             openhack_isolated: env_bool("CTI_OPENHACK_ISOLATED", false),
             openhack_allowed_domains: env_str("CTI_OPENHACK_ALLOWED_DOMAINS"),
             openhack_roe_expires: env_str("CTI_OPENHACK_ROE_EXPIRES"),
+
+            openhack_model: {
+                let m = env_str("CTI_OHACK_MODEL");
+                if m.trim().is_empty() {
+                    "glm-5.3-flash".to_string()
+                } else {
+                    m.trim().to_string()
+                }
+            },
+            openhack_scans_dir: env::var("CTI_OPENHACK_SCANS_DIR")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            openhack_quick_budget: env::var("CTI_OHACK_QUICK_BUDGET")
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .map(|f| f as u64)
+                .unwrap_or(480)
+                .clamp(300, 1200),
         }
     }
 

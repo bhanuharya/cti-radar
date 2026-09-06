@@ -1,5 +1,6 @@
-//! Report generation: HTML fallback + optional Chromium PDF render.
+//! Report generation: printable HTML + optional Chromium PDF render.
 
+use once_cell::sync::OnceCell;
 use serde_json::{json, Map, Value};
 
 /// Build the printable HTML report (PII-masked findings).
@@ -143,15 +144,41 @@ fn render_value(v: &Value) -> String {
     }
 }
 
-/// Render PDF via headless Chromium; returns None to fall back to HTML.
-pub async fn render_pdf(_slug: &str, html: &str, chromium: &str) -> Option<Vec<u8>> {
+/// Render outcome: PDF bytes, an over-size PDF (413), or a render failure
+/// (caller falls back to an HTML download). Mirrors Python `api_org_report_pdf`.
+pub enum PdfOutcome {
+    Pdf(Vec<u8>),
+    TooLarge,
+    Failed,
+}
+
+const PDF_TIMEOUT_SECS: u64 = 45;
+const PDF_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+/// Guard: at most one Chromium process at a time (mirrors `_PDF_SEMAPHORE`).
+static PDF_SEMAPHORE: OnceCell<tokio::sync::Semaphore> = OnceCell::new();
+
+fn pdf_semaphore() -> &'static tokio::sync::Semaphore {
+    PDF_SEMAPHORE.get_or_init(|| tokio::sync::Semaphore::new(1))
+}
+
+/// Non-blocking acquire of the single Chromium slot.
+pub fn try_acquire_pdf_slot() -> Option<tokio::sync::SemaphorePermit<'static>> {
+    pdf_semaphore().try_acquire().ok()
+}
+
+/// Render PDF via headless Chromium (45s timeout); returns Failed to fall
+/// back to HTML. Temp files are always cleaned up.
+pub async fn render_pdf(_slug: &str, html: &str, chromium: &str) -> PdfOutcome {
     // Write HTML to a temp file, invoke chromium headless --print-to-pdf.
     let dir = std::env::temp_dir();
     let html_path = dir.join(format!("cti-report-{}.html", uuid::Uuid::new_v4().simple()));
     let pdf_path = dir.join(format!("cti-report-{}.pdf", uuid::Uuid::new_v4().simple()));
-    std::fs::write(&html_path, html).ok()?;
+    if tokio::fs::write(&html_path, html).await.is_err() {
+        return PdfOutcome::Failed;
+    }
 
-    let result = tokio::process::Command::new(chromium)
+    let mut child = match tokio::process::Command::new(chromium)
         .args([
             "--headless=new",
             "--no-sandbox",
@@ -162,21 +189,44 @@ pub async fn render_pdf(_slug: &str, html: &str, chromium: &str) -> Option<Vec<u
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .output()
-        .await
-        .ok();
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&html_path).await;
+            return PdfOutcome::Failed;
+        }
+    };
 
-    let pdf = match result {
-        Some(out) if out.status.success() => std::fs::read(&pdf_path).ok(),
+    // bounded wait: kill an over-running Chromium instead of hanging a worker
+    let status = match tokio::time::timeout(
+        std::time::Duration::from_secs(PDF_TIMEOUT_SECS),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(Ok(s)) => Some(s),
+        _ => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            None
+        }
+    };
+
+    let pdf = match status {
+        Some(s) if s.success() => tokio::fs::read(&pdf_path).await.ok(),
         _ => None,
     };
 
-    let _ = std::fs::remove_file(&html_path);
-    let _ = std::fs::remove_file(&pdf_path);
+    let _ = tokio::fs::remove_file(&html_path).await;
+    let _ = tokio::fs::remove_file(&pdf_path).await;
 
     match pdf {
-        Some(bytes) if !bytes.is_empty() && bytes.len() <= 20 * 1024 * 1024 => Some(bytes),
-        _ => None,
+        Some(bytes) if !bytes.is_empty() && bytes.len() <= PDF_MAX_BYTES => {
+            PdfOutcome::Pdf(bytes)
+        }
+        Some(_) => PdfOutcome::TooLarge,
+        None => PdfOutcome::Failed,
     }
 }
 

@@ -14,7 +14,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use parking_lot::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CANONICAL_STATUSES: [&str; 5] = [
@@ -69,6 +69,30 @@ fn cfg() -> &'static Config {
 /// Backed by an RwLock so writes (register/domains) can reload it safely.
 static REGISTRY: OnceCell<RwLock<Map<String, Value>>> = OnceCell::new();
 
+// Per-org async write locks: every read-modify-write cycle (status/comment/
+// domains/register/config/scanner persist) holds its org's guard so parallel
+// mutations of the same org cannot lose updates (parity with Python
+// `_org_lock(slug)`).
+static ORG_LOCKS: OnceCell<parking_lot::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
+    OnceCell::new();
+
+fn org_locks() -> &'static parking_lot::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>> {
+    ORG_LOCKS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// Acquire the org's exclusive write guard. Hold across the full
+/// load -> mutate -> persist (+ cache invalidate) sequence.
+pub async fn org_write_lock(slug: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let m = {
+        org_locks()
+            .lock()
+            .entry(slug.to_string())
+            .or_default()
+            .clone()
+    };
+    m.lock_owned().await
+}
+
 fn registry() -> &'static RwLock<Map<String, Value>> {
     REGISTRY.get_or_init(|| {
         let m = load_registry_file();
@@ -93,14 +117,12 @@ fn load_registry_file() -> Map<String, Value> {
 pub fn reload_registry() {
     let m = load_registry_file();
     if let Some(reg) = REGISTRY.get() {
-        if let Ok(mut w) = reg.write() {
-            *w = m;
-        }
+        *reg.write() = m;
     }
 }
 
 pub fn org_list() -> Vec<Value> {
-    let reg = registry().read().unwrap();
+    let reg = registry().read();
     let mut slugs: Vec<&String> = reg.keys().collect();
     slugs.sort();
     slugs
@@ -117,7 +139,7 @@ pub fn org_list() -> Vec<Value> {
 }
 
 pub fn org_get(slug: &str) -> Option<Value> {
-    registry().read().unwrap().get(slug).cloned()
+    registry().read().get(slug).cloned()
 }
 
 /// Resolve a registry path against the runtime data root, rejecting escapes.
@@ -156,7 +178,7 @@ fn resolve_registry_path(value: &str) -> Option<PathBuf> {
 
 /// (findings_path, baseline_path) for a registered org (None for unknown).
 fn org_paths(org: &str) -> (Option<PathBuf>, Option<PathBuf>) {
-    let entry = registry().read().unwrap().get(org).cloned();
+    let entry = registry().read().get(org).cloned();
     match entry {
         Some(entry) => {
             let fp = entry
@@ -871,13 +893,13 @@ fn history_path(slug: &str) -> PathBuf {
     cfg().org_dir(slug).join("history.json")
 }
 
-fn atomic_write_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
+async fn atomic_write_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(dir)?;
+    tokio::fs::create_dir_all(dir).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        let _ = tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await;
     }
     let pid = std::process::id();
     let tmp = dir.join(format!(
@@ -886,49 +908,51 @@ fn atomic_write_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
         pid,
         uuid::Uuid::new_v4().simple()
     ));
-    let result = (|| -> std::io::Result<()> {
+    let result = (async || -> std::io::Result<()> {
         {
-            use std::io::Write;
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(data)?;
-            f.flush()?;
-            f.sync_all()?;
+            use tokio::io::AsyncWriteExt;
+            let mut opts = tokio::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp).await?;
+            f.write_all(data).await?;
+            f.flush().await?;
+            f.sync_all().await?;
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-        }
-        fs::rename(&tmp, path)?;
+        tokio::fs::rename(&tmp, path).await?;
         Ok(())
-    })();
+    })()
+    .await;
     if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = tokio::fs::remove_file(&tmp).await;
     }
     result
 }
 
-pub fn atomic_write_json(path: &Path, data: &Value) -> std::io::Result<()> {
+pub async fn atomic_write_json(path: &Path, data: &Value) -> std::io::Result<()> {
     let mut buf = serde_json::to_vec_pretty(data).unwrap_or_default();
     buf.push(b'\n');
-    atomic_write_bytes(path, &buf)
+    atomic_write_bytes(path, &buf).await
 }
 
-pub fn atomic_write_text(path: &Path, text: &str) -> std::io::Result<()> {
-    atomic_write_bytes(path, text.as_bytes())
+pub async fn atomic_write_text(path: &Path, text: &str) -> std::io::Result<()> {
+    atomic_write_bytes(path, text.as_bytes()).await
 }
 
-pub fn append_history(slug: &str, event: Value) {
+pub async fn append_history(slug: &str, event: Value) {
     if slug.is_empty() {
         return;
     }
     let hp = history_path(slug);
-    let mut events: Vec<Value> = match fs::read_to_string(&hp) {
+    let mut events: Vec<Value> = match tokio::fs::read_to_string(&hp).await {
         Ok(txt) => serde_json::from_str::<Vec<Value>>(&txt).unwrap_or_default(),
         Err(_) => vec![],
     };
     events.push(event);
-    let _ = atomic_write_json(&hp, &Value::Array(events));
+    let _ = atomic_write_json(&hp, &Value::Array(events)).await;
 }
 
 pub fn load_history(slug: &str) -> Vec<Value> {
@@ -1009,7 +1033,7 @@ fn read_org_files(org: &str) -> (Vec<Value>, Vec<String>, Option<String>, Value)
 fn cached_org_data(org: &str) -> (Vec<Value>, Vec<String>, Option<String>, Value) {
     let now = SystemTime::now();
     {
-        let cache = data_cache().read().unwrap();
+        let cache = data_cache().read();
         if let Some((ts, data)) = cache.get(org) {
             if now.duration_since(*ts).unwrap_or_default().as_secs() < DATA_CACHE_TTL_SECS {
                 return data.clone();
@@ -1019,14 +1043,14 @@ fn cached_org_data(org: &str) -> (Vec<Value>, Vec<String>, Option<String>, Value
     // read fresh under write lock to avoid stale-after-write race
     let data = read_org_files(org);
     {
-        let mut cache = data_cache().write().unwrap();
+        let mut cache = data_cache().write();
         cache.insert(org.to_string(), (now, data.clone()));
     }
     data
 }
 
 pub fn invalidate_org_cache(org: &str) {
-    let mut cache = data_cache().write().unwrap();
+    let mut cache = data_cache().write();
     cache.remove(org);
 }
 
@@ -1054,10 +1078,19 @@ pub fn cfg_path_orgs_json() -> PathBuf {
     cfg().orgs_json()
 }
 
-/// Return the org's raw meta dict (read-only).
+/// Return the raw meta dict (read-only).
 pub fn load_meta(org: &str) -> Value {
     let (_, _, _, meta) = cached_org_data(org);
     meta
+}
+
+/// Latest correlation report stored in findings meta (parity with Python
+/// `correlation_report`; Value::Null when absent).
+pub fn correlation_report(org: &str) -> Value {
+    load_meta(org)
+        .get("correlation")
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 pub fn summary_from_data(fs: &[Value], baseline: &[String]) -> Value {

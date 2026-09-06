@@ -1,889 +1,1284 @@
-//! Host-based vulnerability lookup (passive default, active gated).
-//! Port of `app/vuln_scan.py` including the two egress-scope hardening fixes:
-//! (1) stored fingerprint URLs are evidence, never egress authority — Nuclei
-//! input is canonicalized to the approved hostname; (2) cached known-host
-//! state can never expand active Nuclei scope beyond registered org domains.
+//! Passive vulnerability lookup and opt-in Nuclei adapter.
+//!
+//! Nuclei is an active engine.  Gate checks intentionally run before any
+//! executable lookup, process creation, or network-capable work.
 
-use crate::correlation as cc;
-use crate::handlers::valid_slug;
-use serde_json::{json, Map, Value};
+use chrono::{DateTime, Utc};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Duration;
+use std::path::PathBuf;
 
 pub const MAX_TARGETS: usize = 20;
-const VALID_CHECKS: &[&str] = &["cve", "version", "headers", "tls", "login"];
-const DEFAULT_CHECKS: &[&str] = &["cve", "version", "headers", "tls"];
+pub const DEFAULT_NUCLEI_SEVERITY: [&str; 3] = ["critical", "high", "medium"];
 
-/// Fail-closed gate for active checks (mirrors the Python `CTI_VULN_*` gate
-/// and the OpenHack authorization pattern). Returns an error string or None.
-pub fn authorization_error(org: &Value) -> Option<String> {
-    if std::env::var("CTI_VULN_ACTIVE").unwrap_or_default() != "1" {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NucleiOptions {
+    pub engine: String,
+    pub severity: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+/// Validate API-controlled engine filters before a job is queued. No request
+/// string is ever turned into a Nuclei command-line fragment without this.
+pub fn normalize_request_options(
+    engine: &str,
+    severity: Option<&[String]>,
+    tags: Option<&[String]>,
+) -> Result<NucleiOptions, String> {
+    if engine != "passive" && engine != "nuclei" {
+        return Err("invalid engine (passive|nuclei)".to_string());
+    }
+    let severity = match severity {
+        Some(values) if !values.is_empty() => {
+            let normalized: Vec<String> = values.iter().map(|s| s.trim().to_string()).collect();
+            if normalized.iter().any(|s| {
+                !matches!(
+                    s.as_str(),
+                    "critical" | "high" | "medium" | "low" | "info" | "unknown"
+                )
+            }) {
+                return Err("invalid nuclei severity filter".to_string());
+            }
+            normalized
+        }
+        _ => DEFAULT_NUCLEI_SEVERITY
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+    };
+    let tags = tags.unwrap_or(&[]);
+    if tags.len() > MAX_TARGETS {
+        return Err("too many nuclei tags (max 20)".to_string());
+    }
+    let tag_re = regex::Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$").expect("fixed tag regex");
+    let mut normalized_tags = Vec::with_capacity(tags.len());
+    for tag in tags {
+        let tag = tag.trim();
+        if !tag_re.is_match(tag) {
+            return Err("invalid nuclei tag filter".to_string());
+        }
+        normalized_tags.push(tag.to_string());
+    }
+    Ok(NucleiOptions {
+        engine: engine.to_string(),
+        severity,
+        tags: normalized_tags,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveGate {
+    pub active: bool,
+    pub isolated: bool,
+    pub allowed_domains: String,
+    pub roe_expires: String,
+}
+
+pub fn active_gate_from_env() -> ActiveGate {
+    ActiveGate {
+        active: std::env::var("CTI_VULN_ACTIVE").ok().as_deref() == Some("1"),
+        isolated: std::env::var("CTI_VULN_ISOLATED").ok().as_deref() == Some("1"),
+        allowed_domains: std::env::var("CTI_VULN_ALLOWED_DOMAINS").unwrap_or_default(),
+        roe_expires: std::env::var("CTI_VULN_ROE_EXPIRES").unwrap_or_default(),
+    }
+}
+
+/// Validate the generic active-assessment controls without an organization-specific
+/// scope check. This is used only for capability reporting; queue-time
+/// authorization still checks every registered organization domain.
+pub fn active_gate_setup_error(gate: &ActiveGate, now: DateTime<Utc>) -> Option<String> {
+    if !gate.active {
         return Some("CTI_VULN_ACTIVE must equal 1".to_string());
     }
-    if std::env::var("CTI_VULN_ISOLATED").unwrap_or_default() != "1" {
+    if !gate.isolated {
         return Some("CTI_VULN_ISOLATED must equal 1".to_string());
     }
-    let raw = std::env::var("CTI_VULN_ALLOWED_DOMAINS").unwrap_or_default();
-    if raw.trim().is_empty() {
+    if gate.allowed_domains.trim().is_empty() {
         return Some("CTI_VULN_ALLOWED_DOMAINS is missing or empty".to_string());
     }
-    let mut allowed: Vec<String> = Vec::new();
-    for item in raw.split(',') {
-        let d = item.trim().trim_end_matches('.').to_lowercase();
-        if d.is_empty() || !crate::scanner::is_valid_domain(&d) {
+    for item in gate.allowed_domains.split(',') {
+        let domain = item.trim().trim_end_matches('.').to_lowercase();
+        if !crate::scanner::is_valid_domain(&domain) {
             return Some("CTI_VULN_ALLOWED_DOMAINS contains an invalid domain".to_string());
         }
-        allowed.push(d);
     }
-    let targets = org.get("domains").and_then(|v| v.as_array());
-    let targets = match targets {
-        Some(t) if !t.is_empty() => t,
-        _ => return Some("the organization has no registered target domains".to_string()),
+    match DateTime::parse_from_rfc3339(gate.roe_expires.trim()) {
+        Ok(expires) if expires.with_timezone(&Utc) > now => None,
+        Ok(_) => Some("CTI_VULN_ROE_EXPIRES is expired".to_string()),
+        Err(_) => Some(
+            "CTI_VULN_ROE_EXPIRES is not a valid timezone-aware RFC3339/ISO-8601 timestamp"
+                .to_string(),
+        ),
+    }
+}
+
+pub fn authorization_error(gate: &ActiveGate, org: &Value, now: DateTime<Utc>) -> Option<String> {
+    if let Some(error) = active_gate_setup_error(gate, now) {
+        return Some(error);
+    }
+    let Some(domains) = org.get("domains").and_then(Value::as_array) else {
+        return Some("the organization has no registered target domains".to_string());
     };
-    for t in targets {
-        let d = t
+    if domains.is_empty() {
+        return Some("the organization has no registered target domains".to_string());
+    }
+    let allowed: Vec<String> = gate
+        .allowed_domains
+        .split(',')
+        .map(|item| item.trim().trim_end_matches('.').to_lowercase())
+        .collect();
+    for value in domains {
+        let domain = value
             .as_str()
             .unwrap_or("")
             .trim()
             .trim_end_matches('.')
             .to_lowercase();
-        if d.is_empty() || !crate::scanner::is_valid_domain(&d) {
+        if !crate::scanner::is_valid_domain(&domain) {
             return Some("the organization has an invalid registered target domain".to_string());
         }
-        if !allowed.contains(&d) {
-            return Some(
-                "registered target domain outside CTI_VULN_ALLOWED_DOMAINS".to_string(),
-            );
-        }
-    }
-    let raw_expiry = std::env::var("CTI_VULN_ROE_EXPIRES").unwrap_or_default();
-    match chrono::DateTime::parse_from_rfc3339(raw_expiry.trim()) {
-        Ok(expires) => {
-            if expires <= chrono::Utc::now() {
-                return Some("CTI_VULN_ROE_EXPIRES is expired".to_string());
-            }
-        }
-        Err(_) => {
-            return Some(
-                "CTI_VULN_ROE_EXPIRES is not a valid RFC3339/ISO-8601 timestamp".to_string(),
-            );
+        if !allowed.contains(&domain) {
+            return Some("registered target domain outside CTI_VULN_ALLOWED_DOMAINS".to_string());
         }
     }
     None
 }
 
-/// Strict active-scan scope: cached state never expands registered scope.
-pub fn registered_org_domain(target: &str, org_domains: &[String]) -> bool {
-    let t = target.trim().to_lowercase();
-    let t = t.trim_end_matches('.');
-    if t.is_empty() {
+/// Testable pre-execution boundary: lookup is deferred until authorization
+/// succeeds.  Production will pass the Nuclei executable resolver here.
+pub fn prepare_nuclei<F>(
+    gate: &ActiveGate,
+    org: &Value,
+    now: DateTime<Utc>,
+    lookup: F,
+) -> Result<PathBuf, String>
+where
+    F: FnOnce() -> Result<PathBuf, String>,
+{
+    if let Some(error) = authorization_error(gate, org, now) {
+        return Err(error);
+    }
+    lookup()
+}
+
+pub const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_NUCLEI_EVENTS: usize = 500;
+
+#[derive(Clone, Debug)]
+pub struct NucleiConfig {
+    pub binary: PathBuf,
+    pub templates: PathBuf,
+    pub rate_limit: u16,
+    pub timeout_secs: u64,
+    pub interactsh: bool,
+    pub exclude_tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NucleiSettings {
+    pub bin: Option<String>,
+    pub templates: Option<PathBuf>,
+    pub severity: Option<String>,
+    pub tags: Option<String>,
+    pub exclude_tags: Option<String>,
+    pub rate_limit: Option<String>,
+    pub timeout_secs: Option<String>,
+    pub interactsh: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NucleiRuntime {
+    pub config: NucleiConfig,
+    pub severity: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+pub fn expand_tilde_path(path: &std::path::Path, home: &std::path::Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    path.to_path_buf()
+}
+
+fn executable_file(path: &std::path::Path) -> bool {
+    if !path.is_file() {
         return false;
     }
-    org_domains.iter().any(|d| {
-        let dd = d.trim().to_lowercase();
-        let dd = dd.trim_end_matches('.');
-        !dd.is_empty() && (t == dd || t.ends_with(&format!(".{}", dd)))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return std::fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn split_valid_tags(raw: Option<&str>, cap: usize) -> Vec<String> {
+    let re = regex::Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$").expect("fixed tag regex");
+    raw.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|value| re.is_match(value))
+        .map(|value| value.to_lowercase())
+        .take(cap)
+        .collect()
+}
+
+fn severity_from_config(raw: Option<&str>) -> Vec<String> {
+    let values: Vec<String> = raw
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|value| {
+            matches!(
+                *value,
+                "critical" | "high" | "medium" | "low" | "info" | "unknown"
+            )
+        })
+        .map(ToOwned::to_owned)
+        .collect();
+    if values.is_empty() {
+        DEFAULT_NUCLEI_SEVERITY
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect()
+    } else {
+        values
+    }
+}
+
+fn clamped_setting(raw: Option<&str>, default: u64, min: u64, max: u64) -> u64 {
+    raw.unwrap_or("")
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+/// Resolve Nuclei configuration after active authorization has passed. An
+/// explicitly configured binary never falls back to PATH on failure.
+pub fn resolve_nuclei_runtime<F>(
+    settings: &NucleiSettings,
+    path_lookup: F,
+) -> Result<NucleiRuntime, String>
+where
+    F: FnOnce() -> Option<PathBuf>,
+{
+    let binary = match settings
+        .bin
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() || !executable_file(&path) {
+                return Err("CTI_NUCLEI_BIN must be an absolute executable".to_string());
+            }
+            path
+        }
+        None => path_lookup()
+            .filter(|path| executable_file(path))
+            .ok_or_else(|| "nuclei binary not found".to_string())?,
+    };
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let templates = settings
+        .templates
+        .as_ref()
+        .map(|path| expand_tilde_path(path, &home))
+        .unwrap_or_else(|| home.join("nuclei-templates"));
+    if !templates.is_dir() {
+        return Err("nuclei templates dir not found".to_string());
+    }
+    let mut exclude_tags = split_valid_tags(settings.exclude_tags.as_deref(), 20);
+    for required in ["intrusive", "dos", "fuzz"] {
+        if !exclude_tags.iter().any(|tag| tag == required) {
+            exclude_tags.push(required.to_string());
+        }
+    }
+    Ok(NucleiRuntime {
+        config: NucleiConfig {
+            binary,
+            templates,
+            rate_limit: clamped_setting(settings.rate_limit.as_deref(), 20, 1, 150) as u16,
+            timeout_secs: clamped_setting(settings.timeout_secs.as_deref(), 300, 60, 1200),
+            interactsh: settings.interactsh,
+            exclude_tags,
+        },
+        severity: severity_from_config(settings.severity.as_deref()),
+        tags: split_valid_tags(settings.tags.as_deref(), MAX_TARGETS),
     })
 }
 
-fn in_scope(target: &str, org_domains: &[String], known: &HashSet<String>) -> bool {
-    let t = target.trim().to_lowercase();
-    if t.is_empty() || !crate::scanner::is_valid_domain(&t) {
-        return false;
-    }
-    if known.contains(&t) {
-        return true;
-    }
-    registered_org_domain(&t, org_domains)
+fn path_lookup_nuclei() -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join("nuclei"))
+            .find(|candidate| executable_file(candidate))
+    })
 }
 
-/// Build a safe Nuclei input from an exact scoped hostname.
-///
-/// Stored fingerprint URLs are evidence, not egress authority: a scheme and
-/// non-default port are preserved only when the parsed host exactly matches
-/// the approved hostname; userinfo, path, query, and fragments are discarded.
-pub fn canonical_nuclei_url(host: &str, snippet: &Value) -> String {
-    let host = host.trim().to_lowercase();
-    let host = host.trim_end_matches('.').to_string();
-    let mut scheme = "https".to_string();
-    let mut port: Option<u16> = None;
-    if let Some(raw) = snippet.get("url").and_then(|v| v.as_str()) {
-        if let Ok(parsed) = url::Url::parse(raw.trim()) {
-            let ph = parsed.host_str().unwrap_or("").to_lowercase();
-            let ph = ph.trim_end_matches('.').to_string();
-            let ps = parsed.scheme().to_lowercase();
-            if (ps == "http" || ps == "https")
-                && ph == host
-                && parsed.username().is_empty()
-                && parsed.password().is_none()
+pub fn nuclei_runtime_from_env() -> Result<NucleiRuntime, String> {
+    let configured_templates = std::env::var_os("CTI_NUCLEI_TEMPLATES")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let settings = NucleiSettings {
+        bin: std::env::var("CTI_NUCLEI_BIN").ok(),
+        templates: configured_templates,
+        severity: std::env::var("CTI_NUCLEI_SEVERITY").ok(),
+        tags: std::env::var("CTI_NUCLEI_TAGS").ok(),
+        exclude_tags: std::env::var("CTI_NUCLEI_EXCLUDE_TAGS").ok(),
+        rate_limit: std::env::var("CTI_NUCLEI_RATE_LIMIT").ok(),
+        timeout_secs: std::env::var("CTI_NUCLEI_TIMEOUT").ok(),
+        interactsh: std::env::var("CTI_NUCLEI_INTERACTSH").ok().as_deref() == Some("1"),
+    };
+    resolve_nuclei_runtime(&settings, path_lookup_nuclei)
+}
+
+fn host_in_registered_scope(host: &str, domains: &[String]) -> bool {
+    let host = host.trim().trim_end_matches('.').to_lowercase();
+    crate::scanner::is_valid_domain(&host)
+        && domains.iter().any(|domain| {
+            let domain = domain.trim().trim_end_matches('.').to_lowercase();
+            crate::scanner::is_valid_domain(&domain)
+                && (host == domain || host.ends_with(&format!(".{domain}")))
+        })
+}
+
+/// Stored fingerprint URLs are evidence only. The active runner target is
+/// always rebuilt from the already-approved hostname.
+pub fn canonical_runner_target(host: &str, snippet: &Value) -> String {
+    let host = host.trim().trim_end_matches('.').to_lowercase();
+    let mut scheme = "https";
+    let mut port = None;
+    if let Some(raw) = snippet.get("url").and_then(Value::as_str) {
+        if let Ok(url) = url::Url::parse(raw.trim()) {
+            let parsed_host = url
+                .host_str()
+                .unwrap_or("")
+                .trim_end_matches('.')
+                .to_lowercase();
+            let parsed_scheme = url.scheme().to_lowercase();
+            if (parsed_scheme == "http" || parsed_scheme == "https")
+                && parsed_host == host
+                && url.username().is_empty()
+                && url.password().is_none()
             {
-                scheme = ps;
+                scheme = if parsed_scheme == "http" {
+                    "http"
+                } else {
+                    "https"
+                };
                 let default_port = if scheme == "https" { 443 } else { 80 };
-                if let Some(p) = parsed.port() {
-                    if p != default_port {
-                        port = Some(p);
+                if let Some(candidate) = url.port() {
+                    if candidate != default_port {
+                        port = Some(candidate);
                     }
                 }
             }
         }
     }
     match port {
-        Some(p) => format!("{}://{}:{}", scheme, host, p),
-        None => format!("{}://{}", scheme, host),
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
     }
 }
 
-fn today() -> String {
-    chrono::Utc::now().format("%Y-%m-%d").to_string()
+fn template_id_valid(value: &str) -> bool {
+    regex::Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_.\-/]{0,127}$")
+        .expect("fixed template id regex")
+        .is_match(value)
 }
 
-fn emit(
-    cb: &Option<Arc<dyn Fn(String, String) + Send + Sync>>,
-    stage: &str,
-    msg: &str,
-) {
-    if let Some(f) = cb {
-        f(stage.to_string(), msg.to_string());
-    }
-}
-
-#[derive(Default)]
-pub struct VulnOptions {
-    pub targets: Option<Vec<String>>,
-    pub checks: Option<Vec<String>>,
-    pub refresh: bool,
-    pub include_nvd: bool,
-    pub active: bool,
-    pub engine: String,
-    pub nuclei_severity: Option<Vec<String>>,
-    pub nuclei_tags: Option<Vec<String>>,
-    pub on_progress: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
-}
-
-fn err(slug: &str, msg: impl Into<String>) -> Value {
-    json!({"slug": slug, "error": msg.into()})
-}
-
-/// Read-only banner grab on a finding's own IP/port (no bytes that look like
-/// an exploit; read-only greeting capture with tight timeouts).
-async fn grab_banner(ip: &str, port: u16) -> Option<String> {
-    use tokio::io::AsyncReadExt;
-    let addr = format!("{}:{}", ip, port);
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(4),
-        tokio::net::TcpStream::connect(&addr),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    let mut buf = vec![0u8; 2048];
-    let n = tokio::time::timeout(Duration::from_secs(4), stream.read(&mut buf))
-        .await
-        .ok()?
-        .ok()?;
-    if n == 0 {
-        return None;
-    }
-    let txt: String = buf[..n]
-        .iter()
-        .map(|&b| {
-            if b.is_ascii_graphic() || b == b' ' {
-                b as char
-            } else if b == b'\n' || b == b'\r' {
-                ' '
-            } else {
-                '�'
-            }
-        })
-        .collect();
-    let clean = txt.split_whitespace().collect::<Vec<_>>().join(" ");
-    if clean.is_empty() {
-        None
-    } else {
-        Some(clean.chars().take(500).collect())
-    }
-}
-
-/// Run a host-scoped vuln lookup. Returns a stats dict; errors are values,
-/// never panics (mirrors the Python "never raises fatally" contract).
-pub async fn vuln_scan_org(slug: &str, opts: VulnOptions) -> Value {
-    let slug = slug.trim();
-    if !valid_slug(slug) {
-        return err(slug, "invalid slug");
-    }
-    let org = match cc::org_get(slug) {
-        Some(o) => o,
-        None => return err(slug, "org not found"),
+fn cve_values(event: &Value) -> Vec<String> {
+    let full = regex::Regex::new(r"^CVE-\d{4}-\d{4,7}$").expect("fixed CVE regex");
+    let mut out = Vec::new();
+    let mut add = |value: &str| {
+        let value = value.trim().to_uppercase();
+        if full.is_match(&value) && !out.contains(&value) && out.len() < 6 {
+            out.push(value);
+        }
     };
-    let org_domains: Vec<String> = org
-        .get("domains")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.trim().to_lowercase()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // load store
-    let fp = match cc::org_findings_path(slug) {
-        Some(p) => p,
-        None => return err(slug, "findings store unreadable: unknown org"),
-    };
-    let raw_txt = match std::fs::read_to_string(&fp) {
-        Ok(t) => t,
-        Err(e) => return err(slug, format!("findings store unreadable: {}", e.kind())),
-    };
-    let store: Value = match serde_json::from_str(&raw_txt) {
-        Ok(v) => v,
-        Err(_) => return err(slug, "findings store corrupted"),
-    };
-    let empty_map = Map::new();
-    let meta = store.get("meta").and_then(|v| v.as_object()).unwrap_or(&empty_map);
-    let snippets_src = meta
-        .get("fingerprints")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-    let findings_src: Vec<Value> = store
-        .get("findings")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    // normalize checks
-    let mut norm_checks: Vec<String> = Vec::new();
-    if let Some(list) = opts.checks.as_ref() {
-        for c in list {
-            let cc_ = c.trim().to_lowercase();
-            if VALID_CHECKS.contains(&cc_.as_str()) && !norm_checks.contains(&cc_) {
-                norm_checks.push(cc_);
-            }
-        }
-    }
-    if norm_checks.is_empty() {
-        norm_checks = DEFAULT_CHECKS.iter().map(|s| s.to_string()).collect();
-    }
-
-    // known hosts + scope
-    let mut known: HashSet<String> = HashSet::new();
-    for h in snippets_src.keys() {
-        known.insert(h.trim().to_lowercase());
-    }
-    for f in &findings_src {
-        if let Some(t) = f.get("target").and_then(|v| v.as_str()) {
-            let t = t.trim().to_lowercase();
-            if !t.is_empty() {
-                known.insert(t);
-            }
-        }
-    }
-    let mut scope: Vec<String> = Vec::new();
-    if let Some(list) = opts.targets.as_ref() {
-        for t in list {
-            let tt = t.trim().to_lowercase();
-            let tt = tt.trim_end_matches('.').to_string();
-            if tt.is_empty() || scope.contains(&tt) {
-                continue;
-            }
-            if !crate::scanner::is_valid_domain(&tt) {
-                return json!({"slug": slug, "error": format!("invalid target: {}", t)});
-            }
-            if !in_scope(&tt, &org_domains, &known) {
-                return json!({"slug": slug, "error": format!("target out of scope for org: {}", tt)});
-            }
-            scope.push(tt);
-        }
-        scope.truncate(MAX_TARGETS);
-        if scope.is_empty() {
-            return err(slug, "no valid targets");
-        }
-    } else {
-        let mut all: Vec<String> = known.iter().cloned().collect();
-        all.sort();
-        all.truncate(MAX_TARGETS);
-        if all.is_empty() {
-            return json!({"slug": slug, "error": "no fingerprinted hosts yet — run Scan (full) first",
-                "targets": [], "checks": norm_checks, "new_findings": 0});
-        }
-        scope = all;
-    }
-
-    if opts.active {
-        let mut orgv = org.clone();
-        orgv["slug"] = json!(slug);
-        if let Some(gate) = authorization_error(&orgv) {
-            return json!({"slug": slug, "error": format!("active assessment denied: {}", gate),
-                "targets": scope, "checks": norm_checks});
-        }
-    }
-
-    // engine selection: nuclei is active probing -> same fail-closed gate
-    // (empty defaults to passive for backward-compatible callers)
-    let engine = {
-        let e = opts.engine.trim().to_lowercase();
-        if e.is_empty() { "passive".to_string() } else { e }
-    };
-    if engine != "passive" && engine != "nuclei" {
-        return json!({"slug": slug, "error": "invalid engine (passive|nuclei)",
-            "targets": scope, "checks": norm_checks});
-    }
-    let (mut nuc_sev, mut nuc_tags) = (Vec::new(), Vec::new());
-    if engine == "nuclei" {
-        let mut orgv = org.clone();
-        orgv["slug"] = json!(slug);
-        if let Some(gate) = authorization_error(&orgv) {
-            return json!({"slug": slug, "error": format!("nuclei engine denied: {}", gate),
-                "targets": scope, "checks": norm_checks, "engine": engine});
-        }
-        // Hermes fix 2: cached known-host state must not expand active scope.
-        if let Some(outside) = scope
-            .iter()
-            .find(|h| !registered_org_domain(h, &org_domains))
-        {
-            return json!({"slug": slug,
-                "error": format!("nuclei target outside registered org domain: {}", outside),
-                "targets": scope, "checks": norm_checks, "engine": engine});
-        }
-        match crate::nuclei::normalize_options(
-            opts.nuclei_severity.as_deref(),
-            opts.nuclei_tags.as_deref(),
-        ) {
-            Ok((s, t)) => {
-                nuc_sev = s;
-                nuc_tags = t;
-            }
-            Err(e) => {
-                return json!({"slug": slug, "error": e,
-                    "targets": scope, "checks": norm_checks, "engine": engine});
-            }
-        }
-        let st = crate::nuclei::engine_status();
-        if st.get("available").and_then(|v| v.as_bool()) != Some(true) {
-            let reason = st.get("reason").and_then(|v| v.as_str()).unwrap_or("unknown");
-            return json!({"slug": slug, "error": format!("nuclei engine unavailable: {}", reason),
-                "targets": scope, "checks": norm_checks, "engine": engine});
-        }
-    }
-
-    let mut snippets: HashMap<String, Value> = snippets_src.into_iter().collect();
-    let mut refreshed: Vec<String> = Vec::new();
-    if opts.refresh && !scope.is_empty() {
-        let need: Vec<String> = scope
-            .iter()
-            .filter(|h| match snippets.get(*h) {
-                None => true,
-                Some(s) => {
-                    s.get("versions").is_none()
-                        && s.get("server").is_none()
-                        && s.get("code").is_none()
-                }
-            })
-            .cloned()
-            .collect();
-        if !need.is_empty() {
-            emit(
-                &opts.on_progress,
-                "fingerprint",
-                &format!("refreshing {} host(s)", need.len()),
-            );
-            for h in need {
-                let ips = crate::scanner::resolve(&h).await;
-                let (_probe, snippet) = crate::scanner::fetch_fingerprint(&h, &ips).await;
-                if let Some(s) = snippet {
-                    snippets.insert(h.clone(), s);
-                    refreshed.push(h);
-                }
-            }
-        }
-    }
-
-    // active: read-only banner grab on each finding's own IP/port
-    let mut active_evidence: HashMap<String, String> = HashMap::new();
-    if opts.active {
-        emit(
-            &opts.on_progress,
-            "active",
-            &format!("light banner re-check on {} host(s)", scope.len()),
-        );
-        let mut by_target: HashMap<String, &Value> = HashMap::new();
-        for f in &findings_src {
-            if let Some(t) = f.get("target").and_then(|v| v.as_str()) {
-                let t = t.trim().to_lowercase();
-                if scope.contains(&t) && !by_target.contains_key(&t) {
-                    by_target.insert(t, f);
-                }
-            }
-        }
-        for h in &scope {
-            if let Some(f) = by_target.get(h) {
-                let ip = f.get("ip").and_then(|v| v.as_str()).unwrap_or("");
-                let port = f
-                    .get("port")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u16;
-                if ip.is_empty() || port == 0 {
-                    continue;
-                }
-                if let Some(banner) = grab_banner(ip, port).await {
-                    active_evidence.insert(h.clone(), banner);
-                }
-            }
-        }
-    }
-
-    let filt: HashMap<String, Value> = scope
-        .iter()
-        .filter_map(|h| snippets.get(h).map(|s| (h.clone(), s.clone())))
-        .collect();
-    if filt.is_empty() {
-        return json!({"slug": slug, "targets": scope, "checks": norm_checks, "engine": engine,
-            "new_findings": 0, "total_findings": findings_src.len(),
-            "refreshed": refreshed,
-            "note": "no fingerprint data for targets — run Scan (full) first"});
-    }
-
-    // NVD: not implemented in the Rust backend (fail-open, passive stands).
-    let nvd_extra: HashMap<String, Value> = HashMap::new();
-    let nvd_note = if opts.include_nvd && norm_checks.iter().any(|c| c == "cve") {
-        Some("nvd enrichment not available in Rust backend (fail-open to local map)")
-    } else {
-        None
-    };
-
-    // TLS certs for https targets
-    let mut certs: HashMap<String, Value> = HashMap::new();
-    if norm_checks.iter().any(|c| c == "tls") {
-        emit(
-            &opts.on_progress,
-            "tls",
-            &format!("inspecting TLS on {} host(s)", filt.len()),
-        );
-        for (h, s) in &filt {
-            let url = s.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            if !url.starts_with("https://") {
-                continue;
-            }
-            let ips = crate::scanner::resolve(h).await;
-            let ip = ips.first().map(|s| s.as_str()).unwrap_or(h.as_str());
-            if let Some(mut c) = crate::scanner::tls_cert(h, ip, 443).await {
-                c["port"] = json!(443);
-                certs.insert(h.clone(), c);
-            }
-        }
-    }
-
-    emit(
-        &opts.on_progress,
-        "match",
-        &format!("matching {} host(s): {}", filt.len(), norm_checks.join(",")),
-    );
-    let mut new_all: Vec<Value> = Vec::new();
-    if norm_checks.iter().any(|c| c == "cve") {
-        new_all.extend(crate::scanner::synthesize_cve_findings(slug, &filt, &nvd_extra));
-    }
-    if norm_checks.iter().any(|c| c == "version") {
-        new_all.extend(crate::scanner::synthesize_version_findings(slug, &filt));
-    }
-    if norm_checks.iter().any(|c| c == "headers") {
-        new_all.extend(crate::scanner::synthesize_header_findings(slug, &filt));
-    }
-    if norm_checks.iter().any(|c| c == "login") {
-        new_all.extend(crate::scanner::synthesize_login_findings(slug, &filt));
-    }
-    if norm_checks.iter().any(|c| c == "tls") {
-        new_all.extend(crate::scanner::synthesize_cert_findings(slug, &certs));
-    }
-
-    // retag scan-* sources to vuln-scan; nuclei findings keep their own.
-    for f in new_all.iter_mut() {
-        let src = f.get("source").and_then(|v| v.as_str()).unwrap_or("");
-        if src.starts_with("scan-") {
-            f["source"] = json!("vuln-scan");
-        }
-        if let Some(t) = f.get("target").and_then(|v| v.as_str()) {
-            if let Some(banner) = active_evidence.get(&t.trim().to_lowercase()) {
-                if let Some(ev) = f.get_mut("evidence").and_then(|v| v.as_object_mut()) {
-                    ev.insert("active_banner".to_string(), json!(banner));
-                }
-                if let Some(pc) = f.get_mut("proof_chain").and_then(|v| v.as_array_mut()) {
-                    pc.push(json!("vuln-scan active banner re-check (own IP/port only)"));
-                }
-            }
-        }
-        if f.get("identity_key").is_none() {
-            let ik = cc::identity_key(f);
-            f["identity_key"] = json!(ik);
-        }
-    }
-
-    // nuclei phase (active, gated above)
-    let mut nuc_summary = json!({});
-    if engine == "nuclei" && !filt.is_empty() {
-        let mut urls: Vec<String> = Vec::new();
-        for h in &scope {
-            let s = filt.get(h).cloned().unwrap_or(Value::Null);
-            urls.push(canonical_nuclei_url(h, &s));
-        }
-        urls.truncate(MAX_TARGETS);
-        emit(
-            &opts.on_progress,
-            "nuclei",
-            &format!("probing {} target(s) with nuclei templates", urls.len()),
-        );
-        let timeout = crate::nuclei::run_timeout();
-        let sev = nuc_sev.clone();
-        let tags = nuc_tags.clone();
-        let run_out = tokio::task::spawn_blocking(move || {
-            crate::nuclei::run_scan(&urls, &sev, &tags, timeout)
-        })
-        .await;
-        match run_out {
-            Ok((workdir, ofile, run_err)) => {
-                let parsed = if run_err.is_empty() {
-                    match ofile {
-                        Some(p) => crate::nuclei::parse_output_file(&p, slug, &org_domains),
-                        None => Vec::new(),
+    if let Some(classification) = event
+        .get("info")
+        .and_then(|v| v.get("classification"))
+        .and_then(Value::as_object)
+    {
+        for key in ["cve-id", "cve_id"] {
+            match classification.get(key) {
+                Some(Value::Array(values)) => {
+                    for value in values.iter().filter_map(Value::as_str) {
+                        add(value);
                     }
-                } else {
-                    Vec::new()
-                };
-                if !run_err.is_empty() {
-                    nuc_summary = json!({"error": run_err});
-                } else {
-                    nuc_summary = json!({"matched": parsed.len()});
-                    new_all.extend(parsed);
                 }
-                let _ = std::fs::remove_dir_all(&workdir);
-            }
-            Err(e) => {
-                nuc_summary = json!({"error": format!("nuclei task failed: {}", e)});
+                Some(Value::String(value)) => add(value),
+                _ => {}
             }
         }
     }
-
-    // persist genuinely new findings + refreshed fingerprints
-    let persisted: usize;
-    if !new_all.is_empty() || !refreshed.is_empty() {
-        let current_txt = match std::fs::read_to_string(&fp) {
-            Ok(t) => t,
-            Err(e) => {
-                return json!({"slug": slug, "targets": scope, "checks": norm_checks, "engine": engine,
-                    "error": format!("persist failed: cannot re-read store: {}", e.kind()),
-                    "candidates": new_all.len(), "refreshed": refreshed});
-            }
-        };
-        let mut current: Value = match serde_json::from_str(&current_txt) {
-            Ok(v) => v,
-            Err(_) => {
-                return json!({"slug": slug, "targets": scope, "checks": norm_checks, "engine": engine,
-                    "error": "persist failed: corrupted findings store",
-                    "candidates": new_all.len(), "refreshed": refreshed});
-            }
-        };
-        let cur_list: Vec<Value> = current
-            .get("findings")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let mut seen: HashSet<String> = HashSet::new();
-        for x in &cur_list {
-            seen.insert(cc::identity_key(x));
-            let tk = format!(
-                "{}|{}",
-                x.get("target").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase(),
-                x.get("category").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase()
-            );
-            seen.insert(tk);
+    for value in [
+        event
+            .get("template-id")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        event
+            .get("info")
+            .and_then(|v| v.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    ] {
+        for token in value.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+            add(token);
         }
-        let mut fresh: Vec<Value> = Vec::new();
-        for f in new_all.iter() {
-            let ik = f
-                .get("identity_key")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| cc::identity_key(f));
-            let tk = format!(
-                "{}|{}",
-                f.get("target").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase(),
-                f.get("category").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase()
-            );
-            if seen.contains(&ik) || seen.contains(&tk) {
-                continue;
-            }
-            seen.insert(ik);
-            seen.insert(tk);
-            fresh.push(f.clone());
-        }
-        persisted = fresh.len();
-        let mut combined = cur_list;
-        combined.extend(fresh);
-        current["findings"] = Value::Array(combined);
-        if current.get("meta").and_then(|v| v.as_object()).is_none() {
-            current["meta"] = json!({});
-        }
-        {
-            let meta = current.get_mut("meta").unwrap().as_object_mut().unwrap();
-            let mut fps: Map<String, Value> = meta
-                .get("fingerprints")
-                .and_then(|v| v.as_object())
-                .cloned()
-                .unwrap_or_default();
-            for h in &refreshed {
-                if let Some(s) = snippets.get(h) {
-                    fps.insert(h.clone(), s.clone());
-                }
-            }
-            meta.insert("fingerprints".to_string(), Value::Object(fps));
-            meta.insert(
-                "vuln_scan".to_string(),
-                json!({"date": today(), "targets": scope, "checks": norm_checks,
-                    "engine": engine, "new": persisted, "refreshed": refreshed,
-                    "nuclei": nuc_summary}),
-            );
-        }
-        if let Err(e) = cc::atomic_write_json(&fp, &current) {
-            return json!({"slug": slug, "targets": scope, "checks": norm_checks, "engine": engine,
-                "error": format!("persist failed: {}", e.kind()),
-                "candidates": new_all.len(), "refreshed": refreshed});
-        }
-        cc::invalidate_org_cache(slug);
-        let total_now = findings_src.len() + persisted;
-        cc::append_history(
-            slug,
-            json!({"ts": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-                "kind": "vuln-scan",
-                "summary": {"targets": scope.len(), "new": persisted,
-                    "checks": norm_checks, "engine": engine, "nuclei": nuc_summary},
-                "note": format!("vuln lookup on {} host(s) [{}]", scope.len(), engine)}),
-        );
-        let mut out = json!({"slug": slug, "targets": scope, "checks": norm_checks,
-            "engine": engine, "new_findings": persisted, "candidates": new_all.len(),
-            "total_findings": total_now, "refreshed": refreshed,
-            "nuclei": nuc_summary, "active": opts.active});
-        if let Some(note) = nvd_note {
-            out["note"] = json!(note);
-        }
-        return out;
-    }
-
-    let mut out = json!({"slug": slug, "targets": scope, "checks": norm_checks,
-        "engine": engine, "new_findings": 0, "candidates": new_all.len(),
-        "total_findings": findings_src.len(), "refreshed": refreshed,
-        "nuclei": nuc_summary, "active": opts.active});
-    if let Some(note) = nvd_note {
-        out["note"] = json!(note);
     }
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn cap(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
 
-    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    static INIT_ONCE: std::sync::Once = std::sync::Once::new();
+/// Preserve the raw, validated path for identity/dedup. `url::Url` correctly
+/// validates authority but normalizes encoded dot segments, which must not
+/// silently merge distinct Nuclei template matches.
+fn raw_url_path(raw: &str) -> String {
+    let authority_and_tail = raw.split_once("://").map(|(_, tail)| tail).unwrap_or("");
+    let Some(start) = authority_and_tail.find(|c| matches!(c, '/' | '?' | '#')) else {
+        return "/".to_string();
+    };
+    let tail = &authority_and_tail[start..];
+    let path = if tail.starts_with('/') {
+        tail.split(|c| matches!(c, '?' | '#')).next().unwrap_or("/")
+    } else {
+        "/"
+    };
+    cap(&path.to_lowercase(), 120)
+}
 
-    fn test_root() -> std::path::PathBuf {
-        let mut d = std::env::temp_dir();
-        d.push(format!("cti-rust-vuln-test-{}", std::process::id()));
-        d
+/// Convert one untrusted Nuclei JSONL event into a bounded, in-scope finding.
+pub fn map_event(slug: &str, event: &Value, domains: &[String]) -> Option<Value> {
+    let template = event.get("template-id")?.as_str()?.trim();
+    if !template_id_valid(template) {
+        return None;
     }
-
-    /// Init correlation globals once per test process against an isolated dir.
-    fn ensure_test_env() -> std::path::PathBuf {
-        let root = test_root();
-        INIT_ONCE.call_once(|| {
-            let mut cfg = crate::config::Config::load();
-            cfg.data_dir = root.clone();
-            cfg.state_dir = root.join("state");
-            cc::init(cfg);
-        });
-        std::fs::create_dir_all(root.join("orgs").join("acme")).ok();
-        root
+    let raw_url = event.get("matched-at")?.as_str()?.trim();
+    let url = url::Url::parse(raw_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
     }
-
-    fn seed_org(name: &str, fingerprints: Value) {
-        let root = ensure_test_env();
-        let org_dir = root.join("orgs").join(name);
-        std::fs::create_dir_all(&org_dir).ok();
-        let store = json!({"findings": [], "meta": {"fingerprints": fingerprints}});
-        std::fs::write(
-            org_dir.join("findings.json"),
-            serde_json::to_string_pretty(&store).unwrap(),
-        )
-        .ok();
-        std::fs::write(org_dir.join("baseline.txt"), "seed\n").ok();
-        let reg = json!({name: {"name": "Acme", "domains": ["example.com"],
-            "findings": format!("orgs/{}/findings.json", name),
-            "baseline": format!("orgs/{}/baseline.txt", name)}});
-        std::fs::write(
-            root.join("orgs.json"),
-            serde_json::to_string_pretty(&reg).unwrap(),
-        )
-        .ok();
-        cc::reload_registry();
+    let host = url.host_str()?.trim_end_matches('.').to_lowercase();
+    if host.parse::<std::net::IpAddr>().is_ok() || !host_in_registered_scope(&host, domains) {
+        return None;
     }
-
-    fn clear_gate_env() {
-        for k in [
-            "CTI_VULN_ACTIVE",
-            "CTI_VULN_ISOLATED",
-            "CTI_VULN_ALLOWED_DOMAINS",
-            "CTI_VULN_ROE_EXPIRES",
-        ] {
-            std::env::remove_var(k);
+    let path = raw_url_path(raw_url);
+    let info = event.get("info").and_then(Value::as_object);
+    let name = cap(
+        info.and_then(|m| m.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or(template)
+            .trim(),
+        150,
+    );
+    if name.is_empty() {
+        return None;
+    }
+    let severity_raw = info
+        .and_then(|m| m.get("severity"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .trim()
+        .to_lowercase();
+    let severity = match severity_raw.as_str() {
+        "critical" | "high" => "HIGH",
+        "medium" => "MEDIUM",
+        "low" => "LOW",
+        _ => "INFO",
+    };
+    let tag_re = regex::Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$").expect("fixed tag regex");
+    let tags: Vec<String> = info
+        .and_then(|m| m.get("tags"))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| tag_re.is_match(value))
+                .map(|value| cap(value, 40))
+                .take(10)
+                .collect()
+        })
+        .unwrap_or_default();
+    let cves = cve_values(event);
+    let matcher = cap(
+        event
+            .get("matcher-name")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        80,
+    );
+    let extracted = match event.get("extracted-results") {
+        Some(Value::Array(values)) => cap(
+            &values
+                .iter()
+                .filter_map(Value::as_str)
+                .take(5)
+                .map(|value| cap(value, 200))
+                .collect::<Vec<_>>()
+                .join("; "),
+            500,
+        ),
+        Some(Value::String(value)) => cap(value, 500),
+        _ => String::new(),
+    };
+    let mut evidence = serde_json::Map::new();
+    evidence.insert("url".into(), Value::String(cap(raw_url, 500)));
+    evidence.insert("template".into(), Value::String(template.to_string()));
+    evidence.insert(
+        "template_severity".into(),
+        Value::String(cap(&severity_raw, 20)),
+    );
+    evidence.insert("matcher".into(), Value::String(matcher.clone()));
+    evidence.insert("tags".into(), serde_json::json!(tags));
+    if !extracted.is_empty() {
+        evidence.insert("extracted".into(), Value::String(extracted));
+    }
+    if let Some(refs) = info
+        .and_then(|m| m.get("reference"))
+        .and_then(Value::as_array)
+    {
+        let values: Vec<String> = refs
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|value| cap(value, 300))
+            .take(5)
+            .collect();
+        if !values.is_empty() {
+            evidence.insert("references".into(), serde_json::json!(values));
         }
     }
+    let category = cap(
+        &format!(
+            "nuclei {}",
+            tags.first().map(String::as_str).unwrap_or("match")
+        ),
+        80,
+    );
+    let date = crate::correlation::now_iso()[..10].to_string();
+    let scheme_port = url
+        .port_or_known_default()
+        .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+    let identity_key = format!("nuclei|{}|{}|{}", host, template.to_lowercase(), path);
+    Some(serde_json::json!({
+        "id": format!("NUC-{}-{}", crate::scanner::slugify(slug), uuid::Uuid::new_v4().simple()),
+        "title": name,
+        "target": host,
+        "ip": Value::Null,
+        "port": scheme_port,
+        "severity": severity,
+        "category": category,
+        "status": "OPEN",
+        "status_detail": format!("NUCLEI-MATCHED (template {} — verify before acting)", template),
+        "positive": false,
+        "mode": "fast",
+        "source": "nuclei",
+        "description": cap(&format!("{} matched on {}{} via nuclei template {}.", name, host, path, template), 2000),
+        "impact": cap(&format!("A Nuclei template matched this host. Template matches are not exploit proof.{}", if cves.is_empty() { String::new() } else { format!(" Related: {}.", cves.join(", ")) }), 2000),
+        "evidence": Value::Object(evidence),
+        "proof_chain": [cap(&format!("nuclei {} matched {}", template, raw_url), 500)],
+        "remediation": ["Verify the affected component, then patch or mitigate using vendor guidance."],
+        "related_cves": cves,
+        "found_date": date,
+        "first_seen": date,
+        "last_seen": date,
+        "status_history": [{"at": date, "from": "", "to": "OPEN", "by": "nuclei", "note": format!("template {} matched", template)}],
+        "provenance": {"derived_from": ["nuclei"], "confidence": "template-match"},
+        "identity_key": identity_key,
+    }))
+}
 
-    fn set_gate_env() {
-        std::env::set_var("CTI_VULN_ACTIVE", "1");
-        std::env::set_var("CTI_VULN_ISOLATED", "1");
-        std::env::set_var("CTI_VULN_ALLOWED_DOMAINS", "example.com");
-        std::env::set_var("CTI_VULN_ROE_EXPIRES", "2999-01-01T00:00:00Z");
+/// Bounded in-memory JSONL parser. Oversized output is rejected as degraded
+/// input rather than partially trusted.
+pub fn parse_jsonl(contents: &str, slug: &str, domains: &[String]) -> Vec<Value> {
+    if contents.len() > MAX_OUTPUT_BYTES {
+        return Vec::new();
     }
-
-    fn passive_opts(targets: Vec<&str>) -> VulnOptions {
-        VulnOptions {
-            targets: Some(targets.into_iter().map(|s| s.to_string()).collect()),
-            refresh: false,
-            engine: "passive".to_string(),
-            ..Default::default()
+    let mut findings = Vec::new();
+    let mut events_seen = 0usize;
+    for line in contents.lines() {
+        if events_seen >= MAX_NUCLEI_EVENTS {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        events_seen += 1;
+        let line: String = line.chars().take(65_536).collect();
+        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(finding) = map_event(slug, &event, domains) {
+            findings.push(finding);
         }
     }
+    findings
+}
 
-    #[tokio::test]
-    async fn test_gate_fail_closed_by_default() {
-        let _g = TEST_LOCK.lock().await;
-        ensure_test_env();
-        clear_gate_env();
-        let err = authorization_error(&json!({"domains": ["example.com"]}));
-        assert!(err.is_some());
+fn effective_exclude_tags(config: &NucleiConfig) -> Vec<String> {
+    let tag_re = regex::Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$").expect("fixed tag regex");
+    let mut out = Vec::new();
+    for tag in &config.exclude_tags {
+        let tag = tag.trim().to_lowercase();
+        if tag_re.is_match(&tag) && !out.contains(&tag) {
+            out.push(tag);
+        }
     }
+    for required in ["intrusive", "dos", "fuzz"] {
+        if !out.iter().any(|tag| tag == required) {
+            out.push(required.to_string());
+        }
+    }
+    out
+}
 
-    #[tokio::test]
-    async fn test_canonical_url_ignores_poisoned_stored_url() {
-        // Hermes fix 1: stored URL host mismatch -> approved host wins.
-        assert_eq!(
-            canonical_nuclei_url(
-                "app.example.com",
-                &json!({"url": "https://evil.example/not-in-scope"})
-            ),
-            "https://app.example.com"
-        );
-        assert_eq!(
-            canonical_nuclei_url(
-                "app.example.com",
-                &json!({"url": "http://app.example.com:8080/path?q=1"})
-            ),
-            "http://app.example.com:8080"
-        );
-        assert_eq!(
-            canonical_nuclei_url(
-                "app.example.com",
-                &json!({"url": "https://user@evil.example/x"})
-            ),
-            "https://app.example.com"
-        );
-        assert_eq!(
-            canonical_nuclei_url("app.example.com", &json!({})),
-            "https://app.example.com"
-        );
+/// Construct the complete Nuclei command without a shell or free-form args.
+pub fn build_argv(
+    config: &NucleiConfig,
+    targets_file: impl AsRef<std::path::Path>,
+    output_file: impl AsRef<std::path::Path>,
+    severity: &[String],
+    tags: &[String],
+) -> Vec<String> {
+    let mut argv = vec![
+        config.binary.to_string_lossy().into_owned(),
+        "-l".into(),
+        targets_file.as_ref().to_string_lossy().into_owned(),
+        "-t".into(),
+        config.templates.to_string_lossy().into_owned(),
+        "-severity".into(),
+        severity.join(","),
+        "-exclude-tags".into(),
+        effective_exclude_tags(config).join(","),
+        "-jsonl".into(),
+        "-o".into(),
+        output_file.as_ref().to_string_lossy().into_owned(),
+        "-silent".into(),
+        "-nc".into(),
+        "-duc".into(),
+        "-or".into(),
+        "-nm".into(),
+        "-rl".into(),
+        config.rate_limit.clamp(1, 150).to_string(),
+        "-retries".into(),
+        "1".into(),
+        "-timeout".into(),
+        "10".into(),
+        "-bulk-size".into(),
+        "10".into(),
+    ];
+    if !tags.is_empty() {
+        argv.extend(["-tags".into(), tags.join(",")]);
     }
+    if !config.interactsh {
+        argv.push("-ni".into());
+    }
+    argv
+}
 
-    #[tokio::test]
-    async fn test_registered_domain_check() {
-        let doms = vec!["example.com".to_string()];
-        assert!(registered_org_domain("app.example.com", &doms));
-        assert!(registered_org_domain("example.com", &doms));
-        assert!(!registered_org_domain("evil.example", &doms));
-        assert!(!registered_org_domain("example.com.evil.com", &doms));
+pub fn dedup_nuclei_findings(existing: &[Value], candidates: Vec<Value>) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    for finding in existing {
+        if let Some(identity) = finding.get("identity_key").and_then(Value::as_str) {
+            seen.insert(identity.to_string());
+        }
     }
+    let mut fresh = Vec::new();
+    for finding in candidates {
+        let Some(identity) = finding.get("identity_key").and_then(Value::as_str) else {
+            continue;
+        };
+        if seen.insert(identity.to_string()) {
+            fresh.push(finding);
+        }
+    }
+    fresh
+}
 
-    #[tokio::test]
-    async fn test_rejects_out_of_scope() {
-        let _g = TEST_LOCK.lock().await;
-        seed_org(
-            "acme",
-            json!({"app.example.com": {"url": "https://app.example.com", "code": "200"}}),
-        );
-        clear_gate_env();
-        let r = vuln_scan_org("acme", passive_opts(vec!["evil.com"])).await;
-        assert!(r.get("error").is_some());
-        assert!(r["error"].as_str().unwrap().contains("scope"));
+fn private_work_dir() -> Result<PathBuf, String> {
+    let parent = std::env::temp_dir();
+    for _ in 0..8 {
+        let path = parent.join(format!("cti-nuclei-{}", uuid::Uuid::new_v4().simple()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                        .map_err(|_| "cannot secure nuclei work directory".to_string())?;
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err("cannot create nuclei work directory".to_string()),
+        }
     }
+    Err("cannot create nuclei work directory".to_string())
+}
 
-    #[tokio::test]
-    async fn test_nuclei_rejects_known_host_outside_registered_domains() {
-        // Hermes fix 2: known-host state alone must not enlarge active scope.
-        let _g = TEST_LOCK.lock().await;
-        seed_org(
-            "acme",
-            json!({
-                "app.example.com": {"url": "https://app.example.com", "code": "200"},
-                "evil.example": {"url": "https://evil.example", "code": "200"}
-            }),
-        );
-        set_gate_env();
-        let mut opts = passive_opts(vec!["evil.example"]);
-        opts.engine = "nuclei".to_string();
-        let r = vuln_scan_org("acme", opts).await;
-        assert!(r.get("error").is_some());
-        assert!(r["error"].as_str().unwrap().contains("outside registered org domain"));
-        clear_gate_env();
+fn write_private_targets(path: &std::path::Path, targets: &[String]) -> Result<(), String> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut file = options
+        .open(path)
+        .map_err(|_| "cannot stage nuclei targets".to_string())?;
+    for target in targets.iter().take(MAX_TARGETS) {
+        writeln!(file, "{target}").map_err(|_| "cannot stage nuclei targets".to_string())?;
+    }
+    file.sync_all()
+        .map_err(|_| "cannot stage nuclei targets".to_string())
+}
 
-    #[tokio::test]
-    async fn test_nuclei_denied_without_gate_no_subprocess() {
-        let _g = TEST_LOCK.lock().await;
-        seed_org(
-            "acme",
-            json!({"app.example.com": {"url": "https://app.example.com", "code": "200"}}),
-        );
-        clear_gate_env();
-        let mut opts = passive_opts(vec!["app.example.com"]);
-        opts.engine = "nuclei".to_string();
-        let r = vuln_scan_org("acme", opts).await;
-        assert!(r.get("error").is_some());
-        assert!(r["error"].as_str().unwrap().contains("denied"));
-    }
+/// Keep the active child process on a minimal, non-secret environment. The
+/// Nuclei binary is resolved before this boundary, so no provider/API,
+/// credential, proxy, or arbitrary operator variable is needed by the child.
+pub fn safe_nuclei_child_env(
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    const ALLOWED: [&str; 6] = ["PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR"];
+    environment
+        .iter()
+        .filter(|(key, _)| key.to_str().is_some_and(|name| ALLOWED.contains(&name)))
+        .cloned()
+        .collect()
+}
 
-    #[tokio::test]
-    async fn test_passive_cve_match_persists_once() {
-        let _g = TEST_LOCK.lock().await;
-        seed_org(
-            "acme",
-            json!({"app.example.com": {
-                "url": "https://app.example.com", "code": "200",
-                "server": "nginx/1.18.0",
-                "versions": [{"product": "nginx", "version": "1.18.0"}]}}),
-        );
-        clear_gate_env();
-        let mut opts = passive_opts(vec!["app.example.com"]);
-        opts.checks = Some(vec!["cve".to_string()]);
-        let r1 = vuln_scan_org("acme", opts).await;
-        assert!(r1.get("error").is_none(), "unexpected error: {}", r1);
-        assert!(r1["candidates"].as_u64().unwrap_or(0) >= 1);
-        assert!(r1["new_findings"].as_u64().unwrap_or(0) >= 1);
-        // rescan dedups
-        let mut opts2 = passive_opts(vec!["app.example.com"]);
-        opts2.checks = Some(vec!["cve".to_string()]);
-        let r2 = vuln_scan_org("acme", opts2).await;
-        assert_eq!(r2["new_findings"], json!(0));
+fn terminate_child_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // The child was placed in its own process group. Killing the negative
+        // PID reaches helpers as well as the parent runner.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
     }
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
-    #[tokio::test]
-    async fn test_invalid_engine_rejected() {
-        let _g = TEST_LOCK.lock().await;
-        seed_org(
-            "acme",
-            json!({"app.example.com": {"url": "https://app.example.com", "code": "200"}}),
-        );
-        clear_gate_env();
-        let mut opts = passive_opts(vec!["app.example.com"]);
-        opts.engine = "bogus".to_string();
-        let r = vuln_scan_org("acme", opts).await;
-        assert!(r["error"].as_str().unwrap().contains("engine"));
+/// Run a pre-authorized local Nuclei binary. This function contains no target
+/// discovery; callers must pass canonical, registered-domain URLs only.
+pub fn run_nuclei_blocking(
+    config: &NucleiConfig,
+    targets: &[String],
+    severity: &[String],
+    tags: &[String],
+) -> Result<String, String> {
+    if targets.is_empty() || targets.len() > MAX_TARGETS {
+        return Err("invalid nuclei target count".to_string());
     }
+    let work_dir = private_work_dir()?;
+    let result = (|| {
+        let targets_file = work_dir.join("targets.txt");
+        let output_file = work_dir.join("out.jsonl");
+        write_private_targets(&targets_file, targets)?;
+        let argv = build_argv(config, &targets_file, &output_file, severity, tags);
+        let mut command = std::process::Command::new(&argv[0]);
+        command.args(&argv[1..]);
+        command.stdin(std::process::Stdio::null());
+        command.stdout(std::process::Stdio::null());
+        command.stderr(std::process::Stdio::null());
+        // Keep explicitly resolved executable/template paths but do not allow
+        // ambient proxy variables to redirect active traffic.
+        command.env_clear();
+        let environment: Vec<_> = std::env::vars_os().collect();
+        for (key, value) in safe_nuclei_child_env(&environment) {
+            command.env(key, value);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|_| "cannot spawn nuclei".to_string())?;
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|_| "cannot wait for nuclei".to_string())?
+            {
+                break status;
+            }
+            if output_file
+                .metadata()
+                .map(|meta| meta.len() as usize > MAX_OUTPUT_BYTES)
+                .unwrap_or(false)
+            {
+                terminate_child_group(&mut child);
+                return Err("nuclei output exceeded 10MiB limit".to_string());
+            }
+            if started.elapsed()
+                >= std::time::Duration::from_secs(config.timeout_secs.clamp(60, 1200))
+            {
+                terminate_child_group(&mut child);
+                return Err(format!(
+                    "nuclei exceeded {}s budget",
+                    config.timeout_secs.clamp(60, 1200)
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        // Nuclei can use exit 1 for a completed run with matches/errors mixed.
+        // Accept that code only when it produced bounded JSONL; every other
+        // non-zero exit remains a job failure.
+        if !status.success() && status.code() != Some(1) {
+            return Err(format!("nuclei exited {}", status.code().unwrap_or(-1)));
+        }
+        let metadata = output_file
+            .metadata()
+            .map_err(|_| format!("nuclei exited {}", status.code().unwrap_or(-1)))?;
+        if metadata.len() as usize > MAX_OUTPUT_BYTES {
+            return Err("nuclei output exceeded 10MiB limit".to_string());
+        }
+        let output = std::fs::read_to_string(&output_file)
+            .map_err(|_| "nuclei output unreadable".to_string())?;
+        Ok(output)
+    })();
+    let _ = std::fs::remove_dir_all(&work_dir);
+    result
+}
+
+pub const VALID_CHECKS: [&str; 5] = ["cve", "version", "headers", "tls", "login"];
+pub const DEFAULT_CHECKS: [&str; 4] = ["cve", "version", "headers", "tls"];
+
+#[derive(Clone, Debug)]
+pub struct PassiveRequest {
+    pub targets: Vec<String>,
+    pub checks: Vec<String>,
+}
+
+pub fn validate_passive_request(
+    raw_targets: Option<&[String]>,
+    raw_checks: Option<&[String]>,
+) -> Result<PassiveRequest, String> {
+    let mut targets = Vec::new();
+    for value in raw_targets.unwrap_or(&[]) {
+        let target = value.trim().trim_end_matches('.').to_lowercase();
+        if !crate::scanner::is_valid_domain(&target) {
+            return Err("invalid target".to_string());
+        }
+        if !targets.contains(&target) {
+            targets.push(target);
+        }
+    }
+    if targets.len() > MAX_TARGETS {
+        return Err("too many targets (max 20)".to_string());
+    }
+    let mut checks = Vec::new();
+    for value in raw_checks.unwrap_or(&[]) {
+        let check = value.trim().to_lowercase();
+        if !VALID_CHECKS.contains(&check.as_str()) {
+            return Err("invalid vuln check".to_string());
+        }
+        if !checks.contains(&check) {
+            checks.push(check);
+        }
+    }
+    if checks.is_empty() {
+        checks = DEFAULT_CHECKS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
+    }
+    Ok(PassiveRequest { targets, checks })
+}
+
+fn registered_domains(org: &Value) -> Vec<String> {
+    org.get("domains")
+        .and_then(Value::as_array)
+        .map(|domains| {
+            domains
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|value| value.trim().trim_end_matches('.').to_lowercase())
+                .filter(|value| crate::scanner::is_valid_domain(value))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn known_hosts(doc: &Value) -> HashSet<String> {
+    let mut known = HashSet::new();
+    if let Some(fingerprints) = doc
+        .get("meta")
+        .and_then(|v| v.get("fingerprints"))
+        .and_then(Value::as_object)
+    {
+        for host in fingerprints.keys() {
+            let host = host.trim().trim_end_matches('.').to_lowercase();
+            if crate::scanner::is_valid_domain(&host) {
+                known.insert(host);
+            }
+        }
+    }
+    if let Some(findings) = doc.get("findings").and_then(Value::as_array) {
+        for finding in findings {
+            if let Some(host) = finding.get("target").and_then(Value::as_str) {
+                let host = host.trim().trim_end_matches('.').to_lowercase();
+                if crate::scanner::is_valid_domain(&host) {
+                    known.insert(host);
+                }
+            }
+        }
+    }
+    known
+}
+
+fn passive_target_in_scope(host: &str, domains: &[String], known: &HashSet<String>) -> bool {
+    known.contains(host) || host_in_registered_scope(host, domains)
+}
+
+/// Active scope deliberately ignores cached host authority. Cached fingerprints
+/// can choose a scheme/port only after the hostname has passed this check.
+pub fn active_nuclei_targets(
+    org: &Value,
+    cached: &Value,
+    requested: &[String],
+) -> Result<Vec<String>, String> {
+    let domains = registered_domains(org);
+    if domains.is_empty() {
+        return Err("the organization has no registered target domains".to_string());
+    }
+    let mut targets = if requested.is_empty() {
+        let mut from_fingerprints: Vec<String> = cached
+            .get("meta")
+            .and_then(|meta| meta.get("fingerprints"))
+            .and_then(Value::as_object)
+            .map(|fingerprints| {
+                fingerprints
+                    .keys()
+                    .map(|host| host.trim().trim_end_matches('.').to_lowercase())
+                    .filter(|host| host_in_registered_scope(host, &domains))
+                    .collect()
+            })
+            .unwrap_or_default();
+        from_fingerprints.sort();
+        from_fingerprints
+    } else {
+        requested
+            .iter()
+            .map(|host| host.trim().trim_end_matches('.').to_lowercase())
+            .collect()
+    };
+    targets.sort();
+    targets.dedup();
+    targets.truncate(MAX_TARGETS);
+    for target in &targets {
+        if !crate::scanner::is_valid_domain(target) || !host_in_registered_scope(target, &domains) {
+            return Err(format!(
+                "nuclei target outside registered org domain: {target}"
+            ));
+        }
+    }
+    if targets.is_empty() {
+        return Err("no registered fingerprinted targets for nuclei".to_string());
+    }
+    Ok(targets)
+}
+
+/// Purely local, observation-only lookup over fingerprints already stored by
+/// the passive scanner. It intentionally performs no refresh, DNS, HTTP, TLS,
+/// or NVD calls, so a `passive` job cannot create fresh egress.
+pub async fn run_passive_lookup(
+    slug: &str,
+    org: &Value,
+    request: PassiveRequest,
+) -> Result<Value, String> {
+    let _guard = crate::correlation::org_write_lock(slug).await;
+    let path = crate::correlation::org_findings_path(slug)
+        .ok_or_else(|| "findings store unavailable".to_string())?;
+    let text = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|_| "findings store unreadable".to_string())?;
+    let mut doc: Value =
+        serde_json::from_str(&text).map_err(|_| "findings store corrupted".to_string())?;
+    if !doc.is_object() {
+        return Err("findings store corrupted".to_string());
+    }
+    let domains = registered_domains(org);
+    let known = known_hosts(&doc);
+    let mut scope = if request.targets.is_empty() {
+        let mut targets: Vec<String> = known.into_iter().collect();
+        targets.sort();
+        targets
+    } else {
+        request.targets.clone()
+    };
+    scope.truncate(MAX_TARGETS);
+    for target in &scope {
+        if !passive_target_in_scope(target, &domains, &known_hosts(&doc)) {
+            return Err(format!("target out of scope for org: {target}"));
+        }
+    }
+    let snippets: HashMap<String, Value> = doc
+        .get("meta")
+        .and_then(|v| v.get("fingerprints"))
+        .and_then(Value::as_object)
+        .map(|items| {
+            scope
+                .iter()
+                .filter_map(|host| {
+                    items
+                        .get(host)
+                        .cloned()
+                        .map(|snippet| (host.clone(), snippet))
+                })
+                .filter(|(_, snippet)| snippet.is_object())
+                .collect()
+        })
+        .unwrap_or_default();
+    if snippets.is_empty() {
+        return Ok(serde_json::json!({
+            "slug": slug, "engine": "passive", "targets": scope, "checks": request.checks,
+            "new_findings": 0, "candidates": 0,
+            "note": "no fingerprint data for targets — run Scan (full) first",
+        }));
+    }
+    let mut candidates = Vec::new();
+    if request.checks.iter().any(|check| check == "cve") {
+        candidates.extend(
+            crate::scanner::synthesize_cve_findings(slug, &snippets, &HashMap::new()).await,
+        );
+    }
+    if request.checks.iter().any(|check| check == "version") {
+        candidates.extend(crate::scanner::synthesize_version_findings(slug, &snippets).await);
+    }
+    if request.checks.iter().any(|check| check == "headers") {
+        candidates.extend(crate::scanner::synthesize_header_findings(slug, &snippets).await);
+    }
+    if request.checks.iter().any(|check| check == "login") {
+        candidates.extend(crate::scanner::synthesize_login_findings(slug, &snippets).await);
+    }
+    let certs: HashMap<String, Value> = doc
+        .get("meta")
+        .and_then(|v| v.get("certs"))
+        .and_then(Value::as_object)
+        .map(|items| {
+            scope
+                .iter()
+                .filter_map(|host| items.get(host).cloned().map(|cert| (host.clone(), cert)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if request.checks.iter().any(|check| check == "tls") {
+        candidates.extend(crate::scanner::synthesize_cert_findings(slug, &certs).await);
+    }
+    for finding in &mut candidates {
+        if let Some(map) = finding.as_object_mut() {
+            if map
+                .get("source")
+                .and_then(Value::as_str)
+                .is_some_and(|source| source.starts_with("scan-"))
+            {
+                map.insert("source".into(), Value::String("vuln-scan".into()));
+            }
+        }
+        crate::correlation::ensure_identity(finding);
+    }
+    let existing = doc
+        .get("findings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut seen_identity = HashSet::new();
+    let mut seen_category = HashSet::new();
+    for mut finding in existing.clone() {
+        seen_identity.insert(crate::correlation::ensure_identity(&mut finding));
+        let target = finding
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        let category = finding
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        seen_category.insert((target, category));
+    }
+    let mut fresh = Vec::new();
+    for mut finding in candidates.iter().cloned() {
+        let identity = crate::correlation::ensure_identity(&mut finding);
+        let target = finding
+            .get("target")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        let category = finding
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        if seen_identity.insert(identity) && seen_category.insert((target, category)) {
+            fresh.push(finding);
+        }
+    }
+    let mut merged = existing;
+    merged.extend(fresh.iter().cloned());
+    let total = merged.len();
+    let meta = doc
+        .get("meta")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mut meta = meta.as_object().cloned().unwrap_or_default();
+    meta.insert(
+        "vuln_scan".into(),
+        serde_json::json!({
+            "date": crate::correlation::now_iso(), "engine": "passive", "targets": scope,
+            "checks": request.checks, "new": fresh.len(), "refresh": false,
+        }),
+    );
+    doc = serde_json::json!({"meta": Value::Object(meta), "findings": merged});
+    crate::correlation::atomic_write_json(&path, &doc)
+        .await
+        .map_err(|_| "persist failed".to_string())?;
+    crate::correlation::invalidate_org_cache(slug);
+    crate::correlation::append_history(
+        slug,
+        serde_json::json!({
+            "ts": crate::correlation::now_iso(), "kind": "vuln-scan", "mode": "passive",
+            "summary": {"targets": scope.len(), "new": fresh.len()},
+            "note": format!("passive vulnerability lookup on {} host(s)", scope.len()),
+        }),
+    )
+    .await;
+    Ok(serde_json::json!({
+        "slug": slug, "engine": "passive", "targets": scope, "checks": request.checks,
+        "new_findings": fresh.len(), "candidates": candidates.len(), "total_findings": total,
+        "active": false, "refresh": false,
+    }))
+}
+
+pub async fn load_findings_document(slug: &str) -> Result<(PathBuf, Value), String> {
+    let path = crate::correlation::org_findings_path(slug)
+        .ok_or_else(|| "findings store unavailable".to_string())?;
+    let text = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|_| "findings store unreadable".to_string())?;
+    let doc: Value =
+        serde_json::from_str(&text).map_err(|_| "findings store corrupted".to_string())?;
+    if !doc.is_object() {
+        return Err("findings store corrupted".to_string());
+    }
+    Ok((path, doc))
+}
+
+/// Execute a pre-authorized Nuclei run and atomically merge only validated,
+/// registered-scope results. Availability or runner failures return `Err` so
+/// the caller marks the job failed instead of reporting a clean scan.
+pub async fn run_active_nuclei_lookup(
+    slug: &str,
+    org: &Value,
+    runtime: NucleiRuntime,
+    requested_targets: Vec<String>,
+    severity: Vec<String>,
+    tags: Vec<String>,
+) -> Result<Value, String> {
+    if let Some(error) = authorization_error(&active_gate_from_env(), org, Utc::now()) {
+        return Err(format!("nuclei engine denied: {error}"));
+    }
+    let (_, initial) = load_findings_document(slug).await?;
+    let targets = active_nuclei_targets(org, &initial, &requested_targets)?;
+    let domains = registered_domains(org);
+    let fingerprints = initial
+        .get("meta")
+        .and_then(|meta| meta.get("fingerprints"))
+        .and_then(Value::as_object);
+    let urls: Vec<String> = targets
+        .iter()
+        .map(|target| {
+            let snippet = fingerprints
+                .and_then(|items| items.get(target))
+                .cloned()
+                .unwrap_or(Value::Null);
+            canonical_runner_target(target, &snippet)
+        })
+        .collect();
+    let blocking_runtime = runtime.clone();
+    let blocking_urls = urls.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        run_nuclei_blocking(&blocking_runtime.config, &blocking_urls, &severity, &tags)
+    })
+    .await
+    .map_err(|_| "nuclei runner task failed".to_string())??;
+    let candidates = parse_jsonl(&output, slug, &domains);
+    let _guard = crate::correlation::org_write_lock(slug).await;
+    let (path, mut doc) = load_findings_document(slug).await?;
+    let existing = doc
+        .get("findings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let fresh = dedup_nuclei_findings(&existing, candidates);
+    let mut merged = existing;
+    merged.extend(fresh.iter().cloned());
+    let total = merged.len();
+    let mut meta = doc
+        .get("meta")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    meta.insert(
+        "vuln_scan".into(),
+        serde_json::json!({
+            "date": crate::correlation::now_iso(), "engine": "nuclei", "targets": targets,
+            "new": fresh.len(), "matched": fresh.len(), "rate_limit": runtime.config.rate_limit,
+        }),
+    );
+    doc = serde_json::json!({"meta": Value::Object(meta), "findings": merged});
+    crate::correlation::atomic_write_json(&path, &doc)
+        .await
+        .map_err(|_| "persist failed".to_string())?;
+    crate::correlation::invalidate_org_cache(slug);
+    crate::correlation::append_history(
+        slug,
+        serde_json::json!({
+            "ts": crate::correlation::now_iso(), "kind": "vuln-scan", "mode": "nuclei",
+            "summary": {"targets": urls.len(), "new": fresh.len()},
+            "note": format!("Nuclei active template run on {} authorized host(s)", urls.len()),
+        }),
+    )
+    .await;
+    Ok(serde_json::json!({
+        "slug": slug, "engine": "nuclei", "targets": targets, "urls": urls,
+        "new_findings": fresh.len(), "candidates": fresh.len(), "total_findings": total,
+        "active": true,
+    }))
 }
