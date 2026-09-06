@@ -442,7 +442,7 @@ cd cti-dashboard
 python -m pytest tests/ -v
 ```
 
- 218 tests covering: tenant authentication, unknown org rejection, graph XSS
+ 221 tests covering: tenant authentication, unknown org rejection, graph XSS
 prevention, PDF PII masking, job state retention, provider URL SSRF validation,
 session cookie security, CSP enforcement, registration limits, the
 cheap-model AI triage flow (pre-filter, compact prompt, classifier parsing,
