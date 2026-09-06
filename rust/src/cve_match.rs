@@ -3,10 +3,10 @@
 //! Port of `cve_match.py`.
 
 use once_cell::sync::OnceCell;
+use parking_lot::Mutex;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
-use parking_lot::Mutex;
 
 fn suffix_re() -> &'static Regex {
     static RE: OnceCell<Regex> = OnceCell::new();

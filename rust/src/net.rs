@@ -46,8 +46,7 @@ const V4_PRIVATE: [(u32, u8); 14] = [
 ];
 
 /// (`_private_networks_exceptions` for IPv4: PCP anycast — globally reachable.)
-const V4_PRIVATE_EXCEPTIONS: [(u32, u8); 2] =
-    [(v4(192, 0, 0, 9), 32), (v4(192, 0, 0, 10), 32)];
+const V4_PRIVATE_EXCEPTIONS: [(u32, u8); 2] = [(v4(192, 0, 0, 9), 32), (v4(192, 0, 0, 10), 32)];
 
 /// (`_public_network` for IPv4: shared address space — neither global nor private.)
 const V4_SHARED: (u32, u8) = (v4(100, 64, 0, 0), 10);

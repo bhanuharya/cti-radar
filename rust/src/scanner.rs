@@ -300,7 +300,10 @@ mod tests {
         let ips = resolve("example.com").await;
         assert!(!ips.is_empty(), "DNS must resolve example.com");
         let (probe, snippet) = fetch_fingerprint("example.com", &ips).await;
-        assert!(probe.is_some(), "fingerprint must succeed against example.com");
+        assert!(
+            probe.is_some(),
+            "fingerprint must succeed against example.com"
+        );
         assert!(snippet.is_some());
     }
 
@@ -454,8 +457,7 @@ fn pinned_client(host: &str, ip: &str, port: u16) -> Option<reqwest::Client> {
 /// is the zone's wildcard IP set (cached per domain for the process lifetime).
 /// Empty set = no wildcard.
 async fn detect_wildcard(domain: &str) -> HashSet<String> {
-    static CACHE: OnceCell<parking_lot::Mutex<HashMap<String, HashSet<String>>>> =
-        OnceCell::new();
+    static CACHE: OnceCell<parking_lot::Mutex<HashMap<String, HashSet<String>>>> = OnceCell::new();
     let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
     if let Some(hit) = cache.lock().get(domain).cloned() {
         return hit;
@@ -699,87 +701,87 @@ pub async fn fetch_fingerprint(host: &str, ips: &[String]) -> (Option<Value>, Op
             let url = format!("{}://{}", scheme, host);
             let pinned = pinned_client(host, ip, port);
             let client = pinned.as_ref().unwrap_or(&fallback);
-        let result = client.get(&url).header("Host", host).send().await;
-        if let Ok(resp) = result {
-            let status = resp.status();
-            let code = status.as_u16().to_string();
-            let server = resp
-                .headers()
-                .get("server")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            let powered = resp
-                .headers()
-                .get("x-powered-by")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            let content_type = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            // security headers (presence only — absence == missing on wire)
-            let hdr = resp.headers();
-            let get_hdr = |n: &str| {
-                hdr.get(n)
+            let result = client.get(&url).header("Host", host).send().await;
+            if let Ok(resp) = result {
+                let status = resp.status();
+                let code = status.as_u16().to_string();
+                let server = resp
+                    .headers()
+                    .get("server")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
-                    .to_string()
-            };
-            let hsts = get_hdr("strict-transport-security");
-            let csp = get_hdr("content-security-policy");
-            let xfo = get_hdr("x-frame-options");
-            let xcto = get_hdr("x-content-type-options");
-            let referrer_policy = get_hdr("referrer-policy");
-            let permissions_policy = get_hdr("permissions-policy");
-            let www_authenticate = get_hdr("www-authenticate");
-            let set_cookie = get_hdr("set-cookie");
-            let body = resp.text().await.unwrap_or_default();
-            let body_limited: String = body.chars().take(65536).collect();
-            let title = title_re()
-                .captures(&body_limited)
-                .ok()
-                .flatten()
-                .and_then(|c| c.get(1))
-                .map(|m| m.as_str().trim().to_string())
-                .unwrap_or_default();
-            let login_form = password_input_re().is_match(&body_limited).unwrap_or(false);
+                    .to_string();
+                let powered = resp
+                    .headers()
+                    .get("x-powered-by")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                // security headers (presence only — absence == missing on wire)
+                let hdr = resp.headers();
+                let get_hdr = |n: &str| {
+                    hdr.get(n)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let hsts = get_hdr("strict-transport-security");
+                let csp = get_hdr("content-security-policy");
+                let xfo = get_hdr("x-frame-options");
+                let xcto = get_hdr("x-content-type-options");
+                let referrer_policy = get_hdr("referrer-policy");
+                let permissions_policy = get_hdr("permissions-policy");
+                let www_authenticate = get_hdr("www-authenticate");
+                let set_cookie = get_hdr("set-cookie");
+                let body = resp.text().await.unwrap_or_default();
+                let body_limited: String = body.chars().take(65536).collect();
+                let title = title_re()
+                    .captures(&body_limited)
+                    .ok()
+                    .flatten()
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str().trim().to_string())
+                    .unwrap_or_default();
+                let login_form = password_input_re().is_match(&body_limited).unwrap_or(false);
 
-            let mut versions = parse_versions(&server);
-            versions.extend(parse_versions(&powered));
-            versions.extend(parse_versions(&title));
+                let mut versions = parse_versions(&server);
+                versions.extend(parse_versions(&powered));
+                versions.extend(parse_versions(&title));
 
-            probe = Some(json!({
-                "url": url,
-                "code": code,
-                "server": server,
-                "title": title,
-                "ip": ip,
-            }));
-            snippet = Some(json!({
-                "url": url,
-                "code": code,
-                "server": server,
-                "x-powered-by": powered,
-                "content-type": content_type,
-                "strict-transport-security": hsts,
-                "content-security-policy": csp,
-                "x-frame-options": xfo,
-                "x-content-type-options": xcto,
-                "referrer-policy": referrer_policy,
-                "permissions-policy": permissions_policy,
-                "www-authenticate": www_authenticate,
-                "set-cookie": set_cookie,
-                "login_form": login_form,
-                "title": title,
-                "versions": versions,
-            }));
-            break 'ips;
+                probe = Some(json!({
+                    "url": url,
+                    "code": code,
+                    "server": server,
+                    "title": title,
+                    "ip": ip,
+                }));
+                snippet = Some(json!({
+                    "url": url,
+                    "code": code,
+                    "server": server,
+                    "x-powered-by": powered,
+                    "content-type": content_type,
+                    "strict-transport-security": hsts,
+                    "content-security-policy": csp,
+                    "x-frame-options": xfo,
+                    "x-content-type-options": xcto,
+                    "referrer-policy": referrer_policy,
+                    "permissions-policy": permissions_policy,
+                    "www-authenticate": www_authenticate,
+                    "set-cookie": set_cookie,
+                    "login_form": login_form,
+                    "title": title,
+                    "versions": versions,
+                }));
+                break 'ips;
+            }
         }
-    }
     }
     (probe, snippet)
 }
@@ -1454,7 +1456,10 @@ pub async fn synthesize_cert_findings(slug: &str, certs: &HashMap<String, Value>
     out
 }
 
-pub async fn synthesize_login_findings(slug: &str, snippets: &HashMap<String, Value>) -> Vec<Value> {
+pub async fn synthesize_login_findings(
+    slug: &str,
+    snippets: &HashMap<String, Value>,
+) -> Vec<Value> {
     let existing_keys = existing_target_category_keys(slug, "login portal exposed").await;
     let mut out = Vec::new();
     let ts = now_ts();
@@ -1508,7 +1513,10 @@ pub async fn synthesize_login_findings(slug: &str, snippets: &HashMap<String, Va
     out
 }
 
-pub async fn synthesize_version_findings(slug: &str, snippets: &HashMap<String, Value>) -> Vec<Value> {
+pub async fn synthesize_version_findings(
+    slug: &str,
+    snippets: &HashMap<String, Value>,
+) -> Vec<Value> {
     let existing_keys = existing_target_category_keys(slug, "software version disclosure").await;
     let mut out = Vec::new();
     let ts = now_ts();
@@ -1635,7 +1643,10 @@ pub async fn synthesize_cve_findings(
     out
 }
 
-pub async fn synthesize_header_findings(slug: &str, snippets: &HashMap<String, Value>) -> Vec<Value> {
+pub async fn synthesize_header_findings(
+    slug: &str,
+    snippets: &HashMap<String, Value>,
+) -> Vec<Value> {
     // Missing security headers on reachable public hosts.
     // Observational: absence in the snippet == absence on the wire.
     // HSTS/CSP only expected over HTTPS; auth-gated (401/403) or login-form
@@ -2016,7 +2027,9 @@ pub async fn generate_org(
     let mut old_meta: Value = json!({});
     let mut old_baseline_text: String = String::new();
     if baseline_path.exists() {
-        old_baseline_text = tokio::fs::read_to_string(&baseline_path).await.unwrap_or_default();
+        old_baseline_text = tokio::fs::read_to_string(&baseline_path)
+            .await
+            .unwrap_or_default();
     }
     if findings_path.exists() {
         if let Ok(txt) = tokio::fs::read_to_string(&findings_path).await {
@@ -2055,7 +2068,8 @@ pub async fn generate_org(
     // synthesize new findings (dedup against existing) BEFORE reconcile so
     // newly-observed surfaces get identity/lifecycle bookkeeping this pass.
     let enumerated: Vec<String> = hosts.keys().cloned().collect();
-    let mut new_findings = synthesize_surface_findings(&slug, &snippets, &services, &enumerated).await;
+    let mut new_findings =
+        synthesize_surface_findings(&slug, &snippets, &services, &enumerated).await;
     new_findings.extend(synthesize_cert_findings(&slug, &certs).await);
     new_findings.extend(synthesize_login_findings(&slug, &snippets).await);
     new_findings.extend(synthesize_version_findings(&slug, &snippets).await);
@@ -2121,11 +2135,7 @@ pub async fn generate_org(
             if let Some(current) = doc.get("findings").and_then(|v| v.as_array()) {
                 let by_id: HashMap<&str, &Value> = current
                     .iter()
-                    .filter_map(|f| {
-                        f.get("id")
-                            .and_then(|v| v.as_str())
-                            .map(|id| (id, f))
-                    })
+                    .filter_map(|f| f.get("id").and_then(|v| v.as_str()).map(|id| (id, f)))
                     .collect();
                 for f in &mut findings_to_write {
                     let Some(id) = f.get("id").and_then(|v| v.as_str()) else {

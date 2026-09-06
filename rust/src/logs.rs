@@ -124,7 +124,10 @@ mod tests {
         log_event("info", "scan", "a", "three", None).await;
         let (all, total) = read_logs(None, 200).await;
         assert_eq!(total, 3);
-        assert_eq!(all[0].get("message").and_then(|v| v.as_str()), Some("three"));
+        assert_eq!(
+            all[0].get("message").and_then(|v| v.as_str()),
+            Some("three")
+        );
         let (fa, ta) = read_logs(Some("a"), 200).await;
         assert_eq!(ta, 2);
         assert_eq!(fa[0].get("message").and_then(|v| v.as_str()), Some("three"));

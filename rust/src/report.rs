@@ -222,9 +222,7 @@ pub async fn render_pdf(_slug: &str, html: &str, chromium: &str) -> PdfOutcome {
     let _ = tokio::fs::remove_file(&pdf_path).await;
 
     match pdf {
-        Some(bytes) if !bytes.is_empty() && bytes.len() <= PDF_MAX_BYTES => {
-            PdfOutcome::Pdf(bytes)
-        }
+        Some(bytes) if !bytes.is_empty() && bytes.len() <= PDF_MAX_BYTES => PdfOutcome::Pdf(bytes),
         Some(_) => PdfOutcome::TooLarge,
         None => PdfOutcome::Failed,
     }

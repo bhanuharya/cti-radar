@@ -229,7 +229,12 @@ async fn build_dashboard_payload(
     let graph = cc::build_graph(org);
     let fleet = cc::fleet_spread_from_data(&fs);
     let ips = cc::ip_sharing_from_data(&fs);
-    let history: Vec<Value> = cc::load_history(org).iter().rev().take(100).cloned().collect();
+    let history: Vec<Value> = cc::load_history(org)
+        .iter()
+        .rev()
+        .take(100)
+        .cloned()
+        .collect();
     let domains = cc::org_get(org)
         .as_ref()
         .and_then(|o| o.get("domains"))
@@ -240,7 +245,9 @@ async fn build_dashboard_payload(
     let mut scan_info = Value::Null;
     if meta.get("date").is_some() {
         let mut stages = Map::new();
-        for k in ["enum", "resolve", "probe", "services", "tls", "nvd", "total"] {
+        for k in [
+            "enum", "resolve", "probe", "services", "tls", "nvd", "total",
+        ] {
             if let Some(v) = meta.pointer(&format!("/scan_stats/{}", k)) {
                 stages.insert(k.to_string(), v.clone());
             }
@@ -453,8 +460,7 @@ pub async fn api_report_pdf(
     };
     match crate::report::render_pdf(&slug, &html, chromium).await {
         crate::report::PdfOutcome::Pdf(pdf) => {
-            let mut resp =
-                (axum::http::StatusCode::OK, pdf).into_response();
+            let mut resp = (axum::http::StatusCode::OK, pdf).into_response();
             let h = resp.headers_mut();
             h.insert(
                 axum::http::header::CONTENT_TYPE,

@@ -389,7 +389,10 @@ pub async fn effective_ready_profile(slug: &str, override_: Option<&str>) -> Opt
     let p = profiles.get(&eff)?;
     if p.get("provider").and_then(|v| v.as_str()) == Some("openai-compatible") {
         if let Some(k) = p.get("api_key_env").and_then(|v| v.as_str()) {
-            if std::env::var(k).map(|v| v.trim().is_empty()).unwrap_or(true) {
+            if std::env::var(k)
+                .map(|v| v.trim().is_empty())
+                .unwrap_or(true)
+            {
                 return None;
             }
         }
@@ -410,7 +413,10 @@ pub async fn get_capabilities() -> Value {
         let mut ready = true;
         if provider == "openai-compatible" {
             if let Some(k) = p.get("api_key_env").and_then(|v| v.as_str()) {
-                if std::env::var(k).map(|v| v.trim().is_empty()).unwrap_or(true) {
+                if std::env::var(k)
+                    .map(|v| v.trim().is_empty())
+                    .unwrap_or(true)
+                {
                     ready = false;
                 }
             }

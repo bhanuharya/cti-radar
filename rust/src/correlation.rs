@@ -8,13 +8,13 @@
 
 use crate::config::Config;
 use once_cell::sync::OnceCell;
+use parking_lot::RwLock;
 use rayon::prelude::*;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use parking_lot::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CANONICAL_STATUSES: [&str; 5] = [
@@ -73,10 +73,12 @@ static REGISTRY: OnceCell<RwLock<Map<String, Value>>> = OnceCell::new();
 // domains/register/config/scanner persist) holds its org's guard so parallel
 // mutations of the same org cannot lose updates (parity with Python
 // `_org_lock(slug)`).
-static ORG_LOCKS: OnceCell<parking_lot::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
-    OnceCell::new();
+static ORG_LOCKS: OnceCell<
+    parking_lot::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = OnceCell::new();
 
-fn org_locks() -> &'static parking_lot::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>> {
+fn org_locks(
+) -> &'static parking_lot::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>> {
     ORG_LOCKS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
 }
 

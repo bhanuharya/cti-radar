@@ -19,7 +19,10 @@ pub enum AppError {
     /// 400 with extra machine-readable fields merged into the body
     /// (e.g. `{"error": ..., "allowed": [...]}` for invalid ai_profile).
     #[error("bad request: {error}")]
-    BadRequestExtra { error: String, extra: Map<String, Value> },
+    BadRequestExtra {
+        error: String,
+        extra: Map<String, Value>,
+    },
     #[error("not found: {0}")]
     NotFound(String),
     #[error("conflict: {error}")]
@@ -93,7 +96,11 @@ impl IntoResponse for AppError {
                 m.insert("kind".to_string(), Value::String(kind.clone()));
                 (StatusCode::NOT_FOUND, m)
             }
-            AppError::Busy { error, slug, job_id } => {
+            AppError::Busy {
+                error,
+                slug,
+                job_id,
+            } => {
                 let mut m = err_map(error);
                 m.insert("slug".to_string(), Value::String(slug.clone()));
                 m.insert(
@@ -112,17 +119,11 @@ impl IntoResponse for AppError {
             // the full error is logged by the caller via tracing.
             AppError::Io(e) => {
                 tracing::warn!("io error: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    err_map("internal error"),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, err_map("internal error"))
             }
             AppError::Json(e) => {
                 tracing::warn!("json error: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    err_map("internal error"),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, err_map("internal error"))
             }
         };
         (status, Json(Value::Object(body))).into_response()

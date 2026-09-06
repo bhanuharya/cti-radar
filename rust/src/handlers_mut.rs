@@ -130,7 +130,8 @@ pub async fn api_org_register(
             valid_domains.len()
         ),
         None,
-    ).await;
+    )
+    .await;
     Ok(Json(json!({
         "slug": slug,
         "name": name,
@@ -214,7 +215,12 @@ pub async fn api_org_scan(
         "fast"
     };
     // resolve ai_profile: request override > org's stored preference > default
-    let ai_profile_req = body.ai_profile.clone().unwrap_or_default().trim().to_string();
+    let ai_profile_req = body
+        .ai_profile
+        .clone()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let (profiles, _) = crate::ai::load_profiles().await;
     if !ai_profile_req.is_empty() && !profiles.contains_key(&ai_profile_req) {
         return Err(invalid_profile_error(&profiles));
@@ -240,7 +246,8 @@ pub async fn api_org_scan(
             &slug,
             "AI mode requested but no ready profile — falling back to deterministic scan",
             Some(&jid),
-        ).await;
+        )
+        .await;
     }
     crate::logs::log_event(
         "info",
@@ -252,7 +259,8 @@ pub async fn api_org_scan(
             effective.as_deref().unwrap_or("auto")
         ),
         Some(&jid),
-    ).await;
+    )
+    .await;
     // pass the resolved-or-requested profile through (mirrors Python
     // `ai_profile=effective_profile or ai_profile_req`)
     let pass_profile = effective.clone().or(req_opt);
@@ -276,7 +284,8 @@ pub async fn api_org_scan(
                 &slug2,
                 &format!("scan failed: {}", err),
                 Some(&jid2),
-            ).await;
+            )
+            .await;
         } else {
             crate::jobs::release_job(&slug2, "scan", &jid2, None, Some(result));
             crate::logs::log_event("info", "scan", &slug2, "scan completed", Some(&jid2)).await;
@@ -328,7 +337,8 @@ pub async fn api_org_recheck(
             &slug2,
             &format!("recheck completed ({} change(s))", changed),
             Some(&jid2),
-        ).await;
+        )
+        .await;
     });
     Ok(Json(json!({"queued": true, "slug": slug, "job_id": jid})))
 }
@@ -368,7 +378,8 @@ pub async fn api_org_correlate(
                 &slug2,
                 &format!("correlation failed: {}", err),
                 Some(&jid2),
-            ).await;
+            )
+            .await;
         } else {
             crate::jobs::release_job(&slug2, "correlate", &jid2, None, Some(result));
             crate::logs::log_event(
@@ -377,7 +388,8 @@ pub async fn api_org_correlate(
                 &slug2,
                 "correlation completed",
                 Some(&jid2),
-            ).await;
+            )
+            .await;
         }
     });
     Ok(Json(json!({"queued": true, "job_id": jid})))
@@ -421,9 +433,9 @@ pub async fn api_status_change(
     let note = body.note.as_deref().unwrap_or("").trim().to_string();
     // load findings, mutate, persist (mirrors Python `set_finding_status`)
     let (mut fs, _) = cc::load_data(&slug);
-    let idx = fs.iter().position(|f| {
-        f.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-    });
+    let idx = fs
+        .iter()
+        .position(|f| f.get("id").and_then(|v| v.as_str()) == Some(id.as_str()));
     let Some(i) = idx else {
         return Err(AppError::NotFound(format!("finding not found: {}", id)));
     };
@@ -450,7 +462,9 @@ pub async fn api_status_change(
     let findings_path = cc::org_findings_path(&slug)
         .ok_or_else(|| AppError::Internal(format!("bad findings path for org: {}", slug)))?;
     let payload = json!({"meta": cc::load_meta(&slug), "findings": fs});
-    cc::atomic_write_json(&findings_path, &payload).await.map_err(AppError::from)?;
+    cc::atomic_write_json(&findings_path, &payload)
+        .await
+        .map_err(AppError::from)?;
     cc::invalidate_org_cache(&slug);
     cc::append_history(
         &slug,
@@ -469,7 +483,8 @@ pub async fn api_status_change(
         &slug,
         &format!("finding {} status -> {}", id, status),
         None,
-    ).await;
+    )
+    .await;
     match cc::find_finding(&slug, &id) {
         Some(updated) => Ok(Json(
             json!({"org": slug, "finding": cc::normalize_finding(&updated, &slug, None)}),
@@ -512,10 +527,15 @@ pub async fn api_org_ai_grade(
         &slug,
         &format!(
             "AI grading queued (profile={})",
-            if ai_profile_req.is_empty() { "auto" } else { &ai_profile_req }
+            if ai_profile_req.is_empty() {
+                "auto"
+            } else {
+                &ai_profile_req
+            }
         ),
         Some(&jid),
-    ).await;
+    )
+    .await;
     let profile_opt = if ai_profile_req.is_empty() {
         None
     } else {
@@ -533,7 +553,14 @@ pub async fn api_org_ai_grade(
                 Some("AI grading failed (provider or persistence error)".to_string()),
                 None,
             );
-            crate::logs::log_event("error", "ai_grade", &slug2, "AI grading failed", Some(&jid2)).await;
+            crate::logs::log_event(
+                "error",
+                "ai_grade",
+                &slug2,
+                "AI grading failed",
+                Some(&jid2),
+            )
+            .await;
         } else {
             crate::jobs::release_job(&slug2, "grade", &jid2, None, None);
             crate::logs::log_event(
@@ -542,10 +569,14 @@ pub async fn api_org_ai_grade(
                 &slug2,
                 &format!(
                     "AI grading completed ({})",
-                    result.get("result").and_then(|v| v.as_str()).unwrap_or("done")
+                    result
+                        .get("result")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("done")
                 ),
                 Some(&jid2),
-            ).await;
+            )
+            .await;
         }
     });
     Ok(Json(json!({"queued": true, "slug": slug, "job_id": jid})))
@@ -558,9 +589,7 @@ pub async fn api_recheck_status(
     headers: HeaderMap,
 ) -> AppResult<Json<Value>> {
     require_org(&slug, &headers)?;
-    Ok(Json(crate::jobs::job_status(
-        &slug, "recheck", &job_id,
-    )?))
+    Ok(Json(crate::jobs::job_status(&slug, "recheck", &job_id)?))
 }
 
 pub async fn api_ai_grade_status(
@@ -604,9 +633,9 @@ pub async fn api_finding_comment(
     };
     // load findings, append feedback (capped at the 50 most recent), persist
     let (mut fs, _) = cc::load_data(&slug);
-    let idx = fs.iter().position(|f| {
-        f.get("id").and_then(|v| v.as_str()) == Some(id.as_str())
-    });
+    let idx = fs
+        .iter()
+        .position(|f| f.get("id").and_then(|v| v.as_str()) == Some(id.as_str()));
     let Some(i) = idx else {
         return Err(AppError::NotFound(format!("finding not found: {}", id)));
     };
@@ -628,7 +657,9 @@ pub async fn api_finding_comment(
     let findings_path = cc::org_findings_path(&slug)
         .ok_or_else(|| AppError::Internal(format!("bad findings path for org: {}", slug)))?;
     let payload = json!({"meta": cc::load_meta(&slug), "findings": fs});
-    cc::atomic_write_json(&findings_path, &payload).await.map_err(AppError::from)?;
+    cc::atomic_write_json(&findings_path, &payload)
+        .await
+        .map_err(AppError::from)?;
     cc::invalidate_org_cache(&slug);
     let note_short: String = note.chars().take(120).collect();
     cc::append_history(
@@ -648,7 +679,8 @@ pub async fn api_finding_comment(
         &slug,
         &format!("finding {} commented (analyst feedback)", id),
         None,
-    ).await;
+    )
+    .await;
     match cc::find_finding(&slug, &id) {
         Some(updated) => Ok(Json(
             json!({"org": slug, "finding": cc::normalize_finding(&updated, &slug, None)}),
@@ -741,7 +773,8 @@ pub async fn api_org_domains(
             }
         ),
         None,
-    ).await;
+    )
+    .await;
     Ok(Json(json!({"slug": slug, "domains": new_domains})))
 }
 

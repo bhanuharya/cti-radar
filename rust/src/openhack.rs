@@ -271,16 +271,16 @@ async fn list_models_live() -> Value {
     let mut buf = Vec::new();
     if let Some(mut so) = stdout {
         use tokio::io::AsyncReadExt;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), so.read_to_end(&mut buf))
-            .await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), so.read_to_end(&mut buf)).await;
     }
     match exited {
         Some(s) if s.success() => match String::from_utf8(buf) {
             Ok(txt) => {
                 // the binary may print logs: the catalog is the last line
                 let last = txt.lines().last().unwrap_or("").trim();
-                let d: Value =
-                    serde_json::from_str(last).unwrap_or_else(|_| json!({"models": [], "default": ""}));
+                let d: Value = serde_json::from_str(last)
+                    .unwrap_or_else(|_| json!({"models": [], "default": ""}));
                 normalize_models(d, &preferred_model())
             }
             Err(_) => model_fallback(),
