@@ -795,7 +795,7 @@ fn terminate_child_group(child: &mut std::process::Child) {
 fn bounded_stderr(path: &std::path::Path) -> String {
     use std::io::Read;
     let mut buffer = Vec::new();
-    if let Ok(mut file) = std::fs::File::open(path) {
+    if let Ok(file) = std::fs::File::open(path) {
         let _ = file.take(8192).read_to_end(&mut buffer);
     }
     let text = String::from_utf8_lossy(&buffer);
