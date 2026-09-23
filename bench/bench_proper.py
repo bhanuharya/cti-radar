@@ -21,7 +21,7 @@ import urllib.error
 ITERS = int(sys.argv[1]) if len(sys.argv) > 1 else 5
 CONCURRENCY = 16
 TOKEN = os.environ.get("CTI_SCAN_TOKEN", "tok")
-DATA_DIR = os.environ.get("CTI_DATA_DIR", os.path.expanduser("~/code/cti-dashboard/data"))
+DATA_DIR = os.environ.get("CTI_DATA_DIR", os.path.expanduser("~/code/cti-radar/data"))
 
 PY = ("127.0.0.1:8084", "python")
 RS = ("127.0.0.1:8085", "rust")

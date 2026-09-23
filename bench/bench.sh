@@ -15,7 +15,7 @@ set -uo pipefail
 
 ITERS="${1:-5}"
 MODE="${2:-api}"
-DATA_DIR="${CTI_DATA_DIR:-$HOME/code/cti-dashboard/data}"
+DATA_DIR="${CTI_DATA_DIR:-$HOME/code/cti-radar/data}"
 PY_HOST="${PY_HOST:-127.0.0.1:8084}"
 RS_HOST="${RS_HOST:-127.0.0.1:8085}"
 TOKEN="${CTI_SCAN_TOKEN:-tok}"
