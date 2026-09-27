@@ -3,6 +3,12 @@
 This document describes the **supported deployment shape** and its hardening
 notes. For day-to-day operation see the `README.md` setup section.
 
+> **Note:** this guide was written when the Python (FastAPI) backend was the
+> primary implementation. The README now leads with the native Rust/Axum
+> backend (single static binary, embedded dashboard); the Python app remains
+> as a parity reference. The single-process/single-host constraints apply to
+> both backends identically.
+
 ## Supported shape: single process, single host
 
 CTI Radar is architected around **one server process on one host**:
@@ -16,8 +22,10 @@ CTI Radar is architected around **one server process on one host**:
 
 **Rules that follow from this:**
 
-1. Run exactly **one** `uvicorn app.main:app` process per `CTI_DATA_DIR`
-   (`--workers 1` is the default; never pass `--workers N>1`).
+1. Run exactly **one** server process per `CTI_DATA_DIR`: the Rust binary
+   (`./target/release/cti-radar`, built with `cd rust && cargo build
+   --release`) or the Python reference (`uvicorn app.main:app`),
+   `--workers 1` / no extra workers in either case.
 2. Never point two instances (e.g., a dev port and a prod port) at the same
    data directory. If you need a second instance, give it its own
    `CTI_DATA_DIR` and re-register the orgs you want there.
@@ -34,7 +42,7 @@ surface already supports that transition.
 
 ```ini
 [Unit]
-Description=CTI Radar Correlation Dashboard (FastAPI, tailnet-only)
+Description=CTI Radar Correlation Dashboard (tailnet-only)
 After=network.target
 
 [Service]
@@ -50,7 +58,9 @@ Environment=CTI_AI_CONFIG_FILE=/home/you/.config/cti-radar/ai_config.json
 # CTI_HOST/CTI_PORT from server.env, so there is exactly one place to
 # change the bind address.
 WorkingDirectory=/home/you/code/cti-dashboard
-ExecStart=/home/you/code/cti-dashboard/.venv/bin/python -m app.main
+# Rust backend (primary): cargo build --release in the checkout first
+ExecStart=/home/you/code/cti-dashboard/rust/target/release/cti-radar
+# Python parity reference instead: /home/you/code/cti-dashboard/.venv/bin/python -m app.main
 Restart=always
 RestartSec=3
 
