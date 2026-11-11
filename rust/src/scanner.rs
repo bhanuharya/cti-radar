@@ -564,25 +564,16 @@ async fn subdomains_hackertarget(domain: String) -> HashSet<String> {
 }
 
 async fn subdomains_crtname(domain: String) -> HashSet<String> {
-    let url = format!("https://crt.name/?q={}", domain);
+    // crt.name exposes a plain-text CT search at /v1/search?apex= (one
+    // hostname per line). The HTML UI at /?q= is for browsers and any parsing
+    // of it is fragile; the en masse parity reference in app/scanner.py uses
+    // the same endpoint.
+    let url = format!("https://crt.name/v1/search?apex={}", domain);
     let body = fetch_text(&url).await;
-    // crt.name returns a table; extract hostnames via a simple heuristic
-    let mut names = HashSet::new();
-    for line in body.lines() {
-        let l = line.trim().to_lowercase();
-        if l.contains(&domain) && !l.contains('<') && !l.contains('>') {
-            // split on whitespace, keep tokens that look like subdomains
-            for tok in l.split_whitespace() {
-                let t = tok
-                    .trim_end_matches('.')
-                    .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
-                if t.ends_with(&domain) && is_valid_domain(t) {
-                    names.insert(t.to_string());
-                }
-            }
-        }
-    }
-    names
+    body.lines()
+        .map(|l| l.trim().to_lowercase().trim_end_matches('.').to_string())
+        .filter(|s| s.ends_with(&domain) && is_valid_domain(s))
+        .collect()
 }
 
 async fn subdomains_wayback(domain: String) -> HashSet<String> {
